@@ -1,0 +1,45 @@
+import {NgModule} from '@angular/core';
+import {CommonModule, DatePipe} from '@angular/common';
+import {EventsComponent} from './events.component';
+import {RouterModule, Routes} from '@angular/router';
+import {ReactiveFormsModule} from '@angular/forms';
+import {EventDeliveriesModule} from './event-deliveries/event-deliveries.module';
+import {ButtonComponent} from 'src/app/components/button/button.component';
+import {CardComponent} from 'src/app/components/card/card.component';
+import {SkeletonLoaderComponent} from 'src/app/components/skeleton-loader/skeleton-loader.component';
+import {DropdownComponent, DropdownOptionDirective} from 'src/app/components/dropdown/dropdown.component';
+import {EmptyStateComponent} from 'src/app/components/empty-state/empty-state.component';
+import {LoaderModule} from 'src/app/private/components/loader/loader.module';
+import {DatePickerComponent} from 'src/app/components/date-picker/date-picker.component';
+import {CopyButtonComponent} from 'src/app/components/copy-button/copy-button.component';
+import {TagComponent} from 'src/app/components/tag/tag.component';
+import {StatusColorModule} from 'src/app/pipes/status-color/status-color.module';
+import {PermissionDirective} from "../../../components/permission/permission.directive";
+import {CountLabelPipe} from 'src/app/pipes/count-label/count-label.pipe';
+
+const routes: Routes = [{ path: '', component: EventsComponent }];
+
+@NgModule({
+	declarations: [EventsComponent],
+    imports: [
+        CommonModule,
+        ReactiveFormsModule,
+        RouterModule.forChild(routes),
+        EventDeliveriesModule,
+        DropdownComponent,
+        ButtonComponent,
+        CardComponent,
+        SkeletonLoaderComponent,
+        EmptyStateComponent,
+        LoaderModule,
+        DatePickerComponent,
+        DropdownOptionDirective,
+        CopyButtonComponent,
+        TagComponent,
+        StatusColorModule,
+        PermissionDirective,
+        CountLabelPipe
+    ],
+	providers: [DatePipe]
+})
+export class EventsModule {}

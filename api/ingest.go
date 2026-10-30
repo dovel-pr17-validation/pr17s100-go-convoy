@@ -1,0 +1,570 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+	"github.com/oklog/ulid/v2"
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/api/handlers"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/events"
+	"github.com/frain-dev/convoy/internal/pkg/crc"
+	"github.com/frain-dev/convoy/internal/pkg/dedup"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/sources"
+	"github.com/frain-dev/convoy/pkg/httpheader"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/pkg/verifier"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/util"
+	"github.com/frain-dev/convoy/worker/task"
+)
+
+func (a *ApplicationHandler) IngestEvent(w http.ResponseWriter, r *http.Request) {
+	// s.AppService.CountProjectApplications()
+	// 1. Retrieve mask ID
+	maskID := chi.URLParam(r, "maskID")
+
+	// 2. Retrieve source using mask ID.
+	source, err := sources.New(a.A.Logger, a.A.DB).FindSourceByMaskID(r.Context(), maskID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrSourceNotFound) {
+			a.A.Logger.Errorf("Source not found for mask ID %s: %v", maskID, err)
+			_ = render.Render(w, r, util.NewErrorResponse("Resource not found", http.StatusNotFound))
+			return
+		}
+		_ = render.Render(w, r, util.NewErrorResponse("error retrieving source", http.StatusBadRequest))
+		return
+	}
+
+	// 2. Retrieve source using mask ID.
+	// ProjectRepo is the cached repository wired by ensureAPIRepositories.
+	project, err := a.A.ProjectRepo.FetchProjectByID(r.Context(), source.ProjectID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	if err = license.EnsureProjectEnabled(a.A.Licenser, project.UID); err != nil {
+		a.A.Logger.Errorf("Project disabled for project ID %s", project.UID)
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if source.Type != datastore.HTTPSource {
+		_ = render.Render(w, r, util.NewErrorResponse("Source type needs to be HTTP",
+			http.StatusBadRequest))
+		return
+	}
+
+	// 3. Select verifier based of source config.
+	v, err := selectIngestVerifier(source)
+	if err != nil {
+		if errors.Is(err, errIngestVerifierInit) {
+			a.A.Logger.Error("failed to initialize HMAC verifier", "error", err, "source_id", source.UID, "mask_id", maskID)
+			_ = render.Render(w, r, util.NewErrorResponse("failed to initialize HMAC verifier", http.StatusInternalServerError))
+			return
+		}
+		if errors.Is(err, errIngestProviderUndefined) {
+			_ = render.Render(w, r, util.NewErrorResponse("Provider type undefined", http.StatusBadRequest))
+			return
+		}
+		a.A.Logger.Error("no valid verifier configured for source",
+			"error", err, "source_id", source.UID, "mask_id", maskID,
+			"provider", source.Provider, "verifier_type", verifierTypeOrEmpty(source.Verifier))
+		_ = render.Render(w, r, util.NewErrorResponse(
+			"source has no valid verifier configured", http.StatusBadRequest))
+		return
+	}
+
+	var maxIngestSize uint64
+	if project.Config != nil && project.Config.MaxIngestSize != 0 {
+		maxIngestSize = project.Config.MaxIngestSize
+	}
+
+	if maxIngestSize == 0 {
+		cfg, err := config.Get()
+		if err != nil {
+			a.A.Logger.Error("failed to load config", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Service temporarily unavailable", http.StatusInternalServerError))
+			return
+		}
+
+		maxIngestSize = cfg.MaxResponseSize
+	}
+
+	// The Content-Length header indicates the size of the message body, in bytes, sent to the recipient.
+	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Length
+	// We use this to check the size of the request content, this is to ensure that we return the appropriate
+	// status code when the size of a request payload exceeds the configured MaxResponseSize.
+	if r.ContentLength > int64(maxIngestSize) {
+		_ = render.Render(w, r, util.NewErrorResponse("request body too large", http.StatusRequestEntityTooLarge))
+		return
+	}
+
+	var checksum string
+	var isDuplicate bool
+	if len(source.IdempotencyKeys) > 0 {
+		duper := dedup.NewDeDuper(r.Context(), r, events.New(a.A.Logger, a.A.DB))
+		exists, err := duper.Exists(source.Name, source.ProjectID, source.IdempotencyKeys)
+		if err != nil {
+			a.A.Logger.Error("Duplicate check failed", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Failed to process request", http.StatusBadRequest))
+			return
+		}
+
+		isDuplicate = exists
+
+		checksum, err = duper.GenerateChecksum(source.Name, source.IdempotencyKeys)
+		if err != nil {
+			a.A.Logger.Error("Checksum generation failed", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Failed to process request", http.StatusBadRequest))
+			return
+		}
+	}
+
+	// 3.1 On Failure
+	// Return 400 Bad Request.
+	// Read raw body for signature verification first (e.g., GitHub signs raw bytes)
+	rawPayload, err := io.ReadAll(io.LimitReader(r.Body, int64(maxIngestSize)))
+	if err != nil {
+		a.A.Logger.Error("Failed to read request body", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid request format", http.StatusBadRequest))
+		return
+	}
+
+	// Restore body for subsequent reads
+	r.Body = io.NopCloser(bytes.NewReader(rawPayload))
+
+	// Try raw-body verification first
+	rawVerifyErr := v.VerifyRequest(r, rawPayload)
+
+	var payload []byte
+	if rawVerifyErr != nil {
+		// Fallback: extract/convert payload (e.g., form -> JSON) and verify against that for backward compatibility
+		payload, err = extractPayloadFromIngestEventReq(r, maxIngestSize)
+		if err != nil {
+			a.A.Logger.Error("Failed to extract payload", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Invalid request format", http.StatusBadRequest))
+			return
+		}
+
+		// Reset body before verification (some verifiers may inspect headers/body state)
+		r.Body = io.NopCloser(bytes.NewReader(rawPayload))
+
+		if err = v.VerifyRequest(r, payload); err != nil {
+			a.A.Logger.Error("Request verification failed (raw and converted)", "error", rawVerifyErr)
+			_ = render.Render(w, r, util.NewErrorResponse("Request verification failed", http.StatusBadRequest))
+			return
+		}
+	} else {
+		// Raw verification succeeded; now convert for storage
+		payload, err = extractPayloadFromIngestEventReq(r, maxIngestSize)
+		if err != nil {
+			a.A.Logger.Error("Failed to extract payload", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Invalid request format", http.StatusBadRequest))
+			return
+		}
+	}
+
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+
+	eventType := maskID
+	if !util.IsStringEmpty(source.EventTypeLocation) {
+		if sourceUsesPayloadSignature(source) && eventTypeLocationUsesRequestMetadata(source.EventTypeLocation) {
+			_ = render.Render(w, r, util.NewErrorResponse("event type location cannot use request headers or query parameters with payload signature verification", http.StatusBadRequest))
+			return
+		}
+
+		eventType, err = extractEventTypeFromLocation(r, payload, source.EventTypeLocation)
+		if err != nil {
+			a.A.Logger.Error("Failed to extract event type", "error", err)
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+			return
+		}
+	}
+
+	// 3.2 On success
+	// Attach Source to Event.
+	// Write Event to the Ingestion Queue.
+	event := &datastore.Event{
+		UID:              ulid.Make().String(),
+		EventType:        datastore.EventType(eventType),
+		SourceID:         source.UID,
+		ProjectID:        source.ProjectID,
+		Raw:              "", // Skip Raw duplication - Data field is canonical (reduces payload size)
+		Data:             payload,
+		IsDuplicateEvent: isDuplicate,
+		URLQueryParams:   r.URL.RawQuery,
+		URLPath:          r.URL.Path,
+		IdempotencyKey:   checksum,
+		Headers:          httpheader.HTTPHeader(r.Header),
+		AcknowledgedAt:   null.TimeFrom(time.Now()),
+	}
+
+	event.Headers["X-Convoy-Source-Id"] = []string{source.MaskID}
+
+	// Cloud only: enforce the per-org daily event cap for active trials. Placed
+	// here, after signature verification and payload validation and right before
+	// the enqueue, so only events Convoy actually accepts count against the cap.
+	// Skip duplicates: they are deduplicated downstream and never delivered, so an
+	// idempotent retry must not spend quota. A no-cap org (paid, self-hosted) or a
+	// Redis outage passes through.
+	if !isDuplicate && handlers.EnforceTrialEventCap(w, r, a.A, project.OrganisationID) {
+		return
+	}
+
+	jobId := queue.JobId{ProjectID: event.ProjectID, ResourceID: event.UID}.SingleJobId()
+	createEvent := task.CreateEvent{
+		JobID: jobId,
+		Event: event,
+	}
+
+	eventByte, err := msgpack.EncodeMsgPack(createEvent)
+	if err != nil {
+		a.A.Logger.Error("Failed to encode event data", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Failed to process event", http.StatusBadRequest))
+		return
+	}
+
+	job := &queue.Job{
+		ID:      jobId,
+		Payload: eventByte,
+		Delay:   0,
+	}
+
+	err = a.A.Queue.Write(r.Context(), convoy.CreateEventProcessor, convoy.CreateEventQueue, job)
+	if err != nil {
+		a.A.Logger.Error("Error occurred sending new event to the queue", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Failed to process event", http.StatusBadRequest))
+		return
+	}
+
+	// 4. Return 200
+	if !util.IsStringEmpty(source.CustomResponse.Body) {
+		// send back custom response
+		if !util.IsStringEmpty(source.CustomResponse.ContentType) {
+			w.Header().Set("Content-Type", source.CustomResponse.ContentType)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(source.CustomResponse.Body))
+			return
+		}
+
+		render.Status(r, http.StatusOK)
+		render.PlainText(w, r, source.CustomResponse.Body)
+		return
+	}
+
+	if event.IsDuplicateEvent {
+		_ = render.Render(w, r, util.NewServerResponse("Duplicate event received, but will not be sent", len(payload), http.StatusOK))
+	} else {
+		_ = render.Render(w, r, util.NewServerResponse("Event received", len(payload), http.StatusOK))
+	}
+}
+
+const (
+	applicationJsonContentType   = "application/json"
+	multipartFormDataContentType = "multipart/form-data"
+	urlEncodedContentType        = "application/x-www-form-urlencoded"
+)
+
+func extractPayloadFromIngestEventReq(r *http.Request, maxIngestSize uint64) ([]byte, error) {
+	var contentType string
+	rawContentType := strings.ToLower(
+		strings.TrimSpace(
+			r.Header.Get("Content-Type"),
+		),
+	)
+
+	// We split the rawContentType using the first semicolon as the delimiter because go-chi has a weird way
+	// of handling the form-data content type. It adds a semicolon after the boundary and we need to remove it.
+	// Example: multipart/form-data; boundary=--------------------------879783787191406952783600
+	if contentTypeSlice := strings.SplitN(rawContentType, ";", 2); len(contentTypeSlice) == 0 {
+		// always default to json if no content type is specified
+		contentType = applicationJsonContentType
+	} else {
+		contentType = strings.TrimSpace(contentTypeSlice[0])
+	}
+
+	switch contentType {
+	case multipartFormDataContentType:
+		if err := r.ParseMultipartForm(int64(maxIngestSize)); err != nil {
+			return nil, err
+		}
+		return convertRequestFormToJSON(r)
+	case urlEncodedContentType:
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		return convertRequestFormToJSON(r)
+	default:
+		// To avoid introducing a breaking change, we are keeping the old behaviour of assuming
+		// the content type is JSON if the content type is not specified/unsupported.
+		return io.ReadAll(io.LimitReader(r.Body, int64(maxIngestSize)))
+	}
+}
+
+func extractEventTypeFromLocation(r *http.Request, payload []byte, location string) (string, error) {
+	parts := strings.SplitN(location, ".", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid event type location: %s", location)
+	}
+
+	if parts[0] != "request" && parts[0] != "req" {
+		return "", fmt.Errorf("unsupported event type location: %s", location)
+	}
+
+	var value string
+	switch strings.ToLower(parts[1]) {
+	case "header":
+		if strings.Contains(parts[2], ".") {
+			return "", fmt.Errorf("nested selector unsupported for event type location: %s", location)
+		}
+		value = r.Header.Get(parts[2])
+	case "query", "queryparam":
+		if strings.Contains(parts[2], ".") {
+			return "", fmt.Errorf("nested selector unsupported for event type location: %s", location)
+		}
+		value = r.URL.Query().Get(parts[2])
+	case "body":
+		bodyValue, err := valueFromJSONPath(payload, parts[2])
+		if err != nil {
+			return "", err
+		}
+		value = bodyValue
+	default:
+		return "", fmt.Errorf("unsupported event type location: %s", location)
+	}
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("event type not found in request at %s", location)
+	}
+
+	return value, nil
+}
+
+func eventTypeLocationUsesRequestMetadata(location string) bool {
+	return datastore.EventTypeLocationUsesRequestMetadata(location)
+}
+
+func sourceUsesPayloadSignature(source *datastore.Source) bool {
+	return datastore.SourceUsesPayloadSignature(source)
+}
+
+func valueFromJSONPath(payload []byte, path string) (string, error) {
+	var body interface{}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
+		return "", fmt.Errorf("failed to read event type from request body: %w", err)
+	}
+
+	current := body
+	for _, key := range strings.Split(path, ".") {
+		object, ok := current.(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("event type not found in request body at %s", path)
+		}
+
+		current, ok = object[key]
+		if !ok {
+			return "", fmt.Errorf("event type not found in request body at %s", path)
+		}
+	}
+
+	switch v := current.(type) {
+	case string:
+		return v, nil
+	case json.Number:
+		return v.String(), nil
+	case bool:
+		return fmt.Sprint(v), nil
+	default:
+		return "", fmt.Errorf("event type at request.body.%s must be a scalar value", path)
+	}
+}
+
+func convertRequestFormToJSON(r *http.Request) ([]byte, error) {
+	data := make(map[string]string)
+	for k, v := range r.Form {
+		// Golang handles the form data and returns it as a map[string][]string.
+		// we only need the first value in the slice, so we take the first element in the slice.
+		// We also skip empty values.
+		if len(v) > 0 {
+			data[k] = v[0]
+		}
+	}
+	return json.Marshal(data)
+}
+
+func (a *ApplicationHandler) HandleCrcCheck(w http.ResponseWriter, r *http.Request) {
+	maskId := chi.URLParam(r, "maskID")
+	source, err := sources.New(a.A.Logger, a.A.DB).FindSourceByMaskID(r.Context(), maskId)
+	if err != nil {
+		if errors.Is(err, datastore.ErrSourceNotFound) {
+			a.A.Logger.Errorf("Source not found for mask ID %s: %v", maskId, err)
+			_ = render.Render(w, r, util.NewErrorResponse("Resource not found", http.StatusNotFound))
+			return
+		}
+		_ = render.Render(w, r, util.NewErrorResponse("error retrieving source", http.StatusBadRequest))
+		return
+	}
+
+	if source.Type != datastore.HTTPSource {
+		_ = render.Render(w, r, util.NewErrorResponse("Source type needs to be HTTP", http.StatusBadRequest))
+		return
+	}
+
+	if util.IsStringEmpty(string(source.Provider)) {
+		_ = render.Render(w, r, util.NewErrorResponse("Provider type undefined", http.StatusBadRequest))
+		return
+	}
+
+	var c crc.Crc
+
+	switch source.Provider {
+	case datastore.TwitterSourceProvider:
+		secret, err := providerHMACSecret(source)
+		if err != nil {
+			a.A.Logger.Error("no valid verifier configured for source",
+				"error", err, "source_id", source.UID, "mask_id", maskId, "provider", source.Provider)
+			_ = render.Render(w, r, util.NewErrorResponse(
+				"source has no valid verifier configured", http.StatusBadRequest))
+			return
+		}
+		c = crc.NewTwitterCrc(secret)
+	default:
+		_ = render.Render(w, r, util.NewErrorResponse("Provider type is not supported", http.StatusBadRequest))
+		return
+	}
+
+	sourceRepo := sources.New(a.A.Logger, a.A.DB)
+	err = c.HandleRequest(w, r, source, sourceRepo)
+	if err != nil {
+		a.A.Logger.Error("CRC check failed", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("CRC verification failed", http.StatusBadRequest))
+		return
+	}
+}
+
+var (
+	errIngestVerifierMissing   = errors.New("source has no valid verifier configured")
+	errIngestProviderUndefined = errors.New("provider type undefined")
+	errIngestVerifierInit      = errors.New("failed to initialize HMAC verifier")
+)
+
+func verifierTypeOrEmpty(cfg *datastore.VerifierConfig) datastore.VerifierType {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Type
+}
+
+// providerHMACSecret returns the HMAC secret required by provider-backed ingest
+// and CRC handlers. Provider sources always sign with HMAC; a missing config
+// must fail closed instead of panicking on a nil HMac pointer.
+func providerHMACSecret(source *datastore.Source) (string, error) {
+	if source == nil || source.Verifier == nil || source.Verifier.HMac == nil {
+		return "", errIngestVerifierMissing
+	}
+	if util.IsStringEmpty(source.Verifier.HMac.Secret) {
+		return "", errIngestVerifierMissing
+	}
+	return source.Verifier.HMac.Secret, nil
+}
+
+// selectIngestVerifier picks the request verifier for an HTTP source. Provider
+// presets (GitHub/Twitter/Shopify) require an HMAC secret; generic sources
+// follow Verifier.Type. Missing nested config returns errIngestVerifierMissing
+// rather than dereferencing nil.
+func selectIngestVerifier(source *datastore.Source) (verifier.Verifier, error) {
+	if source == nil {
+		return nil, errIngestVerifierMissing
+	}
+
+	verifierConfig := source.Verifier
+	if verifierConfig == nil {
+		return nil, errIngestVerifierMissing
+	}
+
+	if !util.IsStringEmpty(string(source.Provider)) {
+		secret, err := providerHMACSecret(source)
+		if err != nil {
+			return nil, err
+		}
+
+		switch source.Provider {
+		case datastore.GithubSourceProvider:
+			return verifier.NewGithubVerifier(secret), nil
+		case datastore.TwitterSourceProvider:
+			return verifier.NewTwitterVerifier(secret), nil
+		case datastore.ShopifySourceProvider:
+			return verifier.NewShopifyVerifier(secret), nil
+		default:
+			return nil, errIngestProviderUndefined
+		}
+	}
+
+	switch verifierConfig.Type {
+	case datastore.HMacVerifier:
+		if verifierConfig.HMac == nil {
+			return nil, errIngestVerifierMissing
+		}
+		opts := &verifier.HmacOptions{
+			Header:   verifierConfig.HMac.Header,
+			Hash:     verifierConfig.HMac.Hash,
+			Secret:   verifierConfig.HMac.Secret,
+			Encoding: string(verifierConfig.HMac.Encoding),
+		}
+		v, err := verifier.NewHmacVerifier(opts)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", errIngestVerifierInit, err)
+		}
+		return v, nil
+
+	case datastore.BasicAuthVerifier:
+		if verifierConfig.BasicAuth == nil {
+			return nil, errIngestVerifierMissing
+		}
+		return verifier.NewBasicAuthVerifier(
+			verifierConfig.BasicAuth.UserName,
+			verifierConfig.BasicAuth.Password,
+		), nil
+
+	case datastore.APIKeyVerifier:
+		if verifierConfig.ApiKey == nil {
+			return nil, errIngestVerifierMissing
+		}
+		return verifier.NewAPIKeyVerifier(
+			verifierConfig.ApiKey.HeaderValue,
+			verifierConfig.ApiKey.HeaderName,
+		), nil
+
+	case datastore.NoopVerifier:
+		// Explicit opt-out of verification. Sources persisted without a
+		// verifier row are canonicalized to this type by the sources read
+		// layer (buildVerifierConfig), so "no verifier configured" lands
+		// here by design when Provider is empty.
+		return &verifier.NoopVerifier{}, nil
+
+	default:
+		// Fail closed: an unknown or stale verifier type must not silently
+		// accept unverified events (see frain-dev/convoy#2656).
+		return nil, errIngestVerifierMissing
+	}
+}

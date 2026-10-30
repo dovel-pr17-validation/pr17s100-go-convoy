@@ -1,0 +1,99 @@
+package services
+
+import (
+	"context"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/pubsub"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+type UpdateSourceService struct {
+	SourceRepo   datastore.SourceRepository
+	Project      *datastore.Project
+	SourceUpdate *models.UpdateSource
+	Source       *datastore.Source
+	Logger       log.Logger
+}
+
+func (s *UpdateSourceService) Run(ctx context.Context) (*datastore.Source, error) {
+	if !util.IsStringEmpty(string(s.SourceUpdate.Provider)) && !s.SourceUpdate.Provider.IsValid() {
+		return nil, &ServiceError{ErrMsg: "Invalid source provider"}
+	}
+
+	s.Source.Name = *s.SourceUpdate.Name
+	s.Source.Verifier = s.SourceUpdate.Verifier.Transform()
+	s.Source.Type = s.SourceUpdate.Type
+
+	if !util.IsStringEmpty(string(s.SourceUpdate.Provider)) {
+		s.Source.Provider = s.SourceUpdate.Provider
+	}
+
+	if s.SourceUpdate.IsDisabled != nil {
+		s.Source.IsDisabled = *s.SourceUpdate.IsDisabled
+	}
+
+	if s.SourceUpdate.Verifier.Type == datastore.HMacVerifier && s.SourceUpdate.Verifier.HMac == nil {
+		return nil, &ServiceError{ErrMsg: "Invalid verifier config for hmac"}
+	}
+
+	if s.SourceUpdate.Verifier.Type == datastore.APIKeyVerifier && s.SourceUpdate.Verifier.ApiKey == nil {
+		return nil, &ServiceError{ErrMsg: "Invalid verifier config for api key"}
+	}
+
+	if s.SourceUpdate.Verifier.Type == datastore.BasicAuthVerifier && s.SourceUpdate.Verifier.BasicAuth == nil {
+		return nil, &ServiceError{ErrMsg: "Invalid verifier config for basic auth"}
+	}
+
+	if s.SourceUpdate.Type == datastore.PubSubSource {
+		if err := pubsub.Validate(s.SourceUpdate.PubSub.Transform()); err != nil {
+			return nil, &ServiceError{ErrMsg: err.Error()}
+		}
+	}
+
+	if s.SourceUpdate.ForwardHeaders != nil {
+		s.Source.ForwardHeaders = s.SourceUpdate.ForwardHeaders
+	}
+
+	if s.SourceUpdate.IdempotencyKeys != nil {
+		s.Source.IdempotencyKeys = s.SourceUpdate.IdempotencyKeys
+	}
+
+	if s.SourceUpdate.EventTypeLocation != nil {
+		s.Source.EventTypeLocation = *s.SourceUpdate.EventTypeLocation
+	}
+
+	if s.SourceUpdate.PubSub != nil {
+		s.Source.PubSub = s.SourceUpdate.PubSub.Transform()
+	}
+
+	if s.SourceUpdate.CustomResponse.Body != nil {
+		s.Source.CustomResponse.Body = *s.SourceUpdate.CustomResponse.Body
+	}
+
+	if s.SourceUpdate.CustomResponse.ContentType != nil {
+		s.Source.CustomResponse.ContentType = *s.SourceUpdate.CustomResponse.ContentType
+	}
+
+	if s.SourceUpdate.BodyFunction != nil {
+		s.Source.BodyFunction = s.SourceUpdate.BodyFunction
+	}
+
+	if s.SourceUpdate.HeaderFunction != nil {
+		s.Source.HeaderFunction = s.SourceUpdate.HeaderFunction
+	}
+
+	if datastore.SourceUsesPayloadSignature(s.Source) && datastore.EventTypeLocationUsesRequestMetadata(s.Source.EventTypeLocation) {
+		return nil, &ServiceError{ErrMsg: "event type location cannot use request headers or query parameters with payload signature verification"}
+	}
+
+	err := s.SourceRepo.UpdateSource(ctx, s.Project.UID, s.Source)
+	if err != nil {
+		s.Logger.ErrorContext(ctx, "failed to update source", "error", err)
+		return nil, &ServiceError{ErrMsg: "an error occurred while updating source", Err: err}
+	}
+
+	return s.Source, nil
+}

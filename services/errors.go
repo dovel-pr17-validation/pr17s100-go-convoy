@@ -1,0 +1,46 @@
+package services
+
+import (
+	"errors"
+
+	endpointurl "github.com/frain-dev/convoy/pkg/url"
+)
+
+const (
+	ErrCodeAuthInvalid    = "auth.invalid"
+	ErrCodeLicenseExpired = "license.expired"
+	// ErrCodeInternal marks a server-side failure (DB/repository, token
+	// generation, etc.) so handlers can distinguish it from an auth failure and
+	// return 5xx instead of a misleading 401.
+	ErrCodeInternal = "internal"
+)
+
+const (
+	ErrMutualTLSFeatureUnavailable = "mutual TLS feature unavailable, please upgrade your license"
+	ErrOAuth2FeatureUnavailable    = "OAuth2 feature unavailable, please upgrade your license"
+	ErrBasicAuthFeatureUnavailable = "Basic Auth feature unavailable, please upgrade your license"
+)
+
+var (
+	// Endpoint URL validation errors are owned by pkg/url (the single source of
+	// truth shared by the API and the bulk-onboard worker); aliased here so
+	// existing services callers and errors.Is checks keep working.
+	ErrEndpointURLRequired   = endpointurl.ErrEndpointURLRequired
+	ErrHTTPSOnly             = endpointurl.ErrHTTPSOnly
+	ErrInvalidEndpointScheme = endpointurl.ErrInvalidEndpointScheme
+	ErrAPIKeyFieldRequired   = errors.New("api key field is required")
+)
+
+type ServiceError struct {
+	ErrMsg string
+	Err    error
+	Code   string // e.g. "auth.invalid", "license.expired"
+}
+
+func (a *ServiceError) Error() string {
+	return a.ErrMsg
+}
+
+func (a *ServiceError) Unwrap() error {
+	return a.Err
+}

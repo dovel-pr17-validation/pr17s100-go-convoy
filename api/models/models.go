@@ -1,0 +1,173 @@
+package models
+
+import (
+	"encoding/json"
+	"time"
+
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/frain-dev/convoy/auth"
+	"github.com/frain-dev/convoy/datastore"
+)
+
+type PagedResponse struct {
+	Content    interface{}               `json:"content,omitempty"`
+	Pagination *datastore.PaginationData `json:"pagination,omitempty" extensions:"x-nullable"`
+}
+
+type Organisation struct {
+	Name         string `json:"name" bson:"name"`
+	CustomDomain string `json:"custom_domain" bson:"custom_domain"`
+}
+
+type OrganisationInvite struct {
+	InviteeEmail string    `json:"invitee_email" valid:"required~please provide a valid invitee email,email"`
+	Role         auth.Role `json:"role" bson:"role"`
+}
+
+type PersonalAPIKey struct {
+	Name       string `json:"name"`
+	Expiration int    `json:"expiration"`
+}
+
+type UpdateOrganisationMember struct {
+	Role auth.Role `json:"role" bson:"role"`
+}
+
+type APIKeyByIDResponse struct {
+	UID       string            `json:"uid"`
+	Name      string            `json:"name"`
+	Role      auth.Role         `json:"role"`
+	Type      datastore.KeyType `json:"key_type"`
+	ExpiresAt null.Time         `json:"expires_at,omitempty" extensions:"x-nullable"`
+	CreatedAt time.Time         `json:"created_at,omitempty"`
+	UpdatedAt time.Time         `json:"updated_at,omitempty"`
+}
+
+type UserInviteTokenResponse struct {
+	Token *datastore.OrganisationInvite `json:"token" extensions:"x-nullable"`
+	User  *datastore.User               `json:"user" extensions:"x-nullable"`
+}
+
+type InviteTokenLookupResponse struct {
+	Token      *OrganisationInviteToken `json:"token" extensions:"x-nullable"`
+	UserExists bool                     `json:"user_exists"`
+	FirstName  string                   `json:"first_name,omitempty"`
+	LastName   string                   `json:"last_name,omitempty"`
+}
+
+type OrganisationInviteToken struct {
+	OrganisationName string                 `json:"organisation_name,omitempty"`
+	InviteeEmail     string                 `json:"invitee_email"`
+	Role             auth.Role              `json:"role"`
+	Status           datastore.InviteStatus `json:"status"`
+}
+
+func NewOrganisationInviteToken(invite *datastore.OrganisationInvite) *OrganisationInviteToken {
+	if invite == nil {
+		return nil
+	}
+
+	return &OrganisationInviteToken{
+		OrganisationName: invite.OrganisationName,
+		InviteeEmail:     invite.InviteeEmail,
+		Role:             invite.Role,
+		Status:           invite.Status,
+	}
+}
+
+type DeliveryAttempt struct {
+	MessageID  string `json:"msg_id" bson:"msg_id"`
+	APIVersion string `json:"api_version" bson:"api_version"`
+	IPAddress  string `json:"ip" bson:"ip"`
+
+	Status    string `json:"status" bson:"status"`
+	CreatedAt int64  `json:"created_at" bson:"created_at"`
+
+	MessageResponse MessageResponse `json:"response" bson:"response"`
+}
+
+type MessageResponse struct {
+	Status int             `json:"status" bson:"status"`
+	Data   json.RawMessage `json:"data" bson:"data"`
+}
+type ExpireSecret struct {
+	// New Endpoint secret value.
+	Secret string `json:"secret"`
+
+	// Amount of time to wait before expiring the old endpoint secret.
+	// If AdvancedSignatures is turned on for the project, signatures for both secrets will be generated up until
+	// the old signature is expired.
+	Expiration int `json:"expiration"`
+}
+
+type DashboardSummary struct {
+	EventsSent   uint64                     `json:"events_sent" bson:"events_sent"`
+	Applications int                        `json:"apps" bson:"apps"`
+	Period       string                     `json:"period" bson:"period"`
+	PeriodData   *[]datastore.EventInterval `json:"event_data,omitempty" bson:"event_data"`
+}
+
+type WebhookRequest struct {
+	Event string          `json:"event" bson:"event"`
+	Data  json.RawMessage `json:"data" bson:"data"`
+}
+
+type CreateEndpointApiKey struct {
+	Project    *datastore.Project
+	Endpoint   *datastore.Endpoint
+	Name       string `json:"name"`
+	BaseUrl    string
+	KeyType    datastore.KeyType `json:"key_type"`
+	Expiration int               `json:"expiration"`
+}
+
+// NewListResponse is a generic function for looping over
+// a slice of type M and returning a slice of type T
+func NewListResponse[T, M any](items []M, fn func(item M) T) []T {
+	results := make([]T, 0, len(items))
+
+	for _, item := range items {
+		results = append(results, fn(item))
+	}
+
+	return results
+}
+
+type UpdateOrganisationFeatureFlags struct {
+	FeatureFlags map[string]bool `json:"feature_flags" valid:"required"`
+}
+
+type UpdateOrganisationOverride struct {
+	FeatureKey string `json:"feature_key" valid:"required"`
+	Enabled    bool   `json:"enabled"`
+}
+
+type UpdateOrganisationCircuitBreakerConfig struct {
+	SampleRate                  uint64 `json:"sample_rate" valid:"required,min(1)"`
+	ErrorTimeout                uint64 `json:"error_timeout" valid:"required,min(1)"`
+	FailureThreshold            uint64 `json:"failure_threshold" valid:"required,range(0|100)"`
+	SuccessThreshold            uint64 `json:"success_threshold" valid:"required,range(0|100)"`
+	ObservabilityWindow         uint64 `json:"observability_window" valid:"required,min(1)"`
+	MinimumRequestCount         uint64 `json:"minimum_request_count" valid:"required,min(0)"`
+	ConsecutiveFailureThreshold uint64 `json:"consecutive_failure_threshold" valid:"required,min(0)"`
+}
+
+type UpdateFeatureFlagRequest struct {
+	FeatureKey string `json:"feature_key" valid:"required"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+}
+
+type RetryEventDeliveriesRequest struct {
+	Status    string `json:"status" valid:"required"`
+	Time      string `json:"time" valid:"required"`
+	EventID   string `json:"event_id,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
+}
+
+type EarlyAdopterFeature struct {
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
+}

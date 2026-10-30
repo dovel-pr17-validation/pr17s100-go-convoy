@@ -1,0 +1,199 @@
+import { Location } from '@angular/common';
+import { Injectable } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
+import { BehaviorSubject } from 'rxjs';
+import { FILTER_QUERY_PARAM } from 'src/app/models/event.model';
+import { NOTIFICATION_STATUS } from 'src/app/models/global.model';
+import { apiOrigin } from 'src/app/services/api-origin';
+
+@Injectable({
+	providedIn: 'root'
+})
+export class GeneralService {
+	alertStatus: BehaviorSubject<{ message: string; style: NOTIFICATION_STATUS; type?: string; show: boolean }> = new BehaviorSubject<{ message: string; style: NOTIFICATION_STATUS; type?: string; show: boolean }>({ message: 'testing', style: 'info', type: 'alert', show: false });
+
+
+	constructor(private route: ActivatedRoute, private _location: Location) {}
+
+	showNotification(details: { message: string; style: NOTIFICATION_STATUS; type?: string }) {
+		let message = this.capitalizeMessage(details.message);
+		// A 504/timeout body often has no `message`, so the interceptor used to
+		// toast an empty red bar. Error toasts always need readable copy.
+		if (details.style === 'error' && !message.trim()) {
+			message = 'Something went wrong. Try again.';
+		}
+		this.alertStatus.next({ message, style: details.style, show: true, type: details.type ? details.type : 'alert' });
+		if (details.type === 'modal') return;
+
+		setTimeout(() => {
+			this.dismissNotification();
+		}, 7000);
+	}
+
+	/** Ensure toast/API copy always starts with a capital letter. */
+	private capitalizeMessage(message: string): string {
+		const text = (message ?? '').trim();
+		if (!text) return message ?? '';
+		return text.charAt(0).toUpperCase() + text.slice(1);
+	}
+
+	dismissNotification() {
+		this.alertStatus.next({ message: '', style: 'info', show: false });
+	}
+
+	apiURL(): string {
+		return apiOrigin();
+	}
+
+	getSelectedDate(dateOption: string) {
+		const _date = new Date();
+		let startDate, endDate, currentDayOfTheWeek;
+		switch (dateOption) {
+			case 'Last Year':
+				startDate = new Date(_date.getFullYear() - 1, 0, 1);
+				endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+				break;
+			case 'Last Month':
+				startDate = new Date(_date.getFullYear(), _date.getMonth() == 0 ? 11 : _date.getMonth() - 1, 1);
+				endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+				break;
+			case 'Last Week':
+				currentDayOfTheWeek = _date.getDay();
+				switch (currentDayOfTheWeek) {
+					case 0:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 7);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 1:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 8);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 2:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 9);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 3:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 10);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 4:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 11);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 5:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 13);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					case 6:
+						startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 14);
+						endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+						break;
+					default:
+						break;
+				}
+				break;
+			case 'Yesterday':
+				startDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate() - 1);
+				endDate = new Date(_date.getFullYear(), _date.getMonth(), _date.getDate());
+				break;
+			default:
+				break;
+		}
+
+		return { startDate, endDate };
+	}
+
+	getDate(date: Date) {
+		const months = ['Jan', 'Feb', 'Mar', 'April', 'May', 'June', 'July', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec'];
+		const _date = new Date(date);
+		const day = _date.getDate();
+		const month = _date.getMonth();
+		const year = _date.getFullYear();
+		return `${day} ${months[month]}, ${year}`;
+	}
+
+	setContentDisplayed(content: { created_at: Date }[], sortOrder?: string) {
+		const dateCreateds = content.map((item: { created_at: Date }) => this.getDate(item.created_at));
+		const uniqueDateCreateds = [...new Set(dateCreateds)];
+		let displayedItems: any = [];
+		uniqueDateCreateds.forEach(itemDate => {
+			const filteredItemDate = content.filter((item: { created_at: Date }) => this.getDate(item.created_at) === itemDate);
+			const contents = { date: itemDate, content: filteredItemDate };
+			displayedItems.push(contents);
+
+			displayedItems = sortOrder === 'desc' ? displayedItems.sort((a: any, b: any) => Number(new Date(b.date)) - Number(new Date(a.date))) : displayedItems.sort((a: any, b: any) => Number(new Date(a.date)) - Number(new Date(b.date)));
+		});
+
+		return displayedItems;
+	}
+
+	addFilterToURL(params?: FILTER_QUERY_PARAM, replace = false) {
+		const queryParams = replace ? { ...params } : { ...this.route.snapshot.queryParams, ...params };
+
+		if (!params?.next_page_cursor) delete queryParams.next_page_cursor;
+		if (!params?.prev_page_cursor) delete queryParams.prev_page_cursor;
+
+		const cleanedQuery: any = Object.fromEntries(Object.entries(queryParams).filter(([_, q]) => q !== '' && q !== undefined && q !== null));
+		const parts = Object.entries(cleanedQuery).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+		const path = this._location.path().split('?')[0];
+		this._location.go(parts.length ? `${path}?${parts.join('&')}` : path);
+
+		return queryParams;
+	}
+
+	getCodeSnippetString(type: 'event_data' | 'res_body' | 'res_header' | 'req_header' | 'error' | 'log', data: any) {
+		let displayMessage: string;
+		switch (type) {
+			case 'event_data':
+				displayMessage = 'No event payload was sent';
+				break;
+			case 'res_body':
+				displayMessage = 'No response body was sent';
+				break;
+			case 'res_header':
+				displayMessage = 'No response header was sent';
+				break;
+			case 'req_header':
+				displayMessage = 'No request header was sent';
+				break;
+			default:
+				displayMessage = '';
+				break;
+		}
+
+		// Response bodies and error text arrive as raw strings (already
+		// JSON-encoded by the endpoint, or a plain message). Running
+		// JSON.stringify on a string double-encodes it (wraps in quotes, escapes
+		// inner quotes), so parse it first and only pretty-print when it is valid
+		// JSON; otherwise show the raw string as-is.
+		if ((type === 'res_body' || type === 'error') && typeof data === 'string') {
+			const raw = data.trim();
+			if (!raw) return displayMessage;
+			try {
+				return JSON.stringify(JSON.parse(raw), null, 4);
+			} catch {
+				return data;
+			}
+		}
+
+		if (data !== undefined && data !== null) return JSON.stringify(data, null, 4);
+		return displayMessage;
+	}
+
+	// Pull the most specific message out of an HTTP/error object, falling back to
+	// the provided default. Centralises the repeated
+	// `error?.error?.message || error?.message || 'fallback'` chain.
+	extractMessage(error: any, fallback: string): string {
+		return error?.error?.message || error?.message || fallback;
+	}
+
+	convertStringToJson(str: string) {
+		try {
+			const jsonObject = JSON.parse(str);
+			return jsonObject;
+		} catch {
+			this.showNotification({ message: 'Data is not entered in correct JSON format', style: 'error' });
+			return false;
+		}
+	}
+}

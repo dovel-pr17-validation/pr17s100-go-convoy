@@ -1,0 +1,54 @@
+<div convoy-dropdown size="md" [position]="position" [show]="show" #endpointsFilterDropdown>
+  <ng-container dropdownTrigger>
+    <ng-content select="[dropdownTrigger]"></ng-content>
+  </ng-container>
+
+  <div dropdownOptions>
+    <div class="m-10px border border-new.border h-36px px-14px rounded-[10px] flex items-center bg-white-100">
+      <img src="/assets/img/search-icon.svg" alt="search icon" class="mr-10px w-14px" />
+      <input type="search" placeholder="Search endpoints" #endpoint class="w-full outline-none font-body text-[12px] text-new.text-primary placeholder:text-new.text-placeholder bg-transparent" />
+    </div>
+
+    <ul class="min-h-[100px] max-h-[200px] overflow-auto pb-10px">
+      @if (!loadingFilterEndpoints) {
+        @for (endpoint of endpoints$ | async; track $index) {
+          <li
+            convoy-dropdown-option
+            convoy-list-item
+            (click)="selectedEndpoint = endpoint; setEndpoint.emit(selectedEndpoint)"
+            class="text-14 px-20px"
+            [ngClass]="{ '!bg-new.surface-muted !text-new.primary-400': selectedEndpoint && selectedEndpoint.uid === endpoint.uid }"
+            >
+            <button type="button" class="capitalize font-body font-normal text-left w-full justify-start text-[12px] text-new.text-primary py-4px">
+              {{ endpoint.title || endpoint.name }}
+            </button>
+          </li>
+        }
+        @if ((endpoints$ | async)?.length === 0) {
+          <li class="text-12 font-body text-new.text-secondary px-20px py-10px" convoy-list-item [hasBorder]="false">
+            No endpoints found
+          </li>
+        }
+      }
+
+      @if (loadingFilterEndpoints) {
+        <li class="!px-10px py-10px" convoy-list-item [hasBorder]="false">
+          <convoy-skeleton-loader className="w-120px h-16px"></convoy-skeleton-loader>
+          <convoy-skeleton-loader className="w-20px h-16px"></convoy-skeleton-loader>
+        </li>
+        <li class="!px-10px py-10px" convoy-list-item [hasBorder]="false">
+          <convoy-skeleton-loader className="w-120px h-16px"></convoy-skeleton-loader>
+          <convoy-skeleton-loader className="w-20px h-16px"></convoy-skeleton-loader>
+        </li>
+        <li class="!px-10px py-10px" convoy-list-item [hasBorder]="false">
+          <convoy-skeleton-loader className="w-120px h-16px"></convoy-skeleton-loader>
+          <convoy-skeleton-loader className="w-20px h-16px"></convoy-skeleton-loader>
+        </li>
+        <li class="!px-10px py-10px" convoy-list-item [hasBorder]="false">
+          <convoy-skeleton-loader className="w-120px h-16px"></convoy-skeleton-loader>
+          <convoy-skeleton-loader className="w-20px h-16px"></convoy-skeleton-loader>
+        </li>
+      }
+    </ul>
+  </div>
+</div>

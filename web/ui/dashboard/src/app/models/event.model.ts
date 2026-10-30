@@ -1,0 +1,106 @@
+import {DEVICE} from './device.model';
+import {APP, ENDPOINT} from './endpoint.model';
+import {SOURCE} from './source.model';
+
+export interface EVENT {
+	created_at: Date;
+	provider_id: string;
+	status?: string;
+	// Set by the server only when an event failed, explaining why it never
+	// reached an endpoint (for example no matching URL template).
+	failure_reason?: string;
+	uid: string;
+	updated_at: string;
+	app_id?: string;
+	idempotency_key: string;
+	is_duplicate_event: boolean;
+	event_type: string;
+	endpoints?: string[];
+	data: any;
+	matched_endpoints: number;
+	endpoint_metadata: ENDPOINT[];
+	app_metadata: APP;
+	source_metadata: SOURCE;
+}
+
+export interface EVENT_DELIVERY {
+	created_at: string;
+	acknowledged_at?: string;
+	status: string;
+	uid: string;
+	updated_at: string;
+	device_id: string;
+	description?: string;
+	cli_metadata?: {
+		event_type: string;
+		host_name: string;
+	};
+	idempotency_key: string;
+	metadata: {
+		interval_seconds: number;
+		next_send_time: string;
+		num_trials: number;
+		retry_limit: number;
+		strategy: string;
+		data: any;
+	};
+	source_metadata: SOURCE;
+	endpoint_metadata: ENDPOINT;
+	app_metadata: APP;
+	event_metadata: EVENT;
+	device_metadata: DEVICE;
+	endpoint_id: string;
+	latency_seconds?: number;
+	target_url?: string;
+	delivery_mode?: 'at_least_once' | 'at_most_once';
+}
+
+export interface EVENT_DELIVERY_ATTEMPT {
+	url?: string;
+	ip_address: string;
+	http_status: string;
+	api_version: string;
+	updated_at: string;
+	created_at: string;
+	requested_at?: string;
+	responded_at?: string;
+	deleted_at?: number;
+	status?: boolean;
+	response_data?: string;
+	response_http_header: any;
+	request_http_header: any;
+	uid: string;
+	error?: string;
+}
+
+export interface FILTER_QUERY_PARAM {
+	startDate?: string;
+	endDate?: string;
+	eventId?: string;
+	endpointId?: string;
+	idempotencyKey?: string;
+	idempotencyValue?: string;
+	status?: string;
+	sourceId?: string;
+	next_page_cursor?: string;
+	prev_page_cursor?: string;
+	direction?: 'next' | 'prev';
+	showLoader?: boolean;
+	query?: string;
+	queryMode?: 'text';
+	body?: string;
+	name?: string;
+	sort?: string;
+	eventType?: string;
+	ownerId?: string;
+}
+
+
+export interface EVENT_TYPE{
+    name: string;
+	category?: string;
+	description?: string;
+    json_schema?: any;
+	uid: string;
+	deprecated_at?: string;
+}

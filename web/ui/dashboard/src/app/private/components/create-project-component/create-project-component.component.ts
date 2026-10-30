@@ -1,0 +1,684 @@
+import {Component, ElementRef, EventEmitter, inject, Input, OnInit, Output, ViewChild} from '@angular/core';
+import {
+    AbstractControl,
+    FormArray,
+    FormBuilder,
+    FormGroup,
+    ValidationErrors,
+    ValidatorFn,
+    Validators
+} from '@angular/forms';
+import {ActivatedRoute, Router} from '@angular/router';
+import {PROJECT, VERSIONS} from 'src/app/models/project.model';
+import {GeneralService} from 'src/app/services/general/general.service';
+import {PrivateService} from '../../private.service';
+import {CreateProjectComponentService} from './create-project-component.service';
+import {RbacService} from 'src/app/services/rbac/rbac.service';
+import {LicensesService} from 'src/app/services/licenses/licenses.service';
+import {EVENT_TYPE} from 'src/app/models/event.model';
+import {SettingsService} from '../../pages/settings/settings.service';
+
+
+interface TAB {
+	label: string;
+	svg: 'fill' | 'stroke';
+	icon: string;
+}
+
+function jsonValidator(): ValidatorFn {
+    return (control: AbstractControl): ValidationErrors | null => {
+        if (!control.value || typeof control.value === 'object') {
+            return null;
+        }
+        try {
+            JSON.parse(control.value);
+            return null; // Valid JSON
+        } catch (e) {
+            return { invalidJson: true }; // Invalid JSON
+        }
+    };
+}
+
+@Component({
+    selector: 'app-create-project-component',
+    templateUrl: './create-project-component.component.html',
+    styleUrls: ['./create-project-component.component.scss'],
+    standalone: false
+})
+export class CreateProjectComponent implements OnInit {
+	@ViewChild('disableEndpointsDialog', { static: true }) disableEndpointsDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('disableTLSEndpointsDialog', { static: true }) disableTLSEndpointsDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('metaEventsDialog', { static: true }) metaEventsDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('confirmationDialog', { static: true }) confirmationDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('newSignatureDialog', { static: true }) newSignatureDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('newEventTypeDialog', { static: true }) newEventTypeDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('mutliSubEndpointsDialog', { static: true }) mutliSubEndpointsDialog!: ElementRef<HTMLDialogElement>;
+	@ViewChild('tokenDialog', { static: true }) tokenDialog!: ElementRef<HTMLDialogElement>;
+
+	signatureTableHead: string[] = ['Header', 'Version', 'Hash', 'Encoding'];
+	eventTypeTableHead: string[] = ['Event Type', 'Status', 'Category', 'Description', ''];
+	projectForm: FormGroup = this.formBuilder.group({
+		name: ['', Validators.required],
+		config: this.formBuilder.group({
+			strategy: this.formBuilder.group({
+				duration: [null],
+				retry_count: [null],
+				type: [null]
+			}),
+			signature: this.formBuilder.group({
+				header: [null],
+				versions: this.formBuilder.array([])
+			}),
+			request_id_header: [''],
+			ratelimit: this.formBuilder.group({
+				count: [null],
+				duration: [null]
+			}),
+			ssl: this.formBuilder.group({
+				enforce_secure_endpoints: [true]
+			}),
+			disable_endpoint: [false, Validators.required],
+			add_event_id_trace_headers: [false],
+			multiple_endpoint_subscriptions: [false, Validators.required],
+			verify_dynamic_events: [false, Validators.required],
+			allow_unmatched_dynamic_urls: [false, Validators.required],
+			meta_event: this.formBuilder.group({
+				is_enabled: [false, Validators.required],
+				type: ['http', Validators.required],
+				event_type: [[], Validators.required],
+				url: ['', Validators.required],
+				secret: [null]
+			})
+		}),
+		type: [null, Validators.required]
+	});
+	newEventTypeForm: FormGroup = this.formBuilder.group({
+		name: ['', Validators.required],
+		category: ['', Validators.required],
+		description: ['', Validators.required],
+        json_schema: ['', jsonValidator()],
+	});
+	newSignatureForm: FormGroup = this.formBuilder.group({
+		encoding: [null],
+		hash: [null]
+	});
+	isCreatingProject = false;
+	enableMoreConfig = false;
+	regeneratingKey = false;
+	apiKey!: string;
+	hashAlgorithms = ['SHA256', 'SHA512'];
+	retryLogicTypes = [
+		{ uid: 'linear', name: 'Linear time retry' },
+		{ uid: 'exponential', name: 'Exponential time backoff' }
+	];
+	encodings = ['base64', 'hex'];
+	@Output('onAction') onAction = new EventEmitter<any>();
+	@Input('action') action: 'create' | 'update' = 'create';
+	projectDetails!: PROJECT;
+	signatureVersions!: { date: string; content: VERSIONS[] }[];
+	configurations = [
+		{ uid: 'strategy', name: 'Retry Config', show: false, deleted: false },
+		{ uid: 'ratelimit', name: 'Rate Limit', show: false, deleted: false },
+		{ uid: 'signature', name: 'Signature Format', show: false, deleted: false },
+		{ uid: 'request_id_header', name: 'Request ID Header', show: false, deleted: false },
+	];
+	public rbacService = inject(RbacService);
+	tabs: TAB[] = [
+		{ label: 'project config', svg: 'fill', icon: 'settings' },
+		{ label: 'signature history', svg: 'fill', icon: 'sig-history' },
+		{ label: 'endpoints config', svg: 'stroke', icon: 'endpoints' },
+		{ label: 'meta events config', svg: 'stroke', icon: 'meta-events' },
+		{ label: 'event types', svg: 'stroke', icon: 'event-type' },
+		{ label: 'secrets', svg: 'stroke', icon: 'secret' },
+		{ label: 'circuit breaker', svg: 'stroke', icon: 'shield' }
+	];
+	activeTab = this.tabs[0];
+	events = ['endpoint.created', 'endpoint.deleted', 'endpoint.updated', 'eventdelivery.success', 'eventdelivery.failed', 'eventdelivery.retrying', 'project.updated'];
+	eventTypes: EVENT_TYPE[] = [];
+	selectedEventType: EVENT_TYPE | null = null;
+    rateLimitDeleted = false;
+	circuitBreakerFeatureEnabled = false;
+	organisationId!: string;
+
+	constructor(
+		private formBuilder: FormBuilder,
+		private createProjectService: CreateProjectComponentService,
+		private generalService: GeneralService,
+		private privateService: PrivateService,
+		public router: Router,
+		private route: ActivatedRoute,
+		public licenseService: LicensesService,
+		private settingsService: SettingsService
+	) {}
+
+	// Normalized view model for circuit breaker with hard defaults to 0
+	get circuitBreakerView() {
+		const cb = this.projectDetails?.config?.circuit_breaker as
+			| {
+					sample_rate?: number;
+					error_timeout?: number;
+					failure_threshold?: number;
+					success_threshold?: number;
+					observability_window?: number;
+					minimum_request_count?: number;
+					consecutive_failure_threshold?: number;
+			  }
+			| undefined;
+		return {
+			sample_rate: cb?.sample_rate ?? 0,
+			error_timeout: cb?.error_timeout ?? 0,
+			failure_threshold: cb?.failure_threshold ?? 0,
+			success_threshold: cb?.success_threshold ?? 0,
+			observability_window: cb?.observability_window ?? 0,
+			minimum_request_count: cb?.minimum_request_count ?? 0,
+			consecutive_failure_threshold: cb?.consecutive_failure_threshold ?? 0,
+		};
+	}
+
+	async ngOnInit() {
+		this.getEventTypes();
+		if (this.action === 'update') {
+			await this.getProjectDetails();
+			await this.checkCircuitBreakerFeatureFlag();
+		}
+		if (!(await this.rbacService.userCanAccess('Project Settings|MANAGE'))) this.projectForm.disable();
+		if (this.action === 'update') this.switchTab(this.tabs.find(tab => tab.label == this.route.snapshot.queryParams?.activePage) ?? this.tabs[0]);
+
+		this.projectForm.get('type')?.valueChanges.subscribe(type => {
+			if (type === 'incoming') {
+				this.hideOutgoingOnlyConfigs();
+			}
+		});
+	}
+
+	async checkCircuitBreakerFeatureFlag() {
+		const org = localStorage.getItem('CONVOY_ORG');
+		if (!org) return;
+		try {
+			const organisationDetails = JSON.parse(org);
+			this.organisationId = organisationDetails.uid;
+			const response = await this.settingsService.getOrganisationFeatureFlags({
+				org_id: this.organisationId
+			});
+			const featureFlags = response.data || {};
+			this.circuitBreakerFeatureEnabled = featureFlags['circuit-breaker'] || false;
+		} catch (error) {
+			this.circuitBreakerFeatureEnabled = false;
+		}
+	}
+
+	get versions(): FormArray {
+		return this.projectForm.get('config.signature.versions') as FormArray;
+	}
+
+	get versionsLength(): any {
+		const versionsControl = this.projectForm.get('config.signature.versions') as FormArray;
+		return versionsControl.length;
+	}
+	newVersion(): FormGroup {
+		return this.formBuilder.group({
+			encoding: ['', Validators.required],
+			hash: ['', Validators.required]
+		});
+	}
+
+	addVersion() {
+		this.versions.push(this.newVersion());
+	}
+
+	private readonly DEFAULT_REQUEST_ID_HEADER = 'X-Convoy-Idempotency-Key';
+
+	isCustomRequestIdHeader(value?: string): boolean {
+		const header = (value ?? '').trim();
+		return header !== '' && header !== this.DEFAULT_REQUEST_ID_HEADER;
+	}
+
+	setRequestIdHeaderVisibilityFromValue(value?: string): void {
+		const config = this.configurations.find(item => item.uid === 'request_id_header');
+		if (!config) return;
+
+		config.show = this.isCustomRequestIdHeader(value);
+		config.deleted = false;
+		this.projectForm.get('config.request_id_header')?.setValue(config.show ? (value ?? '').trim() : '');
+	}
+
+	clearRequestIdHeaderConfig(): void {
+		const config = this.configurations.find(item => item.uid === 'request_id_header');
+		if (!config) return;
+
+		config.show = false;
+		config.deleted = true;
+		this.projectForm.get('config.request_id_header')?.setValue('');
+	}
+
+	toggleConfigForm(configValue: string, deleted?: boolean) {
+		if (deleted && configValue === 'request_id_header') {
+			this.clearRequestIdHeaderConfig();
+			return;
+		}
+
+		this.configurations.forEach(config => {
+			if (config.uid !== configValue) return;
+
+			if (deleted) {
+				config.show = false;
+				config.deleted = true;
+			} else {
+				config.show = !config.show;
+				config.deleted = false;
+			}
+		});
+	}
+	setConfigFormDeleted(configValue: string, deleted: boolean) {
+		this.configurations.forEach(config => {
+			if (config.uid === configValue) {
+                config.deleted = deleted;
+            }
+		});
+	}
+
+	showConfig(configValue: string): boolean {
+		return this.configurations.find(config => config.uid === configValue)?.show || false;
+	}
+
+    configDeleted(configValue: string): boolean {
+        return this.configurations.find(config => config.uid === configValue)?.deleted || false;
+    }
+
+	async getProjectDetails() {
+		try {
+			this.projectDetails = this.privateService.getProjectDetails;
+
+			this.setSignatureVersions();
+
+			if (this.projectDetails?.type === 'incoming') this.tabs = this.tabs.filter(tab => tab.label !== 'signature history');
+
+			this.projectForm.patchValue(this.projectDetails);
+			this.projectForm.get('config.strategy')?.patchValue(this.projectDetails.config.strategy);
+			this.projectForm.get('config.signature')?.patchValue(this.projectDetails.config.signature);
+			this.projectForm.get('config.ratelimit')?.patchValue(this.projectDetails.config.ratelimit);
+			this.projectForm.get('config.add_event_id_trace_headers')?.patchValue(!!this.projectDetails.config?.add_event_id_trace_headers);
+			this.projectForm.get('config.verify_dynamic_events')?.patchValue(!!this.projectDetails.config?.verify_dynamic_events);
+			this.projectForm.get('config.allow_unmatched_dynamic_urls')?.patchValue(!!this.projectDetails.config?.allow_unmatched_dynamic_urls);
+
+			// set meta events config
+			this.projectDetails.config.meta_event && this.projectDetails.config.meta_event.is_enabled
+				? this.projectForm.get('config.meta_event.is_enabled')?.patchValue(this.projectDetails.config.meta_event.is_enabled)
+				: this.projectForm.get('config.meta_event.is_enabled')?.patchValue(false);
+
+			this.projectForm.get('config.meta_event.type')?.patchValue('http');
+
+			let filteredConfigs: string[] = ['request_id_header'];
+			if (this.projectDetails?.type === 'incoming') filteredConfigs.push('signature');
+
+			this.configurations.filter(item => !filteredConfigs.includes(item.uid)).forEach(config => this.toggleConfigForm(config.uid));
+			this.setRequestIdHeaderVisibilityFromValue(this.projectDetails?.config?.request_id_header);
+		} catch {}
+	}
+
+	setSignatureVersions() {
+		const versions = this.projectDetails.config.signature.versions;
+		if (!versions?.length) return;
+		this.signatureVersions = this.generalService.setContentDisplayed(versions);
+		versions.forEach((version: { encoding: any; hash: any }, index: number) => {
+			this.addVersion();
+			this.versions.at(index)?.patchValue({
+				encoding: version.encoding,
+				hash: version.hash
+			});
+		});
+	}
+
+	async createProject() {
+		const projectFormModal = document.getElementById('projectForm');
+
+		if (this.projectForm.get('name')?.invalid || this.projectForm.get('type')?.invalid) {
+			projectFormModal?.scroll({ top: 0 });
+			this.projectForm.markAllAsTouched();
+			return;
+		}
+		const projectData = this.getProjectData();
+
+		this.isCreatingProject = true;
+
+		try {
+			// this createProject service also updates the project as an active project in localstorage
+			const response = await this.createProjectService.createProject(projectData);
+			// Sync new project as active so UI (e.g. project selector) auto-selects it
+			const user = this.privateService.getUserProfile;
+			if (user?.uid) {
+				this.privateService.setUserProject(user.uid, response.data.project);
+			}
+			this.privateService.projectDetails = { data: response.data.project } as any;
+			await this.privateService.getProjectStat({ refresh: true });
+
+			this.privateService.getProjects({ refresh: true });
+
+			projectFormModal?.scroll({ top: 0, behavior: 'smooth' });
+			this.isCreatingProject = false;
+			this.projectForm.reset();
+			this.apiKey = response.data.api_key.key;
+			this.projectDetails = response.data.project;
+			if (projectFormModal) projectFormModal.style.overflowY = 'hidden';
+			this.tokenDialog.nativeElement.showModal();
+			this.licenseService.setLicenses();
+		} catch (error) {
+			this.isCreatingProject = false;
+		}
+	}
+
+	async updateProject() {
+		this.checkMetaEventsConfig();
+		if (this.projectForm.invalid) return this.projectForm.markAllAsTouched();
+
+		const payload = this.buildProjectUpdatePayload();
+
+		this.isCreatingProject = true;
+
+		try {
+			const response = await this.createProjectService.updateProject(payload);
+
+			this.generalService.showNotification({ message: 'Project updated successfully!', style: 'success' });
+			this.projectDetails = response.data;
+			this.setRequestIdHeaderVisibilityFromValue(response.data?.config?.request_id_header);
+			this.onAction.emit(response.data);
+			this.isCreatingProject = false;
+		} catch (error) {
+			console.error('[updateProject] update failed:', error);
+			this.isCreatingProject = false;
+		}
+	}
+
+	buildProjectUpdatePayload() {
+		const payload = structuredClone(this.projectForm.getRawValue());
+
+		if (typeof payload.config.ratelimit?.duration === 'string') payload.config.ratelimit.duration = this.getTimeValue(payload.config.ratelimit.duration);
+		if (typeof payload.config.strategy?.duration === 'string') payload.config.strategy.duration = this.getTimeValue(payload.config.strategy.duration);
+		if (typeof payload.config.strategy?.retry_count === 'string') payload.config.strategy.retry_count = parseInt(payload.config.strategy.retry_count);
+		if (typeof payload.config.ratelimit?.count === 'string') payload.config.ratelimit.count = parseInt(payload.config.ratelimit.count);
+
+		if (!this.showConfig('ratelimit') && this.configDeleted('ratelimit')) {
+			payload.config.ratelimit = { count: 0, duration: 0 };
+			this.projectForm.get('config.ratelimit')?.patchValue({ count: 0, duration: 0 });
+			this.setConfigFormDeleted('ratelimit', false);
+		}
+
+		if (!this.isCustomRequestIdHeader(payload.config?.request_id_header)) {
+			payload.config.request_id_header = '';
+			this.projectForm.get('config.request_id_header')?.setValue('');
+		}
+
+		return payload;
+	}
+
+	async regenerateKey() {
+		this.confirmationDialog.nativeElement.close();
+		this.regeneratingKey = true;
+		try {
+			const response = await this.createProjectService.regenerateKey();
+			this.generalService.showNotification({ message: response.message, style: 'success' });
+			this.regeneratingKey = false;
+			this.apiKey = response.data.key;
+			this.tokenDialog.nativeElement.showModal();
+			return;
+		} catch (error) {
+			this.regeneratingKey = false;
+			return error;
+		}
+	}
+
+	async createNewSignature(i: number) {
+		if (this.newSignatureForm.invalid) return this.newSignatureForm.markAllAsTouched();
+
+		this.versions.at(i).patchValue(this.newSignatureForm.value);
+		await this.updateProject();
+		this.newSignatureForm.reset();
+		this.newSignatureDialog.nativeElement.close();
+		this.getProjectDetails();
+	}
+
+	getProjectData() {
+		const projectData = structuredClone(this.projectForm.getRawValue());
+		const configKeys = Object.keys(projectData.config);
+
+		configKeys.forEach(configKey => {
+			if (!this.showConfig(configKey)) {
+				if (configKey === 'request_id_header') {
+					projectData.config.request_id_header = '';
+				} else {
+					delete projectData.config[configKey];
+				}
+			}
+		});
+
+		if (!this.isCustomRequestIdHeader(projectData.config?.request_id_header)) {
+			projectData.config.request_id_header = '';
+		}
+
+		return projectData;
+	}
+
+	checkMetaEventsConfig() {
+		const metaEvent = this.projectForm.value.config?.meta_event;
+		const is_meta_events_enabled = metaEvent?.is_enabled;
+		const metaEventsConfig = Object.keys(metaEvent ?? {}).slice(1, -1);
+		if (!is_meta_events_enabled) {
+			metaEventsConfig.forEach(config => {
+				this.projectForm.get(`config.meta_event.${config}`)?.clearValidators();
+				this.projectForm.get(`config.meta_event.${config}`)?.setErrors(null);
+				this.projectForm.updateValueAndValidity();
+			});
+		} else if (!metaEvent?.type) {
+			// `http` is currently the only supported meta event transport; it has no UI control,
+			// so ensure it's set when meta events are enabled (load can null it out).
+			this.projectForm.get('config.meta_event.type')?.patchValue('http');
+		}
+	}
+
+	getTimeString(timeValue: number) {
+		if (timeValue > 59) return `${Math.round(timeValue / 60)}m`;
+		return `${timeValue}s`;
+	}
+
+	getTimeValue(timeValue: any) {
+		const [digits, word] = timeValue.match(/\D+|\d+/g);
+		if (word === 's') return parseInt(digits);
+		else if (word === 'm') return parseInt(digits) * 60;
+		return parseInt(digits);
+	}
+
+	cancel() {
+		this.confirmationDialog.nativeElement.showModal();
+		document.getElementById('projectForm')?.scroll({ top: 0, behavior: 'smooth' });
+	}
+
+	async confirmToggleAction(event: any, actionType?: 'metaEvents' | 'endpoints') {
+		const disableValue = event.target.checked;
+		if (actionType === 'endpoints') disableValue ? await this.updateProject() : this.disableEndpointsDialog.nativeElement.showModal();
+		else if (!disableValue && actionType === 'metaEvents') this.metaEventsDialog.nativeElement.showModal();
+	}
+
+	confirmTLSToggleAction(event: any) {
+		const disableValue = event.target.checked;
+		disableValue ? this.updateProject() : this.disableTLSEndpointsDialog.nativeElement.showModal();
+	}
+
+	switchTab(tab: TAB) {
+		if (tab.label === 'meta events config') this.projectForm.patchValue({ config: { meta_event: { type: 'http' } } });
+		this.activeTab = tab;
+		this.addPageToUrl();
+	}
+
+	addPageToUrl() {
+		const queryParams: any = {};
+		queryParams.activePage = this.activeTab.label;
+		this.router.navigate([], { queryParams: Object.assign({}, queryParams) });
+	}
+
+	get shouldShowBorder(): number {
+		return this.configurations.filter(config => config.show).length;
+	}
+
+	isOutgoingProject(): boolean {
+		return this.projectDetails?.type === 'outgoing' || this.projectForm.get('type')?.value === 'outgoing';
+	}
+
+	isOutgoingOnlyConfig(configUid: string): boolean {
+		return configUid === 'signature' || configUid === 'request_id_header';
+	}
+
+	shouldShowConfigButton(config: { uid: string; show: boolean }, index: number): boolean {
+		if (config.show) {
+			return false;
+		}
+		if (this.isOutgoingOnlyConfig(config.uid)) {
+			return this.isOutgoingProject();
+		}
+		return index < 3;
+	}
+
+	hideOutgoingOnlyConfigs(): void {
+		this.configurations.forEach(config => {
+			if (this.isOutgoingOnlyConfig(config.uid)) {
+				config.show = false;
+				config.deleted = false;
+			}
+		});
+	}
+
+    async createNewEventType() {
+        try {
+            const payload = {
+                ...this.newEventTypeForm.value,
+                json_schema: this.newEventTypeForm.value.json_schema
+                    ? (typeof this.newEventTypeForm.value.json_schema === 'string'
+                        ? JSON.parse(this.newEventTypeForm.value.json_schema)
+                        : this.newEventTypeForm.value.json_schema)
+                    : {},
+            };
+
+            await this.createProjectService.createEventType(payload);
+            this.newEventTypeForm.reset();
+            this.newEventTypeDialog.nativeElement.close();
+            this.getEventTypes();
+        } catch (error) {
+            console.error("Error creating event type:", error);
+        }
+    }
+
+    async updateNewEventType() {
+        if (!this.selectedEventType) {
+            this.generalService.showNotification({message: "Event type not selected", style: 'error', type: 'alert'});
+            return;
+        }
+
+        const payload = {
+            data: {
+                ...this.newEventTypeForm.value,
+                json_schema: this.newEventTypeForm.value.json_schema
+                    ? (typeof this.newEventTypeForm.value.json_schema === 'string'
+                        ? JSON.parse(this.newEventTypeForm.value.json_schema)
+                        : this.newEventTypeForm.value.json_schema)
+                    : {},
+            },
+            eventId: this.selectedEventType.uid
+        };
+
+        try {
+            await this.createProjectService.updateEventType(payload);
+            this.newEventTypeForm.reset();
+            this.newEventTypeDialog.nativeElement.close();
+            await this.getEventTypes();
+        } catch (error) {
+            console.error("Error updating event type:", error);
+        }
+    }
+
+	async deprecateEventType(eventTypeId: string) {
+		try {
+			await this.createProjectService.deprecateEventType(eventTypeId);
+			await this.getEventTypes();
+		} catch {}
+	}
+
+	validEventTypes(): EVENT_TYPE[] {
+		return this.eventTypes.filter(it => it.name !== '*')
+	}
+
+	async getEventTypes() {
+		try {
+			const response = await this.privateService.getEventTypes();
+			this.eventTypes = response.data;
+			return;
+		} catch (error) {
+			return;
+		}
+	}
+
+	openCreateEventTypeModal() {
+		this.selectedEventType = null;
+		this.newEventTypeForm.reset({
+			name: '',
+			description: '',
+			category: '',
+			json_schema: ''
+		});
+		this.newEventTypeDialog.nativeElement.showModal();
+	}
+
+	closeEventTypeModal() {
+		this.selectedEventType = null;
+		this.newEventTypeForm.reset({
+			name: '',
+			description: '',
+			category: '',
+			json_schema: ''
+		});
+		this.newEventTypeDialog.nativeElement.close();
+	}
+
+	openEditEventTypeModal(eventType: any) {
+		this.selectedEventType = eventType;
+		this.newEventTypeForm.patchValue({
+			name: eventType.name,
+			description: eventType.description,
+			category: eventType.category,
+            json_schema: eventType.json_schema
+                ? (typeof eventType.json_schema === 'string'
+                    ? eventType.json_schema
+                    : JSON.stringify(eventType.json_schema))
+                : ''
+		});
+		this.newEventTypeDialog.nativeElement.showModal();
+	}
+
+    async importOpenAPISpec(event: Event) {
+        const file = (event.target as HTMLInputElement).files?.[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async () => {
+            try {
+                const specContent = reader.result as string;
+                await this.createProjectService.importOpenAPISpec({ spec: specContent });
+                this.generalService.showNotification({ message: "OpenAPI spec imported successfully", style: 'success' });
+                this.getEventTypes(); // Refresh event types
+            } catch (error) {
+                this.generalService.showNotification({ message: "Failed to import OpenAPI spec", style: 'error' });
+                console.error("Import error:", error);
+            }
+        };
+        reader.readAsText(file);
+    }
+
+    get isDisabled(): boolean {
+        const org = localStorage.getItem('CONVOY_ORG');
+        if (!org) return false;
+        try {
+            const organisationDetails = JSON.parse(org);
+            return organisationDetails.disabled_at != null && organisationDetails.disabled_at !== undefined;
+        } catch {
+            return false;
+        }
+    }
+}

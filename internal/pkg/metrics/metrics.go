@@ -1,0 +1,67 @@
+package metrics
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/database/postgres"
+	cb "github.com/frain-dev/convoy/pkg/circuit_breaker"
+	"github.com/frain-dev/convoy/queue"
+)
+
+var reg *prometheus.Registry
+var re sync.Once
+
+func Reg() *prometheus.Registry {
+	re.Do(func() {
+		reg = prometheus.NewPedanticRegistry()
+	})
+
+	return reg
+}
+
+// Reset is only intended for use in tests
+func Reset() {
+	reg = nil
+	re = sync.Once{}
+	prometheus.DefaultRegisterer = prometheus.NewRegistry()
+}
+
+func RegisterQueueMetrics(q queue.Queuer, db database.Database, cbm *cb.CircuitBreakerManager) error {
+	configuration, err := config.Get()
+	if err != nil || !configuration.Metrics.IsEnabled {
+		return err
+	}
+
+	registry := Reg()
+
+	if collector, ok := q.(prometheus.Collector); ok {
+		if err := registry.Register(collector); err != nil {
+			return fmt.Errorf("failed to register queue: %w", err)
+		}
+	}
+
+	postgresDB, ok := db.(*postgres.Postgres)
+	if !ok {
+		return errors.New("failed to assert postgres database")
+	}
+
+	if err := registry.Register(postgresDB); err != nil {
+		return fmt.Errorf("failed to register postgres database: %w", err)
+	}
+	postgresDB.StartMetricsCollection()
+
+	// Register circuit breaker if provided
+	if cbm != nil {
+		if err := registry.Register(cbm); err != nil {
+			return fmt.Errorf("failed to register circuit breaker: %w", err)
+		}
+	}
+
+	return nil
+}

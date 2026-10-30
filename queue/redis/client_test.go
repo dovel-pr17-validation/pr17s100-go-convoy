@@ -1,0 +1,130 @@
+package redis
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/rdb"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/testenv"
+)
+
+var testInfra *testenv.Environment
+
+func TestMain(m *testing.M) {
+	res, cleanup, err := testenv.Launch(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to launch test infrastructure: %v\n", err)
+		os.Exit(1)
+	}
+
+	testInfra = res
+
+	code := m.Run()
+
+	if err := cleanup(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to cleanup test infrastructure: %v\n", err)
+		os.Exit(1)
+	}
+
+	os.Exit(code)
+}
+
+type RedisQueueIntegrationTestSuite struct {
+	suite.Suite
+	eventQueue queue.Queuer
+}
+
+func (s *RedisQueueIntegrationTestSuite) SetupTest() {
+	// Each test gets a fresh Redis client
+	redisClient, err := testInfra.NewRedisClient(s.T(), 0)
+	s.Require().NoError(err)
+
+	// Flush the database to ensure a clean state
+	err = redisClient.FlushDB(context.Background()).Err()
+	s.Require().NoError(err)
+
+	queueNames := map[string]int{
+		string(convoy.EventQueue):         2,
+		string(convoy.CreateEventQueue):   2,
+		string(convoy.EventWorkflowQueue): 2,
+	}
+
+	// Load config for Redis DSN from the test container
+	err = config.LoadConfig("")
+	s.Require().NoError(err)
+	cfg, err := config.Get()
+	s.Require().NoError(err)
+
+	// Create rdb.Redis wrapper for the queue
+	rdbClient, err := rdb.NewClient(cfg.Redis.BuildDsn())
+	s.Require().NoError(err)
+
+	opts := queue.QueueOptions{
+		Names:        queueNames,
+		RedisClient:  rdbClient,
+		RedisAddress: cfg.Redis.BuildDsn(),
+		Type:         string(config.RedisQueueProvider),
+	}
+
+	s.eventQueue = NewQueue(opts)
+}
+
+func (s *RedisQueueIntegrationTestSuite) TestDeleteMissingDeliveryBeforeReplacement() {
+	q := s.eventQueue.(*RedisQueue)
+	// A completed delivery has no queue task left, and the queue itself may
+	// already be gone. Replacing it must not retain an uncertain drain receipt.
+	s.Require().NoError(q.DeleteEventDeliveriesFromQueue(convoy.EventQueue, []string{"already-completed"}))
+	s.Require().NoError(q.Write(s.T().Context(), convoy.EventProcessor, convoy.EventQueue, &queue.Job{ID: "still-queued", Payload: []byte("qa")}))
+	s.Require().NoError(q.DeleteEventDeliveriesFromQueue(convoy.EventQueue, []string{"already-completed"}))
+}
+
+func (s *RedisQueueIntegrationTestSuite) TestWrite() {
+	tests := []struct {
+		name            string
+		queueName       string
+		endpointID      string
+		eventID         string
+		eventDeliveryID string
+	}{
+		{
+			name:            "write a single event to queue",
+			queueName:       ulid.Make().String(),
+			endpointID:      ulid.Make().String(),
+			eventID:         ulid.Make().String(),
+			eventDeliveryID: ulid.Make().String(),
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			id := ulid.Make().String()
+
+			eventDelivery := &datastore.EventDelivery{
+				UID: tc.eventDeliveryID,
+			}
+
+			job := &queue.Job{
+				ID:      id,
+				Payload: json.RawMessage(eventDelivery.UID),
+			}
+
+			taskName := convoy.TaskName(id)
+			err := s.eventQueue.Write(context.Background(), taskName, convoy.EventQueue, job)
+			s.Require().NoError(err, "Failed to write to queue")
+		})
+	}
+}
+
+func TestRedisQueueIntegrationTestSuite(t *testing.T) {
+	suite.Run(t, new(RedisQueueIntegrationTestSuite))
+}

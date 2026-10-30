@@ -1,0 +1,83 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/datastore"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/queue"
+)
+
+type BatchRetryEventDeliveryService struct {
+	BatchRetryRepo    datastore.BatchRetryRepository
+	EventDeliveryRepo datastore.EventDeliveryRepository
+	Queue             queue.Queuer
+	Filter            *datastore.Filter
+	ProjectID         string
+	Logger            log.Logger
+}
+
+func (e *BatchRetryEventDeliveryService) Run(ctx context.Context) error {
+	// Check if there's an active batch retry
+	activeRetry, err := e.BatchRetryRepo.FindActiveBatchRetry(ctx, e.ProjectID)
+	if err != nil && !errors.Is(err, datastore.ErrBatchRetryNotFound) {
+		e.Logger.ErrorContext(ctx, "failed to check for active batch retry", "error", err)
+		return &ServiceError{ErrMsg: "failed to check for active batch retry", Err: err}
+	}
+
+	if activeRetry != nil {
+		return &ServiceError{ErrMsg: "an active batch retry already exists"}
+	}
+
+	// Count total events
+	count, err := e.EventDeliveryRepo.CountEventDeliveries(ctx, e.ProjectID, e.Filter.EndpointIDs, e.Filter.EventID, e.Filter.Status, e.Filter.SearchParams)
+	if err != nil {
+		e.Logger.ErrorContext(ctx, "failed to count events", "error", err)
+		return &ServiceError{ErrMsg: "failed to count events", Err: err}
+	}
+
+	// Create a batch retry record
+	batchRetry := &datastore.BatchRetry{
+		ID:              ulid.Make().String(),
+		ProjectID:       e.ProjectID,
+		Status:          datastore.BatchRetryStatusPending,
+		TotalEvents:     int(count),
+		Filter:          datastore.FromFilterStruct(*e.Filter),
+		ProcessedEvents: 0,
+		FailedEvents:    0,
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+
+	err = e.BatchRetryRepo.CreateBatchRetry(ctx, batchRetry)
+	if err != nil {
+		e.Logger.ErrorContext(ctx, "failed to create batch retry", "error", err)
+		return &ServiceError{ErrMsg: "failed to create batch retry", Err: err}
+	}
+
+	data, err := msgpack.EncodeMsgPack(batchRetry)
+	if err != nil {
+		e.Logger.ErrorContext(ctx, "failed to encode batch retry payload", "error", err)
+		return &ServiceError{ErrMsg: "failed to encode batch retry payload", Err: err}
+	}
+
+	job := &queue.Job{
+		ID:      batchRetry.ID,
+		Payload: data,
+		Delay:   0,
+	}
+
+	err = e.Queue.WriteWithoutTimeout(ctx, convoy.BatchRetryProcessor, convoy.BatchRetryQueue, job)
+	if err != nil {
+		e.Logger.ErrorContext(ctx, "failed to queue batch retry job", "error", err)
+		return &ServiceError{ErrMsg: "failed to queue batch retry job", Err: err}
+	}
+
+	return nil
+}

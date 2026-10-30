@@ -1,0 +1,69 @@
+package services
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/email"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/queue"
+)
+
+type GeneratePasswordResetTokenService struct {
+	UserRepo datastore.UserRepository
+	Queue    queue.Queuer
+
+	BaseURL string
+	Data    *models.ForgotPassword
+	Logger  log.Logger
+}
+
+func (u *GeneratePasswordResetTokenService) Run(ctx context.Context) error {
+	user, err := u.UserRepo.FindUserByEmail(ctx, u.Data.Email)
+	if err != nil {
+		if err == datastore.ErrUserNotFound {
+			return &ServiceError{ErrMsg: "an account with this email does not exist"}
+		}
+
+		u.Logger.ErrorContext(ctx, "failed to find user by email", "error", err)
+		return &ServiceError{ErrMsg: "failed to find user by email", Err: err}
+	}
+
+	resetToken := ulid.Make().String()
+	user.ResetPasswordToken = resetToken
+	user.ResetPasswordExpiresAt = time.Now().Add(time.Hour * 2)
+
+	err = u.UserRepo.UpdateUser(ctx, user)
+	if err != nil {
+		u.Logger.ErrorContext(ctx, "failed to update user", "error", err)
+		return &ServiceError{ErrMsg: "failed to update user", Err: err}
+	}
+
+	err = u.sendPasswordResetEmail(ctx, u.BaseURL, resetToken, user, u.Logger)
+	if err != nil {
+		u.Logger.ErrorContext(ctx, "failed to queue password reset email", "error", err)
+		return &ServiceError{ErrMsg: err.Error()}
+	}
+	return nil
+}
+
+func (u *GeneratePasswordResetTokenService) sendPasswordResetEmail(ctx context.Context, baseURL, token string, user *datastore.User, logger log.Logger) error {
+	em := email.Message{
+		Email:        user.Email,
+		Subject:      "Convoy Password Reset",
+		TemplateName: email.TemplateResetPassword,
+		Params: map[string]interface{}{
+			"email":              user.Email,
+			"password_reset_url": fmt.Sprintf("%s/reset-password?auth-token=%s", baseURL, token),
+			"recipient_name":     user.FirstName,
+			"expires_at":         user.ResetPasswordExpiresAt.Format(time.RFC1123),
+		},
+	}
+
+	return queueEmail(ctx, &em, u.Queue, logger)
+}

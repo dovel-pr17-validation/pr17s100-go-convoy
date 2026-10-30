@@ -1,0 +1,163 @@
+package noop
+
+import (
+	"context"
+	"encoding/json"
+)
+
+// Noop License is for testing only
+
+type Licenser struct{}
+
+func (Licenser) FeatureListJSON(_ context.Context) (json.RawMessage, error) {
+	return []byte{}, nil
+}
+
+func NewLicenser() *Licenser {
+	return &Licenser{}
+}
+
+// Limit check methods
+func (Licenser) CheckOrgLimit(_ context.Context) (bool, error) {
+	return true, nil
+}
+
+func (Licenser) CheckUserLimit(_ context.Context) (bool, error) {
+	return true, nil
+}
+
+func (Licenser) CheckProjectLimit(_ context.Context) (bool, error) {
+	return true, nil
+}
+
+func (Licenser) IsMultiUserMode(_ context.Context) (bool, error) {
+	return true, nil // Noop allows multi-user
+}
+
+func (Licenser) UseForwardProxy() bool {
+	return true
+}
+
+func (Licenser) CanExportPrometheusMetrics() bool {
+	return true
+}
+
+func (Licenser) PostgresQueue() bool {
+	return true
+}
+
+func (Licenser) AdvancedEndpointMgmt() bool {
+	return true
+}
+
+func (Licenser) AdvancedSubscriptions() bool {
+	return true
+}
+
+func (Licenser) Transformations() bool {
+	return true
+}
+
+func (Licenser) AsynqMonitoring() bool {
+	return true
+}
+
+func (Licenser) WebhookArchiving() bool {
+	return true
+}
+
+func (Licenser) RetentionPolicy() bool {
+	return true
+}
+
+func (Licenser) WebhookAnalytics() bool {
+	return true
+}
+
+func (Licenser) MutualTLS() bool {
+	return true
+}
+
+func (Licenser) OAuth2EndpointAuth() bool {
+	return true
+}
+
+func (Licenser) BasicAuthEndpointAuth() bool {
+	return true
+}
+
+func (Licenser) EndpointURLTemplates() bool {
+	return true
+}
+
+func (Licenser) CustomUserAgent() bool {
+	return true
+}
+
+func (Licenser) RemoveEnabledProject(_ string) {}
+
+func (Licenser) ProjectEnabled(_ string) bool {
+	return true
+}
+
+func (Licenser) AddEnabledProject(_ string) {}
+
+func (Licenser) ConsumerPoolTuning() bool {
+	return true
+}
+
+func (Licenser) AdvancedWebhookFiltering() bool {
+	return true
+}
+
+func (Licenser) EventSearch() bool {
+	return true
+}
+
+func (Licenser) PortalLinks() bool {
+	return true
+}
+
+func (Licenser) CircuitBreaking() bool {
+	return true
+}
+
+func (Licenser) IngestRate() bool {
+	return true
+}
+
+func (Licenser) AgentExecutionMode() bool {
+	return true
+}
+
+func (Licenser) IpRules() bool {
+	return true
+}
+
+func (Licenser) EnterpriseSSO() bool {
+	return true
+}
+
+func (Licenser) GoogleOAuth() bool {
+	return true
+}
+
+func (k *Licenser) DatadogTracing() bool {
+	return true
+}
+
+func (k *Licenser) ReadReplica() bool {
+	return true
+}
+
+func (k *Licenser) CredentialEncryption() bool {
+	return true
+}
+
+func (k *Licenser) CustomCertificateAuthority() bool {
+	return true
+}
+
+func (k *Licenser) StaticIP() bool {
+	return true
+}

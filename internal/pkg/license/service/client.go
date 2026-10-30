@@ -1,0 +1,267 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/config"
+	log "github.com/frain-dev/convoy/pkg/logger"
+)
+
+const (
+	// DefaultOverwatchHost is the default billing service URL
+	DefaultOverwatchHost = "https://overwatch.getconvoy.cloud"
+	// DefaultValidatePath is the default validation endpoint
+	DefaultValidatePath = "/licenses/validate"
+	// DefaultTimeout is the default request timeout
+	DefaultTimeout = 10 * time.Second
+	// DefaultRetryCount is the default number of retries
+	DefaultRetryCount = 3
+)
+
+// Client handles communication with the license service
+type Client struct {
+	host         string
+	validatePath string
+	timeout      time.Duration
+	retryCount   int
+	version      string
+	deploymentID string
+	usageLoader  UsageLoader
+	httpClient   *http.Client
+	logger       log.Logger
+}
+
+// Config holds configuration for the license service client
+type Config struct {
+	Host         string
+	ValidatePath string
+	Timeout      time.Duration
+	RetryCount   int
+	// Version is sent with validation requests; defaults to convoy.GetVersion() when empty.
+	Version string
+	// DeploymentID is the instance configuration UID sent with validation
+	// requests; empty when configuration is unavailable.
+	DeploymentID string
+	// UsageLoader optionally attaches anonymized usage counts (licensed instances only).
+	UsageLoader UsageLoader
+	Logger      log.Logger
+}
+
+// NewClientFromConfig builds a license service client from the typed license service
+// configuration plus a logger. It is the single construction site for the repeated
+// host/validate-path/timeout/retry wiring.
+func NewClientFromConfig(cfg config.LicenseServiceConfiguration, l log.Logger) *Client {
+	return NewClient(Config{
+		Host:         cfg.Host,
+		ValidatePath: cfg.ValidatePath,
+		Timeout:      cfg.Timeout,
+		RetryCount:   cfg.RetryCount,
+		Logger:       l,
+	})
+}
+
+// NewClient creates a new license service client
+func NewClient(cfg Config) *Client {
+	if cfg.Host == "" {
+		cfg.Host = DefaultOverwatchHost
+	}
+	if cfg.ValidatePath == "" {
+		cfg.ValidatePath = DefaultValidatePath
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = DefaultTimeout
+	}
+	if cfg.RetryCount == 0 {
+		cfg.RetryCount = DefaultRetryCount
+	}
+	if cfg.Version == "" {
+		cfg.Version = convoy.GetVersion()
+	}
+
+	return &Client{
+		host:         cfg.Host,
+		validatePath: cfg.ValidatePath,
+		timeout:      cfg.Timeout,
+		retryCount:   cfg.RetryCount,
+		version:      cfg.Version,
+		deploymentID: cfg.DeploymentID,
+		usageLoader:  cfg.UsageLoader,
+		httpClient: &http.Client{
+			Timeout:   cfg.Timeout,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
+		},
+		logger: cfg.Logger,
+	}
+}
+
+// ValidateLicense validates a license key with the license service
+func (c *Client) ValidateLicense(ctx context.Context, licenseKey string) (*LicenseValidationData, error) {
+	if licenseKey == "" {
+		return nil, fmt.Errorf("license key is required")
+	}
+
+	reqBody := ValidateLicenseRequest{
+		LicenseKey:   licenseKey,
+		Version:      c.version,
+		DeploymentID: c.deploymentID,
+	}
+	// Fail open: omit usage on loader error or miss. Never block validate.
+	if c.usageLoader != nil {
+		if snap, err := c.usageLoader.LoadCached(ctx); err == nil && snap != nil {
+			reqBody.Usage = snap
+		}
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s%s", c.host, c.validatePath)
+
+	var lastErr error
+	for attempt := 0; attempt <= c.retryCount; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request failed: %w", err)
+			if c.logger != nil {
+				c.logger.Warnf("License validation attempt %d failed, retrying...: %v", attempt+1, err)
+			}
+			continue
+		}
+
+		// Read and close body immediately to avoid connection pool exhaustion during retries
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response: %w", err)
+			continue
+		}
+
+		// Check HTTP status code
+		if resp.StatusCode != http.StatusOK {
+			// An expired self-hosted trial is a definitive negative the billing service
+			// returns as HTTP 400 with {"status":false,"message":"Trial has
+			// expired"}. Detect it here and return the sentinel immediately (no
+			// retry) so the licenser can degrade to the community/OSS floor. Every
+			// other non-200 keeps the existing retry-then-transient-error behaviour,
+			// so paid suspended/revoked/expired signalling is byte-for-byte
+			// unchanged (it never fired on this branch before and still does not).
+			if c.isTrialExpiredBody(body) {
+				return nil, ErrLicenseTrialExpired
+			}
+			lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			if c.logger != nil {
+				c.logger.Warnf("License validation attempt %d returned status %d, retrying...", attempt+1, resp.StatusCode)
+			}
+			continue
+		}
+
+		var validationResp LicenseValidationResponse
+		if err := json.Unmarshal(body, &validationResp); err != nil {
+			lastErr = fmt.Errorf("failed to unmarshal response: %w", err)
+			continue
+		}
+
+		if !validationResp.Status {
+			err := c.parseError(validationResp.Message)
+			return nil, err
+		}
+
+		if validationResp.Data == nil {
+			return nil, fmt.Errorf("invalid response: data is nil")
+		}
+
+		// Check license status (consolidated with parseError logic)
+		if err := c.checkLicenseStatus(validationResp.Data.Status); err != nil {
+			return nil, err
+		}
+
+		return validationResp.Data, nil
+	}
+
+	return nil, fmt.Errorf("license validation failed after %d attempts: %w", c.retryCount+1, lastErr)
+}
+
+// isTrialExpiredBody reports whether a non-200 validation response body carries
+// the distinct expired-trial signal. It reuses parseError as the single message
+// -> sentinel mapping, so only "Trial has expired" matches; any other failure
+// message returns false and is left to the caller's existing retry handling.
+func (c *Client) isTrialExpiredBody(body []byte) bool {
+	var resp LicenseValidationResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	if resp.Status {
+		return false
+	}
+	return errors.Is(c.parseError(resp.Message), ErrLicenseTrialExpired)
+}
+
+// parseError parses error message and returns appropriate error type
+func (c *Client) parseError(message string) error {
+	switch message {
+	case "License not found":
+		return ErrLicenseNotFound
+	case "License is suspended":
+		return ErrLicenseSuspended
+	case "License has expired":
+		return ErrLicenseExpired
+	case "Trial has expired":
+		// Distinct from a paid "License has expired": an expired self-hosted trial
+		// degrades the instance to the community/OSS floor (see licenser.go), it does
+		// not fail closed or boot-error. The billing service emits this message only for an
+		// expired license-native trial.
+		return ErrLicenseTrialExpired
+	case "License has been revoked":
+		return ErrLicenseRevoked
+	default:
+		return &LicenseError{
+			Message: message,
+			Status:  "validation_failed",
+		}
+	}
+}
+
+// checkLicenseStatus validates the license status
+func (c *Client) checkLicenseStatus(status string) error {
+	switch status {
+	case "active":
+		return nil
+	case "suspended":
+		return ErrLicenseSuspended
+	case "expired":
+		return ErrLicenseExpired
+	case "revoked":
+		return ErrLicenseRevoked
+	default:
+		return fmt.Errorf("unknown license status: %s", status)
+	}
+}

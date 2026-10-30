@@ -1,0 +1,1159 @@
+package hooks
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/kelseyhightower/envconfig"
+	"github.com/oklog/ulid/v2"
+	"github.com/spf13/cobra"
+	"gopkg.in/guregu/null.v4"
+
+	pyro "github.com/grafana/pyroscope-go"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	dbhook "github.com/frain-dev/convoy/database/hooks"
+	"github.com/frain-dev/convoy/database/listener"
+	"github.com/frain-dev/convoy/database/postgres"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/configuration"
+	"github.com/frain-dev/convoy/internal/delivery_attempts"
+	"github.com/frain-dev/convoy/internal/meta_events"
+	"github.com/frain-dev/convoy/internal/organisations"
+	"github.com/frain-dev/convoy/internal/pkg/broker"
+	"github.com/frain-dev/convoy/internal/pkg/cli"
+	fflag2 "github.com/frain-dev/convoy/internal/pkg/fflag"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/license/service"
+	licenseusage "github.com/frain-dev/convoy/internal/pkg/license/usage"
+	"github.com/frain-dev/convoy/internal/pkg/tracer"
+	"github.com/frain-dev/convoy/internal/projects"
+	"github.com/frain-dev/convoy/internal/users"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+const envPrefix = "convoy"
+
+func PreRun(app *cli.App, db *postgres.Postgres) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		cfgPath, err := cmd.Flags().GetString("config")
+		if err != nil {
+			return err
+		}
+
+		err = config.LoadConfig(cfgPath, func(c *config.Configuration) error {
+			err := envconfig.Process(envPrefix, c)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+
+		if err != nil {
+			return err
+		}
+
+		cfg, err := config.Get()
+		if err != nil {
+			return err
+		}
+
+		// Override with CLI Flags
+		cliConfig, err := buildCliConfiguration(cmd)
+		if err != nil {
+			return err
+		}
+
+		if err := config.Override(cliConfig); err != nil {
+			return err
+		}
+
+		if err := applyExplicitRetentionArchivingFlags(cmd); err != nil {
+			return err
+		}
+
+		cfg, err = config.Get() // updated
+		if err != nil {
+			return err
+		}
+
+		if _, ok := skipHook[cmd.Use]; ok {
+			return nil
+		}
+
+		logLevel, parseErr := log.ParseLevel(cfg.Logger.Level)
+		if parseErr != nil {
+			slog.Warn("error parsing log level",
+				slog.String("using default log level: ", log.LevelError.String()),
+				slog.String(" for log level: ", cfg.Logger.Level),
+				slog.String(" err: ", parseErr.Error()))
+			logLevel = log.LevelError
+		}
+
+		lo := log.New("convoy", logLevel)
+
+		postgresDB, err := postgres.NewDB(cfg)
+		if err != nil {
+			return errors.New("failed to connect to postgres with err: " + err.Error())
+		}
+
+		*db = *postgresDB
+
+		err = config.LoadCaCert(cfg.Dispatcher.CACertString, cfg.Dispatcher.CACertPath)
+		if err != nil {
+			return err
+		}
+
+		brokerDeps, err := broker.New(cfg, db.GetDB(), lo)
+		if err != nil {
+			return err
+		}
+		q := brokerDeps.Queue
+		ca := brokerDeps.Cache
+
+		if cfg.Pyroscope.EnableProfiling {
+			err = enableProfiling(cfg, cmd)
+			if err != nil {
+				return err
+			}
+		}
+
+		hooks := dbhook.Init()
+
+		// the order matters here
+		projectListener := listener.NewProjectListener(q, lo)
+		hooks.RegisterHook(datastore.ProjectUpdated, projectListener.AfterUpdate)
+		projectRepo := projects.New(lo, postgresDB)
+
+		metaEventRepo := meta_events.New(lo, postgresDB)
+		attemptsRepo := delivery_attempts.New(lo, postgresDB)
+		endpointListener := listener.NewEndpointListener(q, projectRepo, metaEventRepo, lo)
+		eventDeliveryListener := listener.NewEventDeliveryListener(q, projectRepo, metaEventRepo, attemptsRepo, lo)
+
+		hooks.RegisterHook(datastore.EndpointCreated, endpointListener.AfterCreate)
+		hooks.RegisterHook(datastore.EndpointUpdated, endpointListener.AfterUpdate)
+		hooks.RegisterHook(datastore.EndpointDeleted, endpointListener.AfterDelete)
+		hooks.RegisterHook(datastore.EventDeliveryUpdated, eventDeliveryListener.AfterUpdate)
+
+		if ok := shouldCheckMigration(cmd); ok {
+			err = checkPendingMigrations(lo, db)
+			if err != nil {
+				return errors.New("pending migrations check failed: " + err.Error())
+			}
+		}
+
+		// Postgres cache writes convoy.kv_cache. Ping after the migration
+		// check so a missing table is pending-migrations, not a cache failure.
+		err = ca.Set(context.Background(), "ping", "pong", 10*time.Second)
+		if err != nil {
+			return errors.New("failed to ping cache with err: " + err.Error())
+		}
+
+		app.DB = postgresDB
+		app.Queue = q
+		app.Logger = lo
+		app.Cache = ca
+		app.Rate = brokerDeps.RateLimiter
+		app.Broker = brokerDeps
+
+		if ok := shouldBootstrap(cmd); ok {
+			err = ensureDefaultUser(context.Background(), app)
+			if err != nil {
+				return err
+			}
+
+			if _, err := ensureInstanceConfig(context.Background(), app, cfg); err != nil {
+				return err
+			}
+
+			if err := applyInstanceLicenseConfig(context.Background(), app, &cfg); err != nil {
+				return err
+			}
+		}
+
+		// Load the instance configuration UID before building the license client
+		// so validation requests can include the deployment_id. If configuration
+		// is unavailable (or this command skips config load) we proceed with an
+		// empty value rather than blocking startup.
+		if _, ok := skipConfigLoadCmd[cmd.Use]; !ok {
+			configRepo := configuration.New(app.Logger, app.DB)
+			instCfg, cfgErr := configRepo.LoadConfiguration(cmd.Context())
+			if cfgErr != nil {
+				lo.Error("Failed to load configuration", "error", cfgErr)
+			} else {
+				cfg.InstanceId = instCfg.UID
+				if err := config.Override(&cfg); err != nil {
+					return err
+				}
+			}
+		}
+
+		licenseClientCfg := service.Config{
+			Host:         cfg.LicenseService.Host,
+			ValidatePath: cfg.LicenseService.ValidatePath,
+			Timeout:      cfg.LicenseService.Timeout,
+			RetryCount:   cfg.LicenseService.RetryCount,
+			DeploymentID: cfg.InstanceId,
+			Logger:       lo,
+		}
+		// Licensed instances only: attach cached anonymized usage on validate.
+		if !util.IsStringEmpty(cfg.LicenseKey) {
+			licenseClientCfg.UsageLoader = licenseusage.NewStore(app.DB, app.Cache)
+		}
+		licenseClient := service.NewClient(licenseClientCfg)
+
+		app.Licenser, err = license.NewLicenser(&license.Config{
+			LicenseService: service.LicenserConfig{
+				LicenseKey:    cfg.LicenseKey,
+				UseOrgBilling: cfg.UsesOrgBilling(),
+				Client:        licenseClient,
+				OrgRepo:       organisations.New(lo, app.DB),
+				UserRepo:      users.New(log.New("convoy", log.LevelError), app.DB),
+				ProjectRepo:   projectRepo,
+				Logger:        lo,
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		licenseOverrideCfg(&cfg, app.Licenser)
+		if err := config.Override(&cfg); err != nil {
+			return err
+		}
+
+		if err := broker.AllowPostgresQueue(cfg, app.Licenser); err != nil {
+			return err
+		}
+
+		lo.Debugf("Read replicas: %d", db.ReplicaSize())
+		if db.ReplicaSize() > 0 && !app.Licenser.ReadReplica() {
+			lo.Error("your instance does not have access to use read replicas, upgrade to access this feature")
+			db.UnsetReplicas()
+		}
+
+		app.TracerBackend, err = tracer.Init(cfg.Tracer, cmd.Name(), app.Licenser)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+}
+
+func applyInstanceLicenseConfig(ctx context.Context, a *cli.App, cfg *config.Configuration) error {
+	configRepo := configuration.New(a.Logger, a.DB)
+	instCfg, err := configRepo.LoadInstanceBillingConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	if applyLicensePrecedence(instCfg, cfg) {
+		if err := configRepo.UpdateInstanceBillingConfig(ctx, instCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyLicensePrecedence resolves the effective instance license (env/file key
+// wins, else the persisted guest-checkout key), points the runtime cfg at it for
+// the licenser, and records the resolved value + provenance back onto instCfg so
+// the row is the single, debuggable source of truth for reads. It never writes
+// checkout_license_key: that column is owned by the guest-checkout flow, so an
+// env override stays reversible (drop env and the next boot falls back to the
+// purchased key). Boot runs before serving requests, so persisting here cannot
+// race a concurrent checkout. Returns true when instCfg changed and must be
+// persisted.
+func applyLicensePrecedence(instCfg *datastore.Configuration, cfg *config.Configuration) bool {
+	// The purchased guest key lives in checkout_license_key. Legacy rows (pre-column
+	// or pre-migration) persisted a guest key only in license_key, so when the
+	// checkout column is empty but license_key holds a non-env key, treat that key
+	// as the purchased handle and self-heal the column. Without this, resolving from
+	// an empty checkout key would blank an already-paid license at boot.
+	checkoutKey := instCfg.CheckoutLicenseKey
+	healed := false
+	if checkoutKey == "" && instCfg.LicenseKey != "" && instCfg.LicenseKeySource != config.LicenseSourceEnv {
+		checkoutKey = instCfg.LicenseKey
+		instCfg.CheckoutLicenseKey = checkoutKey
+		healed = true
+	}
+
+	effective, source := config.ResolveEffectiveLicense(cfg.LicenseKey, checkoutKey)
+	cfg.LicenseKey = effective
+
+	if instCfg.LicenseKey == effective && instCfg.LicenseKeySource == source && !healed {
+		return false
+	}
+	instCfg.LicenseKey = effective
+	instCfg.LicenseKeySource = source
+	if effective != "" {
+		instCfg.LicenseSyncedAt = null.NewTime(time.Now(), true)
+	}
+	return true
+}
+
+func licenseOverrideCfg(cfg *config.Configuration, licenser license.Licenser) {
+	if !licenser.ConsumerPoolTuning() {
+		cfg.ConsumerPoolSize = config.DefaultConfiguration.ConsumerPoolSize
+	}
+
+	if !licenser.IngestRate() {
+		cfg.InstanceIngestRate = config.DefaultConfiguration.InstanceIngestRate
+		cfg.ApiRateLimit = config.DefaultConfiguration.ApiRateLimit
+	}
+}
+
+// these commands don't need to load instance config
+var skipConfigLoadCmd = map[string]struct{}{
+	"bootstrap": {},
+}
+
+// commands dont need the hooks
+var skipHook = map[string]struct{}{
+	// migrate commands
+	"up":      {},
+	"down":    {},
+	"create":  {},
+	"config":  {},
+	"version": {},
+}
+
+func PostRun(app *cli.App, db *postgres.Postgres) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		if db == nil || db.GetDB() == nil {
+			os.Exit(0)
+		}
+
+		err := db.Close()
+		if err == nil {
+			os.Exit(0)
+		}
+
+		err = app.TracerBackend.Shutdown(context.Background())
+		if err == nil {
+			os.Exit(0)
+		}
+		return err
+	}
+}
+
+func enableProfiling(cfg config.Configuration, cmd *cobra.Command) error {
+	_, err := pyro.Start(pyro.Config{
+		ApplicationName: cfg.Pyroscope.ProfileID,
+		Tags: map[string]string{
+			"cmd": cmd.Use,
+		},
+		// replace this with the address of pyro server
+		ServerAddress: cfg.Pyroscope.URL,
+
+		// you can disable logging by setting this to nil
+		// Logger: pyro.StandardLogger,
+		UploadRate: time.Second * 5,
+
+		// optionally, if authentication is enabled, specify the API key:
+		BasicAuthUser:     cfg.Pyroscope.Username,
+		BasicAuthPassword: cfg.Pyroscope.Password,
+
+		// but you can select the ones you want to use:
+		ProfileTypes: []pyro.ProfileType{
+			pyro.ProfileCPU,
+			pyro.ProfileInuseObjects,
+			pyro.ProfileAllocObjects,
+			pyro.ProfileInuseSpace,
+			pyro.ProfileAllocSpace,
+			pyro.ProfileGoroutines,
+			pyro.ProfileMutexCount,
+			pyro.ProfileMutexDuration,
+			pyro.ProfileBlockCount,
+			pyro.ProfileBlockDuration,
+		},
+	})
+	return err
+}
+
+func ensureInstanceConfig(ctx context.Context, a *cli.App, cfg config.Configuration) (*datastore.Configuration, error) {
+	configRepo := configuration.New(a.Logger, a.DB)
+
+	s3 := datastore.S3Storage{
+		Prefix:       null.NewString(cfg.StoragePolicy.S3.Prefix, true),
+		Bucket:       null.NewString(cfg.StoragePolicy.S3.Bucket, true),
+		AccessKey:    null.NewString(cfg.StoragePolicy.S3.AccessKey, true),
+		SecretKey:    null.NewString(cfg.StoragePolicy.S3.SecretKey, true),
+		Region:       null.NewString(cfg.StoragePolicy.S3.Region, true),
+		SessionToken: null.NewString(cfg.StoragePolicy.S3.SessionToken, true),
+		Endpoint:     null.NewString(cfg.StoragePolicy.S3.Endpoint, true),
+	}
+
+	onPrem := datastore.OnPremStorage{
+		Path: null.NewString(cfg.StoragePolicy.OnPrem.Path, true),
+	}
+
+	azureBlob := datastore.AzureBlobStorage{
+		AccountName:   null.NewString(cfg.StoragePolicy.AzureBlob.AccountName, true),
+		AccountKey:    null.NewString(cfg.StoragePolicy.AzureBlob.AccountKey, true),
+		ContainerName: null.NewString(cfg.StoragePolicy.AzureBlob.ContainerName, true),
+		Endpoint:      null.NewString(cfg.StoragePolicy.AzureBlob.Endpoint, true),
+		Prefix:        null.NewString(cfg.StoragePolicy.AzureBlob.Prefix, true),
+	}
+
+	storagePolicy := &datastore.StoragePolicyConfiguration{
+		Type:      datastore.StorageType(cfg.StoragePolicy.Type),
+		S3:        &s3,
+		OnPrem:    &onPrem,
+		AzureBlob: &azureBlob,
+	}
+
+	retentionPolicy := &datastore.RetentionPolicyConfiguration{
+		Period:       cfg.Retention.Period,
+		Enabled:      cfg.Retention.Enabled,
+		EnabledKnown: true,
+	}
+	webhookArchiving := &datastore.WebhookArchivingConfiguration{
+		Enabled: cfg.WebhookArchiving.Enabled,
+	}
+
+	configuration, err := configRepo.LoadConfiguration(ctx)
+	if err != nil {
+		if errors.Is(err, datastore.ErrConfigNotFound) {
+			a.Logger.Info("Creating Instance Config")
+			c := &datastore.Configuration{
+				UID:                ulid.Make().String(),
+				StoragePolicy:      storagePolicy,
+				IsAnalyticsEnabled: true,
+				IsSignupEnabled:    cfg.Auth.IsSignupEnabled,
+				AdminManagedKnown:  true,
+				RetentionPolicy:    retentionPolicy,
+				WebhookArchiving:   webhookArchiving,
+				CreatedAt:          time.Now(),
+				UpdatedAt:          time.Now(),
+			}
+
+			if createErr := configRepo.CreateConfiguration(ctx, c); createErr != nil {
+				// Concurrent boot: peer won the live-row unique index. Use that row.
+				if loaded, loadErr := configRepo.LoadConfiguration(ctx); loadErr == nil {
+					return loaded, nil
+				}
+				return nil, createErr
+			}
+			return c, nil
+		}
+
+		return configuration, err
+	}
+
+	if !configuration.AdminManagedKnown {
+		err = completeAdminManagedMigration(ctx, cfg, configuration, configRepo)
+		if err != nil {
+			return configuration, err
+		}
+	}
+
+	if configuration.AdminManaged {
+		return configuration, nil
+	}
+	configuration.StoragePolicy = storagePolicy
+	configuration.IsSignupEnabled = cfg.Auth.IsSignupEnabled
+	configuration.RetentionPolicy = retentionPolicy
+	configuration.WebhookArchiving = webhookArchiving
+	configuration.UpdatedAt = time.Now()
+	return configuration, configRepo.UpdateConfiguration(ctx, configuration)
+}
+
+type adminManagedConfigurationStore interface {
+	CompleteAdminManagedMigration(context.Context, string, bool) (bool, bool, error)
+}
+
+// completeAdminManagedMigration marks a legacy NULL ownership column as known
+// env-owned (false). Admin Managed is opt-in; upgrades must not flip it on.
+func completeAdminManagedMigration(
+	ctx context.Context,
+	cfg config.Configuration,
+	configuration *datastore.Configuration,
+	configStore adminManagedConfigurationStore,
+) error {
+	if configuration.RetentionPolicy == nil {
+		return errors.New("complete admin-managed migration: missing retention policy")
+	}
+	adminManaged, retentionEnabled, err := configStore.CompleteAdminManagedMigration(
+		ctx,
+		configuration.UID,
+		cfg.Retention.Enabled,
+	)
+	if err != nil {
+		return err
+	}
+
+	configuration.AdminManaged = adminManaged
+	configuration.AdminManagedKnown = true
+	configuration.RetentionPolicy.Enabled = retentionEnabled
+	configuration.RetentionPolicy.EnabledKnown = true
+	configuration.UpdatedAt = time.Now()
+	return nil
+}
+
+// applyExplicitRetentionArchivingFlags force-applies Retention.Enabled and
+// WebhookArchiving.Enabled when the operator set the CLI flags. config.Override
+// skips false bools (reflect zero), so --retention-enabled=false would otherwise
+// leave the default true and keep the 01:00 partition-drop cron registered.
+func applyExplicitRetentionArchivingFlags(cmd *cobra.Command) error {
+	var retentionEnabled *bool
+	if cmd.Flags().Changed("retention-enabled") {
+		v, err := cmd.Flags().GetBool("retention-enabled")
+		if err != nil {
+			return err
+		}
+		retentionEnabled = &v
+	}
+
+	var webhookArchivingEnabled *bool
+	switch {
+	case cmd.Flags().Changed("webhook-archiving-enabled"):
+		v, err := cmd.Flags().GetBool("webhook-archiving-enabled")
+		if err != nil {
+			return err
+		}
+		webhookArchivingEnabled = &v
+	case cmd.Flags().Changed("retention-policy-enabled"):
+		v, err := cmd.Flags().GetBool("retention-policy-enabled")
+		if err != nil {
+			return err
+		}
+		webhookArchivingEnabled = &v
+	}
+
+	if retentionEnabled == nil && webhookArchivingEnabled == nil {
+		return nil
+	}
+
+	return config.ForceBools(func(c *config.Configuration) {
+		if retentionEnabled != nil {
+			c.Retention.Enabled = *retentionEnabled
+		}
+		if webhookArchivingEnabled != nil {
+			c.WebhookArchiving.Enabled = *webhookArchivingEnabled
+		}
+	})
+}
+
+func buildCliConfiguration(cmd *cobra.Command) (*config.Configuration, error) {
+	c := &config.Configuration{}
+
+	// CONVOY_LOGGER_LEVEL
+	logLevel, err := cmd.Flags().GetString("log-level")
+	if err != nil {
+		return nil, err
+	}
+
+	if !util.IsStringEmpty(logLevel) {
+		c.Logger.Level = logLevel
+	}
+
+	// CONVOY_INSTANCE_INGEST_RATE
+	instanceIngestRate, err := cmd.Flags().GetInt("instance-ingest-rate")
+	if err != nil {
+		return nil, err
+	}
+
+	c.InstanceIngestRate = instanceIngestRate
+
+	// CONVOY_API_RATE_LIMIT
+	apiRateLimit, err := cmd.Flags().GetInt("api-rate-limit")
+	if err != nil {
+		return nil, err
+	}
+
+	c.ApiRateLimit = apiRateLimit
+
+	// CONVOY_LICENSE_KEY
+	licenseKey, err := cmd.Flags().GetString("license-key")
+	if err != nil {
+		return nil, err
+	}
+
+	c.LicenseKey = licenseKey
+
+	// CONVOY_ROOT_PATH
+	rootPath, err := cmd.Flags().GetString("root-path")
+	if err != nil {
+		return nil, err
+	}
+
+	if !util.IsStringEmpty(rootPath) {
+		c.RootPath = rootPath
+	}
+
+	// CONVOY_DB_TYPE
+	dbType, err := cmd.Flags().GetString("db-type")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_SCHEME
+	dbScheme, err := cmd.Flags().GetString("db-scheme")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_HOST
+	dbHost, err := cmd.Flags().GetString("db-host")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_USERNAME
+	dbUsername, err := cmd.Flags().GetString("db-username")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_PASSWORD
+	dbPassword, err := cmd.Flags().GetString("db-password")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_DATABASE
+	dbDatabase, err := cmd.Flags().GetString("db-database")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_DB_PORT
+	dbPort, err := cmd.Flags().GetInt("db-port")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_ENABLE_FEATURE_FLAG
+	flags, err := cmd.Flags().GetStringSlice("enable-feature-flag")
+	if err != nil {
+		return nil, err
+	}
+	if len(flags) > 0 {
+		c.EnableFeatureFlag = flags
+	}
+
+	flag := fflag2.NewFFlag(c.EnableFeatureFlag)
+
+	var readReplicas []config.DatabaseConfiguration
+	replicaDSNs, err := cmd.Flags().GetStringSlice("read-replicas-dsn")
+	if flag.CanAccessFeature(fflag2.ReadReplicas) {
+		if err != nil {
+			return nil, err
+		}
+
+		for _, replicaStr := range replicaDSNs {
+			var replica config.DatabaseConfiguration
+			if len(replicaStr) == 0 || !strings.Contains(replicaStr, "://") {
+				return nil, fmt.Errorf("invalid read-replicas-dsn: %s", replicaStr)
+			}
+			replica.DSN = replicaStr
+			readReplicas = append(readReplicas, replica)
+		}
+	} else if len(replicaDSNs) > 0 {
+		slog.Error("read-replicas feature flag required before use")
+	}
+
+	c.Database = config.DatabaseConfiguration{
+		Type:     config.DatabaseProvider(dbType),
+		Scheme:   dbScheme,
+		Host:     dbHost,
+		Username: dbUsername,
+		Password: dbPassword,
+		Database: dbDatabase,
+		Port:     dbPort,
+
+		ReadReplicas: readReplicas,
+	}
+
+	// CONVOY_REDIS_SCHEME
+	redisScheme, err := cmd.Flags().GetString("redis-scheme")
+	if err != nil {
+		return nil, err
+	}
+
+	if !util.IsStringEmpty(redisScheme) && !config.IsValidRedisScheme(redisScheme) {
+		return nil, fmt.Errorf("invalid redis scheme: %s. Supported schemes are: %s, %s, %s", redisScheme, config.RedisScheme, config.RedisSentinelScheme, config.RedisSecureScheme)
+	}
+
+	// CONVOY_REDIS_HOST
+	redisHost, err := cmd.Flags().GetString("redis-host")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_USERNAME
+	redisUsername, err := cmd.Flags().GetString("redis-username")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_PASSWORD
+	redisPassword, err := cmd.Flags().GetString("redis-password")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_DATABASE
+	redisDatabase, err := cmd.Flags().GetString("redis-database")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_PORT
+	redisPort, err := cmd.Flags().GetInt("redis-port")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_SENTINEL_MASTER_NAME
+	redisSentinelMasterName, err := cmd.Flags().GetString("redis-sentinel-master-name")
+	if err != nil {
+		return nil, err
+	}
+
+	// CONVOY_REDIS_CLUSTER_ADDRESSES
+	redisAddresses, err := cmd.Flags().GetString("redis-addresses")
+	if err != nil {
+		return nil, err
+	}
+
+	c.Redis = config.RedisConfiguration{
+		Scheme:     redisScheme,
+		Host:       redisHost,
+		Username:   redisUsername,
+		Password:   redisPassword,
+		Database:   redisDatabase,
+		Port:       redisPort,
+		MasterName: redisSentinelMasterName,
+		Addresses:  redisAddresses,
+	}
+
+	// CONVOY_RETENTION_PERIOD (legacy: --retention-policy / CONVOY_RETENTION_POLICY)
+	retentionPeriod, err := cmd.Flags().GetString("retention-period")
+	if err != nil {
+		return nil, err
+	}
+	if util.IsStringEmpty(retentionPeriod) {
+		retentionPeriod, err = cmd.Flags().GetString("retention-policy")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !util.IsStringEmpty(retentionPeriod) {
+		c.Retention.Period = retentionPeriod
+	}
+
+	// CONVOY_RETENTION_ENABLED
+	if cmd.Flags().Changed("retention-enabled") {
+		retentionEnabled, err := cmd.Flags().GetBool("retention-enabled")
+		if err != nil {
+			return nil, err
+		}
+		c.Retention.Enabled = retentionEnabled
+	}
+
+	// CONVOY_WEBHOOK_ARCHIVING_ENABLED (legacy: --retention-policy-enabled)
+	if cmd.Flags().Changed("webhook-archiving-enabled") {
+		webhookArchivingEnabled, err := cmd.Flags().GetBool("webhook-archiving-enabled")
+		if err != nil {
+			return nil, err
+		}
+		c.WebhookArchiving.Enabled = webhookArchivingEnabled
+	} else if cmd.Flags().Changed("retention-policy-enabled") {
+		retentionPolicyEnabled, err := cmd.Flags().GetBool("retention-policy-enabled")
+		if err != nil {
+			return nil, err
+		}
+		c.WebhookArchiving.Enabled = retentionPolicyEnabled
+	}
+
+	// CONVOY_DISPATCHER_BLOCK_LIST
+	ipBlockList, err := cmd.Flags().GetStringSlice("ip-block-list")
+	if err != nil {
+		return nil, err
+	}
+	if len(ipBlockList) > 0 {
+		c.Dispatcher.BlockList = ipBlockList
+	}
+
+	// CONVOY_DISPATCHER_ALLOW_LIST
+	ipAllowList, err := cmd.Flags().GetStringSlice("ip-allow-list")
+	if err != nil {
+		return nil, err
+	}
+	if len(ipAllowList) > 0 {
+		c.Dispatcher.AllowList = ipAllowList
+	}
+
+	// tracing
+	tracingProvider, err := cmd.Flags().GetString("tracer-type")
+	if err != nil {
+		return nil, err
+	}
+
+	c.Tracer = config.TracerConfiguration{
+		Type: config.TracerProvider(tracingProvider),
+	}
+
+	switch c.Tracer.Type {
+	case config.OTelTracerProvider:
+		sampleRate, err := cmd.Flags().GetFloat64("otel-sample-rate")
+		if err != nil {
+			return nil, err
+		}
+
+		collectorURL, err := cmd.Flags().GetString("otel-collector-url")
+		if err != nil {
+			return nil, err
+		}
+
+		headerName, err := cmd.Flags().GetString("otel-auth-header-name")
+		if err != nil {
+			return nil, err
+		}
+
+		headerValue, err := cmd.Flags().GetString("otel-auth-header-value")
+		if err != nil {
+			return nil, err
+		}
+
+		insecureSkipVerify, err := cmd.Flags().GetBool("otel-insecure-skip-verify")
+		if err != nil {
+			return nil, err
+		}
+
+		c.Tracer.OTel = config.OTelConfiguration{
+			SampleRate:         sampleRate,
+			CollectorURL:       collectorURL,
+			InsecureSkipVerify: insecureSkipVerify,
+			OTelAuth: config.OTelAuthConfiguration{
+				HeaderName:  headerName,
+				HeaderValue: headerValue,
+			},
+		}
+	case config.DatadogTracerProvider:
+		agentUrl, err := cmd.Flags().GetString("datadog-agent-url")
+		if err != nil {
+			return nil, err
+		}
+		c.Tracer.Datadog = config.DatadogConfiguration{
+			AgentURL: agentUrl,
+		}
+
+	case config.SentryTracerProvider:
+		dsn, err := cmd.Flags().GetString("sentry-dsn")
+		if err != nil {
+			return nil, err
+		}
+
+		sampleRate, err := cmd.Flags().GetFloat64("sentry-sample-rate")
+		if err != nil {
+			return nil, err
+		}
+
+		debug, err := cmd.Flags().GetBool("sentry-debug")
+		if err != nil {
+			return nil, err
+		}
+
+		c.Tracer.Sentry = config.SentryConfiguration{
+			DSN:        dsn,
+			SampleRate: sampleRate,
+			Debug:      debug,
+		}
+
+		cfg, err := config.Get()
+		if err != nil {
+			return nil, err
+		}
+
+		if !util.IsStringEmpty(cfg.Environment) {
+			c.Tracer.Sentry.Environment = cfg.Environment
+		}
+	}
+
+	c.Metrics = config.MetricsConfiguration{
+		IsEnabled: false,
+	}
+
+	if flag.CanAccessFeature(fflag2.Prometheus) {
+		metricsBackend, err := cmd.Flags().GetString("metrics-backend")
+		if err != nil {
+			return nil, err
+		}
+
+		if !config.IsStringEmpty(metricsBackend) {
+			c.Metrics = config.MetricsConfiguration{
+				IsEnabled: false,
+				Backend:   config.MetricsBackend(metricsBackend),
+			}
+
+			if c.Metrics.Backend == config.PrometheusMetricsProvider {
+				sampleTime, err := cmd.Flags().GetUint64("metrics-prometheus-sample-time")
+				if err != nil {
+					return nil, err
+				}
+
+				if sampleTime < 1 {
+					return nil, errors.New("metrics-prometheus-sample-time must be non-zero")
+				}
+
+				queryTimeout, err := cmd.Flags().GetUint64("metrics-prometheus-query-timeout")
+				if err != nil {
+					return nil, err
+				}
+
+				materializedViewRefreshInterval, err := cmd.Flags().GetUint64("metrics-prometheus-materialized-view-refresh-interval")
+				if err != nil {
+					return nil, err
+				}
+
+				c.Metrics = config.MetricsConfiguration{
+					IsEnabled: true,
+					Backend:   config.MetricsBackend(metricsBackend),
+					Prometheus: config.PrometheusMetricsConfiguration{
+						SampleTime:                      sampleTime,
+						QueryTimeout:                    queryTimeout,
+						MaterializedViewRefreshInterval: materializedViewRefreshInterval,
+					},
+				}
+			}
+		} else {
+			slog.Warn("metrics backend not specified")
+		}
+	}
+
+	maxRetrySeconds, err := cmd.Flags().GetUint64("max-retry-seconds")
+	if err != nil {
+		return nil, err
+	}
+
+	c.MaxRetrySeconds = maxRetrySeconds
+
+	err = loadHCPVaultConfig(cmd, &c.HCPVault)
+	if err != nil {
+		return nil, err
+	}
+
+	billingURL, err := cmd.Flags().GetString("billing-url")
+	if err != nil {
+		return nil, err
+	}
+
+	billingAPIKey, err := cmd.Flags().GetString("billing-api-key")
+	if err != nil {
+		return nil, err
+	}
+
+	if !util.IsStringEmpty(billingURL) {
+		c.Billing.URL = billingURL
+	}
+
+	if !util.IsStringEmpty(billingAPIKey) {
+		c.Billing.APIKey = billingAPIKey
+	}
+
+	if err := c.Billing.Validate(); err != nil {
+		return nil, fmt.Errorf("billing configuration error: %w", err)
+	}
+
+	return c, nil
+}
+
+func checkPendingMigrations(lo log.Logger, db database.Database) error {
+	p, ok := db.(*postgres.Postgres)
+	if !ok {
+		return errors.New("failed to open database")
+	}
+
+	type ID struct {
+		Id string
+	}
+	counter := map[string]ID{}
+
+	files, err := convoy.MigrationFiles.ReadDir("sql")
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if !file.IsDir() {
+			id := ID{Id: file.Name()}
+			counter[id.Id] = id
+		}
+	}
+
+	rows, err := p.GetDB().Queryx("SELECT id FROM convoy.gorp_migrations")
+	if err != nil {
+		return err
+	}
+	defer closeWithError(lo, rows)
+
+	for rows.Next() {
+		var id ID
+
+		err = rows.StructScan(&id)
+		if err != nil {
+			return err
+		}
+
+		_, ok := counter[id.Id]
+		if ok {
+			delete(counter, id.Id)
+		}
+	}
+
+	if len(counter) > 0 {
+		return postgres.ErrPendingMigrationsFound
+	}
+
+	return nil
+}
+
+func shouldCheckMigration(cmd *cobra.Command) bool {
+	if cmd.Annotations == nil {
+		return true
+	}
+
+	val, ok := cmd.Annotations["CheckMigration"]
+	if !ok {
+		return true
+	}
+
+	if val != "false" {
+		return true
+	}
+
+	return false
+}
+
+func shouldBootstrap(cmd *cobra.Command) bool {
+	if cmd.Annotations == nil {
+		return true
+	}
+
+	val, ok := cmd.Annotations["ShouldBootstrap"]
+	if !ok {
+		return true
+	}
+
+	if val != "false" {
+		return true
+	}
+
+	return false
+}
+
+func ensureDefaultUser(ctx context.Context, a *cli.App) error {
+	userRepo := users.New(a.Logger, a.DB)
+	count, err := userRepo.CountUsers(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to count users: %v", err)
+	}
+
+	if count > 0 {
+		return nil
+	}
+
+	p := datastore.Password{Plaintext: "default"}
+	err = p.GenerateHash()
+
+	if err != nil {
+		return err
+	}
+
+	defaultUser := &datastore.User{
+		UID:           ulid.Make().String(),
+		FirstName:     "default",
+		LastName:      "default",
+		Email:         "superuser@default.com",
+		Password:      string(p.Hash),
+		EmailVerified: true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+
+	err = userRepo.CreateUser(ctx, defaultUser)
+	if err != nil {
+		if errors.Is(err, datastore.ErrDuplicateEmail) {
+			return nil
+		}
+		return fmt.Errorf("failed to create user - %w", err)
+	}
+
+	a.Logger.Infof("Created Superuser with username: %s", defaultUser.Email)
+	fmt.Printf("Superuser created successfully:\n  Username: %s\n  Password: %s\n", defaultUser.Email, p.Plaintext)
+
+	return nil
+}
+
+func closeWithError(lo log.Logger, closer io.Closer) {
+	err := closer.Close()
+	if err != nil {
+		lo.Printf("%v, an error occurred while closing the client", err)
+	}
+}
+
+func loadHCPVaultConfig(cmd *cobra.Command, vaultConfig *config.HCPVaultConfig) error {
+	// Load from CLI flags
+	clientID, err := cmd.Flags().GetString("hcp-client-id")
+	if err != nil {
+		return err
+	}
+	if clientID != "" {
+		vaultConfig.ClientID = clientID
+	}
+
+	clientSecret, err := cmd.Flags().GetString("hcp-client-secret")
+	if err != nil {
+		return err
+	}
+	if clientSecret != "" {
+		vaultConfig.ClientSecret = clientSecret
+	}
+
+	orgID, err := cmd.Flags().GetString("hcp-org-id")
+	if err != nil {
+		return err
+	}
+	if orgID != "" {
+		vaultConfig.OrgID = orgID
+	}
+
+	projectID, err := cmd.Flags().GetString("hcp-project-id")
+	if err != nil {
+		return err
+	}
+	if projectID != "" {
+		vaultConfig.ProjectID = projectID
+	}
+
+	appName, err := cmd.Flags().GetString("hcp-app-name")
+	if err != nil {
+		return err
+	}
+	if appName != "" {
+		vaultConfig.AppName = appName
+	}
+
+	secretName, err := cmd.Flags().GetString("hcp-secret-name")
+	if err != nil {
+		return err
+	}
+	if secretName != "" {
+		vaultConfig.SecretName = secretName
+	}
+
+	return nil
+}

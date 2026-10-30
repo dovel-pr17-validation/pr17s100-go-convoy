@@ -1,0 +1,381 @@
+-- Event Deliveries Repository SQL Queries
+-- Migrated from database/postgres/event_delivery.go to sqlc
+
+-- ============================================================================
+-- Group 1: CRUD Operations
+-- ============================================================================
+
+-- name: CreateEventDelivery :batchexec
+-- event_bytes denormalizes the parent event's persisted byte size (raw_bytes +
+-- data_bytes) so egress usage can be summed without joining back to the events
+-- payload. NULL for deliveries of pre-migration events; usage reads COALESCE those
+-- to a join-time fallback.
+INSERT INTO convoy.event_deliveries (
+    id, project_id, event_id, endpoint_id, device_id, subscription_id, headers, status,
+	metadata, cli_metadata, description, target_url, url_query_params, idempotency_key, event_type, acknowledged_at, delivery_mode,
+	event_bytes
+)
+VALUES (@id, @project_id, @event_id, @endpoint_id, @device_id, @subscription_id, @headers, @status,
+		@metadata, @cli_metadata, @description, @target_url, @url_query_params, @idempotency_key, @event_type, @acknowledged_at, @delivery_mode,
+		(SELECT e.raw_bytes + e.data_bytes FROM convoy.events e WHERE e.id = @event_id_lookup AND e.project_id = @project_id_lookup));
+
+-- Records the delivery's day as stale for the per-status rollup unless the row
+-- was created today, which the refresh window covers no matter when the next
+-- run lands. Yesterday does not qualify: a run a second after midnight covers
+-- today and yesterday as they are then, which no longer includes the day this
+-- update touched. Those markers cost an idempotent insert and are cleared by
+-- the window refresh itself, so they never reach the drain.
+--
+-- Same statement as the status write, so a status change cannot land without
+-- the rollup learning that the day moved.
+-- name: UpdateEventDeliveryMetadata :exec
+WITH updated AS (
+    UPDATE convoy.event_deliveries
+    SET status = @status, metadata = @metadata, latency_seconds = @latency_seconds, description = @description, updated_at = NOW()
+    WHERE id = @id AND project_id = @project_id AND deleted_at IS NULL
+    RETURNING created_at
+)
+INSERT INTO convoy.event_delivery_daily_counts_stale (day)
+SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date
+FROM updated
+WHERE created_at < DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+ON CONFLICT (day) DO NOTHING;
+
+-- Marks stale days the same way as UpdateEventDeliveryMetadata. This is the
+-- path force resend and batch retry take, which is how a day long past the
+-- refresh window gets its statuses rewritten in bulk.
+-- name: UpdateStatusOfEventDeliveries :exec
+WITH updated AS (
+    UPDATE convoy.event_deliveries
+    SET status = @status, description = @description, updated_at = NOW()
+    WHERE (project_id = @project_id OR @project_id = '')
+      AND id = ANY(@ids::TEXT[])
+      AND deleted_at IS NULL
+    RETURNING created_at
+)
+INSERT INTO convoy.event_delivery_daily_counts_stale (day)
+SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date
+FROM updated
+WHERE created_at < DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+ON CONFLICT (day) DO NOTHING;
+
+-- ============================================================================
+-- Group 2: Find Operations
+-- ============================================================================
+
+-- name: FindEventDeliveryByID :one
+SELECT
+    ed.id, ed.project_id, ed.event_id, ed.subscription_id,
+    ed.headers, ed.attempts, ed.status, ed.metadata, ed.cli_metadata,
+	COALESCE(ed.target_url, '') AS target_url,
+    COALESCE(ed.url_query_params, '') AS url_query_params,
+    COALESCE(ed.idempotency_key, '') AS idempotency_key,
+    ed.description, ed.created_at, ed.updated_at, ed.acknowledged_at,
+    COALESCE(ed.event_type, '') AS event_type,
+    COALESCE(ed.device_id, '') AS device_id,
+    COALESCE(ed.endpoint_id, '') AS endpoint_id,
+    COALESCE(ed.delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    COALESCE(ed.latency_seconds, 0) AS latency_seconds,
+    COALESCE(ep.id, '') AS "endpoint_metadata.id",
+    COALESCE(ep.name, '') AS "endpoint_metadata.name",
+    COALESCE(ep.project_id, '') AS "endpoint_metadata.project_id",
+    COALESCE(ep.support_email, '') AS "endpoint_metadata.support_email",
+    COALESCE(ep.url, '') AS "endpoint_metadata.url",
+    COALESCE(ep.owner_id, '') AS "endpoint_metadata.owner_id",
+    COALESCE(ep.status, '') AS "endpoint_metadata.status",
+    ep.deleted_at AS "endpoint_metadata.deleted_at",
+    ev.id AS "event_metadata.id",
+    ev.event_type AS "event_metadata.event_type",
+    ev.created_at AS "event_metadata.created_at",
+    COALESCE(d.id, '') AS "device_metadata.id",
+    COALESCE(d.status, '') AS "device_metadata.status",
+    COALESCE(d.host_name, '') AS "device_metadata.host_name",
+    COALESCE(s.id, '') AS "source_metadata.id",
+    COALESCE(s.name, '') AS "source_metadata.name"
+FROM convoy.event_deliveries ed
+LEFT JOIN convoy.endpoints ep ON ed.endpoint_id = ep.id
+LEFT JOIN convoy.events ev ON ed.event_id = ev.id AND ev.project_id = ed.project_id
+LEFT JOIN convoy.devices d ON ed.device_id = d.id
+LEFT JOIN convoy.sources s ON s.id = ev.source_id
+WHERE ed.deleted_at IS NULL
+  AND ed.id = @id AND ed.project_id = @project_id;
+
+-- Slim variant: does not JOIN endpoint/event/source/device tables. It still loads
+-- description so the worker's write-back via UpdateEventDeliveryMetadata stays
+-- faithful and does not clobber a stored description with an empty value.
+-- name: FindEventDeliveryByIDSlim :one
+SELECT
+    id, project_id, event_id, subscription_id,
+    headers, attempts, status, metadata, cli_metadata, description,
+	COALESCE(target_url, '') AS target_url,
+    COALESCE(url_query_params, '') AS url_query_params,
+    COALESCE(idempotency_key, '') AS idempotency_key,
+    created_at, updated_at,
+    COALESCE(event_type, '') AS event_type,
+    COALESCE(device_id, '') AS device_id,
+    COALESCE(endpoint_id, '') AS endpoint_id,
+    COALESCE(delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    acknowledged_at
+FROM convoy.event_deliveries
+WHERE deleted_at IS NULL
+  AND project_id = @project_id AND id = @id;
+
+-- name: FindEventDeliveriesByIDs :many
+SELECT
+    id, project_id, event_id, subscription_id,
+    headers, attempts, status, metadata, cli_metadata,
+	COALESCE(target_url, '') AS target_url,
+    COALESCE(idempotency_key, '') AS idempotency_key,
+    COALESCE(url_query_params, '') AS url_query_params,
+    description, created_at, updated_at,
+    COALESCE(event_type, '') AS event_type,
+    COALESCE(device_id, '') AS device_id,
+    COALESCE(endpoint_id, '') AS endpoint_id,
+    COALESCE(delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    acknowledged_at
+FROM convoy.event_deliveries
+WHERE id = ANY(@ids::TEXT[])
+  AND project_id = @project_id
+  AND deleted_at IS NULL;
+
+-- name: FindEventDeliveriesByEventID :many
+SELECT
+    id, project_id, event_id, subscription_id,
+    headers, attempts, status, metadata, cli_metadata,
+	COALESCE(target_url, '') AS target_url,
+    COALESCE(idempotency_key, '') AS idempotency_key,
+    COALESCE(url_query_params, '') AS url_query_params,
+    description, created_at, updated_at,
+    COALESCE(event_type, '') AS event_type,
+    COALESCE(device_id, '') AS device_id,
+    COALESCE(endpoint_id, '') AS endpoint_id,
+    COALESCE(delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    acknowledged_at
+FROM convoy.event_deliveries
+WHERE event_id = @event_id
+  AND project_id = @project_id
+  AND deleted_at IS NULL;
+
+-- name: FindDiscardedEventDeliveries :many
+SELECT
+    id, project_id, event_id, subscription_id,
+    headers, attempts, status, metadata, cli_metadata,
+	COALESCE(target_url, '') AS target_url,
+    COALESCE(idempotency_key, '') AS idempotency_key,
+    COALESCE(url_query_params, '') AS url_query_params,
+    description, created_at, updated_at,
+    COALESCE(event_type, '') AS event_type,
+    COALESCE(device_id, '') AS device_id,
+    COALESCE(endpoint_id, '') AS endpoint_id,
+    COALESCE(delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    acknowledged_at
+FROM convoy.event_deliveries
+WHERE status = 'Discarded'
+  AND project_id = @project_id
+  AND device_id = @device_id
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND deleted_at IS NULL;
+
+-- name: FindStuckEventDeliveriesByStatus :many
+SELECT id, project_id
+FROM convoy.event_deliveries
+WHERE status = @status
+  AND created_at <= now() - make_interval(secs := 30)
+  AND deleted_at IS NULL
+FOR UPDATE SKIP LOCKED
+LIMIT 1000;
+
+-- ============================================================================
+-- Group 3: Count Operations
+-- ============================================================================
+
+-- name: CountDeliveriesByStatus :one
+SELECT COUNT(id) AS count
+FROM convoy.event_deliveries
+WHERE status = @status
+  AND (project_id = @project_id OR @project_id = '')
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND deleted_at IS NULL;
+
+-- name: CountEventDeliveries :one
+SELECT COUNT(id) AS count
+FROM convoy.event_deliveries
+WHERE (project_id = @project_id OR @project_id = '')
+  AND (event_id = @event_id OR @event_id = '')
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND deleted_at IS NULL
+  AND (CASE WHEN @has_endpoint_ids::BOOLEAN THEN endpoint_id = ANY(@endpoint_ids::TEXT[]) ELSE true END)
+  AND (CASE WHEN @has_status::BOOLEAN THEN status = ANY(@statuses::TEXT[]) ELSE true END);
+
+-- CountDeliveriesByEndpointAndStatus returns per-endpoint counts for the given
+-- statuses over a date range. Used to compute the period (history) failure rate
+-- for the endpoints list and the per-endpoint reliability view. Restricted to the
+-- caller's status set so it stays index-friendly.
+-- name: CountDeliveriesByEndpointAndStatus :many
+SELECT endpoint_id, status, COUNT(*) AS count
+FROM convoy.event_deliveries
+WHERE project_id = @project_id
+  AND endpoint_id = ANY(@endpoint_ids::TEXT[])
+  AND status = ANY(@statuses::TEXT[])
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND deleted_at IS NULL
+GROUP BY endpoint_id, status;
+
+-- ============================================================================
+-- Group 4: Pagination
+-- ============================================================================
+
+-- Hydrate a page of delivery ids. The id scan lives in Go (listFilter) so
+-- status, cursor, and other optional filters are real predicates, not CASE
+-- wrappers. Generic plans of the old InnerDesc/InnerAsc queries timed out on
+-- rare-status page 2 because those CASE clauses kept status and the keyset
+-- out of index cond. ORDER BY here is only the ~page of already-chosen ids.
+-- name: HydrateEventDeliveriesPage :many
+SELECT
+    ed.id, ed.project_id, ed.event_id, ed.subscription_id,
+    ed.headers, ed.attempts, ed.status, ed.metadata, ed.cli_metadata,
+    COALESCE(ed.target_url, '') AS target_url,
+    COALESCE(ed.url_query_params, '') AS url_query_params,
+    COALESCE(ed.idempotency_key, '') AS idempotency_key,
+    ed.description, ed.created_at, ed.updated_at, ed.acknowledged_at,
+    COALESCE(ed.event_type, '') AS event_type,
+    COALESCE(ed.device_id, '') AS device_id,
+    COALESCE(ed.endpoint_id, '') AS endpoint_id,
+    COALESCE(ed.delivery_mode, 'at_least_once')::TEXT AS delivery_mode,
+    COALESCE(ed.latency_seconds, 0) AS latency_seconds,
+    COALESCE(ep.id, '') AS "endpoint_metadata.id",
+    COALESCE(ep.name, '') AS "endpoint_metadata.name",
+    COALESCE(ep.project_id, '') AS "endpoint_metadata.project_id",
+    COALESCE(ep.support_email, '') AS "endpoint_metadata.support_email",
+    COALESCE(ep.url, '') AS "endpoint_metadata.url",
+    COALESCE(ep.owner_id, '') AS "endpoint_metadata.owner_id",
+    COALESCE(ep.status, '') AS "endpoint_metadata.status",
+    ep.deleted_at AS "endpoint_metadata.deleted_at",
+    ev.id AS "event_metadata.id",
+    ev.event_type AS "event_metadata.event_type",
+    ev.created_at AS "event_metadata.created_at",
+    COALESCE(d.id, '') AS "device_metadata.id",
+    COALESCE(d.status, '') AS "device_metadata.status",
+    COALESCE(d.host_name, '') AS "device_metadata.host_name",
+    COALESCE(s.id, '') AS "source_metadata.id",
+    COALESCE(s.name, '') AS "source_metadata.name",
+    COALESCE(s.idempotency_keys, '{}') AS "source_metadata.idempotency_keys"
+FROM convoy.event_deliveries ed
+LEFT JOIN convoy.endpoints ep ON ed.endpoint_id = ep.id
+LEFT JOIN convoy.events ev ON ed.event_id = ev.id AND ev.project_id = ed.project_id
+LEFT JOIN convoy.devices d ON ed.device_id = d.id
+LEFT JOIN convoy.sources s ON s.id = ev.source_id
+WHERE ed.project_id = @project_id
+  AND ed.id = ANY(@ids::TEXT[])
+  AND ed.deleted_at IS NULL;
+
+-- ============================================================================
+-- Group 5: Intervals
+-- ============================================================================
+
+-- name: LoadEventDeliveryIntervalsDaily :many
+SELECT
+    DATE_TRUNC('day', created_at) AS "data.group_only",
+    TO_CHAR(DATE_TRUNC('day', created_at), 'yyyy-mm-dd') AS "data.total_time",
+    EXTRACT('doy' FROM created_at) AS "data.index",
+    COUNT(*) AS count
+FROM convoy.event_deliveries
+WHERE project_id = @project_id
+  AND deleted_at IS NULL
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND (CASE WHEN @has_endpoint_ids::BOOLEAN THEN endpoint_id = ANY(@endpoint_ids::TEXT[]) ELSE true END)
+GROUP BY "data.group_only", "data.index"
+ORDER BY "data.group_only" ASC;
+
+-- name: LoadEventDeliveryIntervalsWeekly :many
+SELECT
+    DATE_TRUNC('week', created_at) AS "data.group_only",
+    TO_CHAR(DATE_TRUNC('week', created_at), 'yyyy-mm-dd') AS "data.total_time",
+    EXTRACT('week' FROM created_at) AS "data.index",
+    COUNT(*) AS count
+FROM convoy.event_deliveries
+WHERE project_id = @project_id
+  AND deleted_at IS NULL
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND (CASE WHEN @has_endpoint_ids::BOOLEAN THEN endpoint_id = ANY(@endpoint_ids::TEXT[]) ELSE true END)
+GROUP BY "data.group_only", "data.index"
+ORDER BY "data.group_only" ASC;
+
+-- name: LoadEventDeliveryIntervalsMonthly :many
+SELECT
+    DATE_TRUNC('month', created_at) AS "data.group_only",
+    TO_CHAR(DATE_TRUNC('month', created_at), 'yyyy-mm') AS "data.total_time",
+    EXTRACT('month' FROM created_at) AS "data.index",
+    COUNT(*) AS count
+FROM convoy.event_deliveries
+WHERE project_id = @project_id
+  AND deleted_at IS NULL
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND (CASE WHEN @has_endpoint_ids::BOOLEAN THEN endpoint_id = ANY(@endpoint_ids::TEXT[]) ELSE true END)
+GROUP BY "data.group_only", "data.index"
+ORDER BY "data.group_only" ASC;
+
+-- name: LoadEventDeliveryIntervalsYearly :many
+SELECT
+    DATE_TRUNC('year', created_at) AS "data.group_only",
+    TO_CHAR(DATE_TRUNC('year', created_at), 'yyyy') AS "data.total_time",
+    EXTRACT('year' FROM created_at) AS "data.index",
+    COUNT(*) AS count
+FROM convoy.event_deliveries
+WHERE project_id = @project_id
+  AND deleted_at IS NULL
+  AND created_at >= @start_date
+  AND created_at <= @end_date
+  AND (CASE WHEN @has_endpoint_ids::BOOLEAN THEN endpoint_id = ANY(@endpoint_ids::TEXT[]) ELSE true END)
+GROUP BY "data.group_only", "data.index"
+ORDER BY "data.group_only" ASC;
+
+-- ============================================================================
+-- Group 7: Export Operations
+-- ============================================================================
+
+-- name: ExportEventDeliveries :many
+SELECT ed.id,
+       JSONB_BUILD_OBJECT(
+           'uid', ed.id,
+           'project_id', ed.project_id,
+           'event_id', ed.event_id,
+           'endpoint_id', ed.endpoint_id,
+           'device_id', ed.device_id,
+           'subscription_id', ed.subscription_id,
+           'headers', ed.headers,
+           'attempts', ed.attempts,
+           'status', ed.status,
+           'metadata', ed.metadata,
+           'cli_metadata', ed.cli_metadata,
+           'description', ed.description,
+           'target_url', ed.target_url,
+           'url_query_params', ed.url_query_params,
+           'idempotency_key', ed.idempotency_key,
+           'event_type', ed.event_type,
+           'acknowledged_at', ed.acknowledged_at,
+           'latency_seconds', ed.latency_seconds,
+           'delivery_mode', ed.delivery_mode,
+           'created_at', ed.created_at,
+           'updated_at', ed.updated_at
+       ) AS json_output
+FROM convoy.event_deliveries AS ed
+WHERE created_at < @created_at_end
+  AND created_at >= @created_at_start
+  AND (id > @cursor OR @cursor = '')
+  AND deleted_at IS NULL
+ORDER BY id
+LIMIT @page_limit;
+
+-- name: CountExportedEventDeliveries :one
+SELECT COUNT(*) AS count FROM convoy.event_deliveries
+WHERE created_at < @created_at_end
+  AND created_at >= @created_at_start
+  AND deleted_at IS NULL;

@@ -1,0 +1,373 @@
+package organisations
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/common"
+	"github.com/frain-dev/convoy/internal/organisations/repo"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+// Service implements the OrganisationRepository using SQLc-generated queries
+type Service struct {
+	logger log.Logger
+	repo   repo.Querier      // SQLc-generated interface
+	db     *pgxpool.Pool     // Connection pool
+	legacy database.Database // For gradual migration if needed
+}
+
+// Ensure Service implements datastore.OrganisationRepository at compile time
+var _ datastore.OrganisationRepository = (*Service)(nil)
+
+// New creates a new Organisation Service
+func New(logger log.Logger, db database.Database) *Service {
+	return &Service{
+		logger: logger,
+		repo:   repo.New(db.GetConn()),
+		db:     db.GetConn(),
+		legacy: db,
+	}
+}
+
+// rowToOrganisation converts any SQLc-generated row struct to datastore.Organisation
+func rowToOrganisation(row interface{}) datastore.Organisation {
+	var (
+		id, ownerID, name, licenseData  string
+		customDomain, assignedDomain    pgtype.Text
+		createdAt, updatedAt, deletedAt pgtype.Timestamptz
+		disabledAt                      pgtype.Timestamptz
+	)
+
+	switch r := row.(type) {
+	case repo.FetchOrganisationByIDRow:
+		id, ownerID, name = r.ID, r.OwnerID, r.Name
+		customDomain, assignedDomain = r.CustomDomain, r.AssignedDomain
+		if r.LicenseData.Valid {
+			licenseData = r.LicenseData.String
+		}
+		createdAt, updatedAt, deletedAt, disabledAt = r.CreatedAt, r.UpdatedAt, r.DeletedAt, r.DisabledAt
+	case repo.FetchOrganisationByCustomDomainRow:
+		id, ownerID, name = r.ID, r.OwnerID, r.Name
+		customDomain, assignedDomain = r.CustomDomain, r.AssignedDomain
+		if r.LicenseData.Valid {
+			licenseData = r.LicenseData.String
+		}
+		createdAt, updatedAt, deletedAt, disabledAt = r.CreatedAt, r.UpdatedAt, r.DeletedAt, r.DisabledAt
+	case repo.FetchOrganisationByAssignedDomainRow:
+		id, ownerID, name = r.ID, r.OwnerID, r.Name
+		customDomain, assignedDomain = r.CustomDomain, r.AssignedDomain
+		if r.LicenseData.Valid {
+			licenseData = r.LicenseData.String
+		}
+		createdAt, updatedAt, deletedAt, disabledAt = r.CreatedAt, r.UpdatedAt, r.DeletedAt, r.DisabledAt
+	case repo.FetchOrganisationsPaginatedRow:
+		id, ownerID, name = r.ID, r.OwnerID, r.Name
+		customDomain, assignedDomain = r.CustomDomain, r.AssignedDomain
+		if r.LicenseData.Valid {
+			licenseData = r.LicenseData.String
+		}
+		createdAt, updatedAt, deletedAt, disabledAt = r.CreatedAt, r.UpdatedAt, r.DeletedAt, r.DisabledAt
+	default:
+		return datastore.Organisation{}
+	}
+
+	return datastore.Organisation{
+		UID:            id,
+		OwnerID:        ownerID,
+		Name:           name,
+		CustomDomain:   common.PgTextToNullString(customDomain),
+		AssignedDomain: common.PgTextToNullString(assignedDomain),
+		LicenseData:    licenseData,
+		CreatedAt:      createdAt.Time,
+		UpdatedAt:      updatedAt.Time,
+		DeletedAt:      common.PgTimestamptzToNullTime(deletedAt),
+		DisabledAt:     common.PgTimestamptzToNullTime(disabledAt),
+	}
+}
+
+// ============================================================================
+// Service Implementation
+// ============================================================================
+
+// CreateOrganisation creates a new organisation
+func (s *Service) CreateOrganisation(ctx context.Context, org *datastore.Organisation) error {
+	if org == nil {
+		return util.NewServiceError(http.StatusBadRequest, errors.New("organisation cannot be nil"))
+	}
+
+	err := s.repo.CreateOrganisation(ctx, repo.CreateOrganisationParams{
+		ID:             common.StringToPgTextNullable(org.UID),
+		Name:           common.StringToPgTextNullable(org.Name),
+		OwnerID:        common.StringToPgTextNullable(org.OwnerID),
+		CustomDomain:   common.NullStringToPgText(org.CustomDomain),
+		AssignedDomain: common.NullStringToPgText(org.AssignedDomain),
+		LicenseData:    common.StringToPgTextNullable(org.LicenseData),
+	})
+
+	if err != nil {
+		s.logger.Error("failed to create organisation", "error", err)
+		return util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	return nil
+}
+
+// UpdateOrganisation updates an existing organisation
+func (s *Service) UpdateOrganisation(ctx context.Context, org *datastore.Organisation) error {
+	if org == nil {
+		return util.NewServiceError(http.StatusBadRequest, errors.New("organisation cannot be nil"))
+	}
+
+	result, err := s.repo.UpdateOrganisation(ctx, repo.UpdateOrganisationParams{
+		Name:           common.StringToPgTextNullable(org.Name),
+		CustomDomain:   common.NullStringToPgText(org.CustomDomain),
+		AssignedDomain: common.NullStringToPgText(org.AssignedDomain),
+		DisabledAt:     common.NullTimeToPgTimestamptz(org.DisabledAt),
+		LicenseData:    common.StringToPgTextNullable(org.LicenseData),
+		ID:             common.StringToPgTextNullable(org.UID),
+	})
+
+	if err != nil {
+		s.logger.Error("failed to update organisation", "error", err)
+		return util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return util.NewServiceError(http.StatusNotFound, datastore.ErrOrgNotFound)
+	}
+
+	return nil
+}
+
+// UpdateOrganisationLicenseData updates only the license_data field for an organisation
+func (s *Service) UpdateOrganisationLicenseData(ctx context.Context, orgID, licenseData string) error {
+	result, err := s.repo.UpdateOrganisationLicenseData(ctx, repo.UpdateOrganisationLicenseDataParams{
+		LicenseData: common.StringToPgTextNullable(licenseData),
+		ID:          common.StringToPgTextNullable(orgID),
+	})
+	if err != nil {
+		s.logger.Error("failed to update organisation license data", "error", err)
+		return util.NewServiceError(http.StatusInternalServerError, err)
+	}
+	if result.RowsAffected() == 0 {
+		return util.NewServiceError(http.StatusNotFound, datastore.ErrOrgNotFound)
+	}
+	return nil
+}
+
+// DeleteOrganisation soft deletes an organisation by ID
+func (s *Service) DeleteOrganisation(ctx context.Context, id string) error {
+	result, err := s.repo.DeleteOrganisation(ctx, common.StringToPgTextNullable(id))
+	if err != nil {
+		s.logger.Error("failed to delete organisation", "error", err)
+		return util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return util.NewServiceError(http.StatusNotFound, datastore.ErrOrgNotFound)
+	}
+
+	return nil
+}
+
+// FetchOrganisationByID retrieves an organisation by its ID
+func (s *Service) FetchOrganisationByID(ctx context.Context, id string) (*datastore.Organisation, error) {
+	row, err := s.repo.FetchOrganisationByID(ctx, common.StringToPgTextNullable(id))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, datastore.ErrOrgNotFound
+		}
+		s.logger.Error("failed to fetch organisation by id", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	org := rowToOrganisation(row)
+	return &org, nil
+}
+
+// FetchOrganisationByCustomDomain retrieves an organisation by its custom domain
+func (s *Service) FetchOrganisationByCustomDomain(ctx context.Context, domain string) (*datastore.Organisation, error) {
+	row, err := s.repo.FetchOrganisationByCustomDomain(ctx, common.StringToPgTextNullable(domain))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, datastore.ErrOrgNotFound
+		}
+		s.logger.Error("failed to fetch organisation by custom domain", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	org := rowToOrganisation(row)
+	return &org, nil
+}
+
+// FetchOrganisationByAssignedDomain retrieves an organisation by its assigned domain
+func (s *Service) FetchOrganisationByAssignedDomain(ctx context.Context, domain string) (*datastore.Organisation, error) {
+	row, err := s.repo.FetchOrganisationByAssignedDomain(ctx, common.StringToPgTextNullable(domain))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, datastore.ErrOrgNotFound
+		}
+		s.logger.Error("failed to fetch organisation by assigned domain", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	org := rowToOrganisation(row)
+	return &org, nil
+}
+
+// LoadOrganisationsPaged retrieves organisations with pagination
+func (s *Service) LoadOrganisationsPaged(ctx context.Context, pageable datastore.Pageable) ([]datastore.Organisation, datastore.PaginationData, error) {
+	return s.LoadOrganisationsPagedWithSearch(ctx, pageable, "")
+}
+
+// LoadOrganisationsPagedWithSearch retrieves organisations with pagination and search
+func (s *Service) LoadOrganisationsPagedWithSearch(ctx context.Context, pageable datastore.Pageable, search string) ([]datastore.Organisation, datastore.PaginationData, error) {
+	// Determine direction for query
+	direction := "next"
+	if pageable.Direction == datastore.Prev {
+		direction = "prev"
+	}
+
+	// Prepare search parameter
+	hasSearch := !util.IsStringEmpty(search)
+	searchParam := ""
+	if hasSearch {
+		searchParam = "%" + search + "%"
+	}
+
+	// Query organisations with pagination
+	rows, err := s.repo.FetchOrganisationsPaginated(ctx, repo.FetchOrganisationsPaginatedParams{
+		Direction: common.StringToPgTextNullable(direction),
+		Cursor:    common.StringToPgTextNullable(pageable.Cursor()),
+		HasSearch: common.BoolToPgBool(hasSearch),
+		Search:    common.StringToPgTextNullable(searchParam),
+		LimitVal:  pgtype.Int8{Int64: int64(pageable.Limit()), Valid: true},
+	})
+	if err != nil {
+		s.logger.Error("failed to load organisations paged", "error", err)
+		return nil, datastore.PaginationData{}, util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	// Convert rows to organisations
+	organisations := make([]datastore.Organisation, 0, len(rows))
+	for _, row := range rows {
+		org := rowToOrganisation(row)
+		organisations = append(organisations, org)
+	}
+
+	// Build IDs for pagination
+	ids := make([]string, len(organisations))
+	for i := range organisations {
+		ids[i] = organisations[i].UID
+	}
+
+	// If we got more results than requested, trim the extra one (used for hasNext detection)
+	if len(organisations) > pageable.PerPage {
+		organisations = organisations[:len(organisations)-1]
+	}
+
+	// Count previous rows for pagination
+	var prevRowCount datastore.PrevRowCount
+	if len(organisations) > 0 {
+		first := organisations[0]
+		count, err := s.repo.CountPrevOrganisations(ctx, repo.CountPrevOrganisationsParams{
+			Cursor:    common.StringToPgTextNullable(first.UID),
+			HasSearch: common.BoolToPgBool(hasSearch),
+			Search:    common.StringToPgTextNullable(searchParam),
+		})
+		if err != nil {
+			s.logger.Error("failed to count prev organisations", "error", err)
+			return nil, datastore.PaginationData{}, util.NewServiceError(http.StatusInternalServerError, err)
+		}
+		prevRowCount.Count = int(count.Int64)
+	}
+
+	// Build pagination data
+	pagination := &datastore.PaginationData{PrevRowCount: prevRowCount}
+	pagination = pagination.Build(pageable, ids)
+
+	return organisations, *pagination, nil
+}
+
+// CountOrganisations returns the total count of organisations
+func (s *Service) CountOrganisations(ctx context.Context) (int64, error) {
+	count, err := s.repo.CountOrganisations(ctx)
+	if err != nil {
+		s.logger.Error("failed to count organisations", "error", err)
+		return 0, util.NewServiceError(http.StatusInternalServerError, err)
+	}
+
+	return count.Int64, nil
+}
+
+// CalculateUsage calculates usage metrics for an organisation
+func (s *Service) CalculateUsage(ctx context.Context, orgID string, startTime, endTime time.Time) (*datastore.OrganisationUsage, error) {
+	usage := &datastore.OrganisationUsage{
+		OrganisationID: orgID,
+		CreatedAt:      time.Now(),
+	}
+
+	// Calculate ingress bytes (raw + data bytes)
+	ingressRow, err := s.repo.CalculateIngressBytes(ctx, repo.CalculateIngressBytesParams{
+		OrganisationID: common.StringToPgTextNullable(orgID),
+		StartTime:      pgtype.Timestamptz{Time: startTime, Valid: true},
+		EndTime:        pgtype.Timestamptz{Time: endTime, Valid: true},
+	})
+	if err != nil {
+		s.logger.Error("failed to calculate ingress bytes", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, fmt.Errorf("failed to calculate ingress bytes: %w", err))
+	}
+	usage.Received.Bytes = ingressRow.RawBytes.Int64 + ingressRow.DataBytes.Int64
+
+	// Calculate egress bytes
+	egressBytes, err := s.repo.CalculateEgressBytes(ctx, repo.CalculateEgressBytesParams{
+		OrganisationID: common.StringToPgTextNullable(orgID),
+		StartTime:      pgtype.Timestamptz{Time: startTime, Valid: true},
+		EndTime:        pgtype.Timestamptz{Time: endTime, Valid: true},
+	})
+	if err != nil {
+		s.logger.Error("failed to calculate egress bytes", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, fmt.Errorf("failed to calculate egress bytes: %w", err))
+	}
+	usage.Sent.Bytes = egressBytes.Int64
+
+	// Count events
+	eventCount, err := s.repo.CountOrgEvents(ctx, repo.CountOrgEventsParams{
+		OrganisationID: common.StringToPgTextNullable(orgID),
+		StartTime:      pgtype.Timestamptz{Time: startTime, Valid: true},
+		EndTime:        pgtype.Timestamptz{Time: endTime, Valid: true},
+	})
+	if err != nil {
+		s.logger.Error("failed to count events", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, fmt.Errorf("failed to count events: %w", err))
+	}
+	usage.Received.Volume = eventCount.Int64
+
+	// Count deliveries
+	deliveryCount, err := s.repo.CountOrgDeliveries(ctx, repo.CountOrgDeliveriesParams{
+		OrganisationID: common.StringToPgTextNullable(orgID),
+		StartTime:      pgtype.Timestamptz{Time: startTime, Valid: true},
+		EndTime:        pgtype.Timestamptz{Time: endTime, Valid: true},
+	})
+	if err != nil {
+		s.logger.Error("failed to count deliveries", "error", err)
+		return nil, util.NewServiceError(http.StatusInternalServerError, fmt.Errorf("failed to count deliveries: %w", err))
+	}
+	usage.Sent.Volume = deliveryCount.Int64
+
+	// Format period as YYYY-MM
+	usage.Period = startTime.Format("2006-01")
+
+	return usage, nil
+}

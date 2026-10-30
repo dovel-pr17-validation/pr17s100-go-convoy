@@ -1,0 +1,1030 @@
+package net
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/netip"
+	"net/url"
+	"os"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/stealthrocket/netjail"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"golang.org/x/net/http/httpproxy"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/fflag"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/tracer"
+	"github.com/frain-dev/convoy/pkg/constants"
+	"github.com/frain-dev/convoy/pkg/httpheader"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+var ErrMissingIdempotencyKeyForCustomRequestIDHeader = datastore.ErrMissingIdempotencyKeyForCustomRequestIDHeader
+
+var (
+	ErrAllowListIsRequired = errors.New("allowlist is required")
+	ErrBlockListIsRequired = errors.New("blocklist is required")
+	ErrLoggerIsRequired    = errors.New("logger is required")
+	ErrInvalidIPPrefix     = errors.New("invalid IP prefix")
+	ErrNon2xxResponse      = errors.New("endpoint returned a non-2xx response")
+)
+
+// ContentTypeConverter defines the interface for converting JSON data to different content types
+type ContentTypeConverter interface {
+	Convert(jsonData json.RawMessage) ([]byte, error)
+	ContentType() string
+}
+
+// JSONConverter handles application/json content type
+type JSONConverter struct{}
+
+func (j JSONConverter) Convert(jsonData json.RawMessage) ([]byte, error) {
+	return jsonData, nil
+}
+
+func (j JSONConverter) ContentType() string {
+	return constants.ContentTypeJSON
+}
+
+// FormURLEncodedConverter handles application/x-www-form-urlencoded content type
+type FormURLEncodedConverter struct{}
+
+func (f FormURLEncodedConverter) Convert(jsonData json.RawMessage) ([]byte, error) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(jsonData, &data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON data: %w", err)
+	}
+
+	values := url.Values{}
+	for key, value := range data {
+		switch v := value.(type) {
+		case string:
+			values.Set(key, v)
+		case float64:
+			values.Set(key, fmt.Sprintf("%.0f", v))
+		case bool:
+			values.Set(key, fmt.Sprintf("%t", v))
+		case nil:
+			values.Set(key, "")
+		default:
+			// For complex types, convert to JSON string
+			jsonValue, err := json.Marshal(v)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal value for key %s: %w", key, err)
+			}
+			values.Set(key, string(jsonValue))
+		}
+	}
+
+	return []byte(values.Encode()), nil
+}
+
+func (f FormURLEncodedConverter) ContentType() string {
+	return constants.ContentTypeFormURLEncoded
+}
+
+// getConverter returns the appropriate converter for the given content type
+func getConverter(contentType string) ContentTypeConverter {
+	switch contentType {
+	case constants.ContentTypeFormURLEncoded:
+		return FormURLEncodedConverter{}
+	default:
+		return JSONConverter{}
+	}
+}
+
+type DispatcherOption func(d *Dispatcher) error
+
+// CustomTransport wraps both netjail.Transport and otelhttp.Transport
+type CustomTransport struct {
+	otelTransport    *otelhttp.Transport
+	netJailTransport *netjail.Transport
+	vanillaTransport *http.Transport
+}
+
+// RoundTrip executes a single HTTP transaction
+func (c *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return c.otelTransport.RoundTrip(req)
+}
+
+// dispatcherOtelOpts builds the otelhttp options shared by both the netjail
+// and vanilla transports. When detailedTrace is true we register an httptrace
+// ClientTrace through otelhttp.WithClientTrace so the network-timing events
+// land on otelhttp's child span (HTTP webhook.dispatch) instead of whatever
+// span happens to live on the dispatcher caller's ctx — otelhttp invokes
+// the function with its internal ctx already carrying the child span, so the
+// closure resolves to the correct one.
+func dispatcherOtelOpts(detailedTrace bool) []otelhttp.Option {
+	opts := []otelhttp.Option{
+		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+			return fmt.Sprintf("%s webhook.dispatch", r.Method)
+		}),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return true
+		}),
+	}
+	if detailedTrace {
+		opts = append(opts, otelhttp.WithClientTrace(buildDispatchClientTrace))
+	}
+	return opts
+}
+
+// buildDispatchClientTrace returns an httptrace.ClientTrace whose hooks add
+// per-phase events to the active span on ctx. otelhttp.Transport.RoundTrip
+// calls this with its own ctx (which carries the child span it just created),
+// so AddEvent attaches to that span — not to the dispatcher caller's parent.
+func buildDispatchClientTrace(ctx context.Context) *httptrace.ClientTrace {
+	addEvent := func(name string, attrs ...attribute.KeyValue) {
+		span := oteltrace.SpanFromContext(ctx)
+		if span.IsRecording() {
+			span.AddEvent(name, oteltrace.WithAttributes(attrs...))
+		}
+	}
+	return &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			addEvent(tracer.EventDispatcherDNSLookupStart, attribute.String("dns.host", info.Host))
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			attrs := []attribute.KeyValue{
+				attribute.String("dns.addresses", fmt.Sprintf("%v", info.Addrs)),
+			}
+			if info.Err != nil {
+				attrs = append(attrs, attribute.String("dns.error", info.Err.Error()))
+			}
+			addEvent(tracer.EventDispatcherDNSLookupDone, attrs...)
+		},
+		ConnectStart: func(network, addr string) {
+			addEvent(tracer.EventDispatcherConnectStart,
+				attribute.String("net.network", network),
+				attribute.String("net.addr", addr),
+			)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			attrs := []attribute.KeyValue{
+				attribute.String("net.network", network),
+				attribute.String("net.addr", addr),
+			}
+			if err != nil {
+				attrs = append(attrs, attribute.String("net.error", err.Error()))
+			}
+			addEvent(tracer.EventDispatcherConnectDone, attrs...)
+		},
+		TLSHandshakeStart: func() {
+			addEvent(tracer.EventDispatcherTLSHandshakeStart)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			attrs := []attribute.KeyValue{
+				attribute.Int("tls.version", int(state.Version)),
+				attribute.Int("tls.cipher_suite", int(state.CipherSuite)),
+			}
+			if err != nil {
+				attrs = append(attrs, attribute.String("tls.error", err.Error()))
+			}
+			addEvent(tracer.EventDispatcherTLSHandshakeDone, attrs...)
+		},
+		GotFirstResponseByte: func() {
+			addEvent(tracer.EventDispatcherFirstByte)
+		},
+	}
+}
+
+// NewNetJailTransport creates a new CustomTransport wrapping a netjail.Transport.
+// detailedTrace controls whether per-phase network timing events are recorded
+// on the otelhttp child span via httptrace hooks.
+func NewNetJailTransport(netJailTransport *netjail.Transport, detailedTrace bool) *CustomTransport {
+	otelTransport := otelhttp.NewTransport(netJailTransport, dispatcherOtelOpts(detailedTrace)...)
+	return &CustomTransport{
+		otelTransport:    otelTransport,
+		netJailTransport: netJailTransport,
+	}
+}
+
+// NewVanillaTransport creates a new CustomTransport wrapping the vanilla transport.
+// detailedTrace controls whether per-phase network timing events are recorded
+// on the otelhttp child span via httptrace hooks.
+func NewVanillaTransport(transport *http.Transport, detailedTrace bool) *CustomTransport {
+	otelTransport := otelhttp.NewTransport(transport, dispatcherOtelOpts(detailedTrace)...)
+	return &CustomTransport{
+		otelTransport:    otelTransport,
+		vanillaTransport: transport,
+	}
+}
+
+type DetailedTraceConfig struct {
+	Enabled bool
+}
+
+type Dispatcher struct {
+	// gating mechanisms
+	ff *fflag.FFlag
+	l  license.Licenser
+
+	logger        log.Logger
+	transport     *http.Transport
+	client        *http.Client
+	notifClient   *http.Client
+	rules         *netjail.Rules
+	detailedTrace DetailedTraceConfig
+}
+
+func NewDispatcher(l license.Licenser, ff *fflag.FFlag, options ...DispatcherOption) (*Dispatcher, error) {
+	d := &Dispatcher{
+		ff:     ff,
+		l:      l,
+		logger: log.New("convoy", log.LevelInfo),
+		client: &http.Client{},
+		rules:  &netjail.Rules{},
+		transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          1000,
+			IdleConnTimeout:       30 * time.Second,
+			MaxIdleConnsPerHost:   100,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    false,
+		},
+	}
+
+	for _, option := range options {
+		if err := option(d); err != nil {
+			return nil, err
+		}
+	}
+
+	if d.logger == nil {
+		return nil, ErrLoggerIsRequired
+	}
+
+	netJailTransport := &netjail.Transport{
+		New: func() *http.Transport {
+			return d.transport.Clone()
+		},
+	}
+
+	if ff.CanAccessFeature(fflag.IpRules) && l.IpRules() {
+		d.client.Transport = NewNetJailTransport(netJailTransport, d.detailedTrace.Enabled)
+	} else {
+		// Default (unlicensed) egress: block cloud metadata / link-local targets
+		// at dial time while still allowing delivery to general private networks.
+		d.client.Transport = NewVanillaTransport(withMetadataGuard(d.transport), d.detailedTrace.Enabled)
+	}
+
+	// Notifications dial user-controlled URLs (e.g. slack_webhook_url), so the
+	// client blocks private/reserved targets at connect time. The guard is
+	// bypassed only for the hop to a configured forward proxy (egress control is
+	// then the proxy's job, as with webhook delivery); every direct request,
+	// including NO_PROXY and hostname-only targets, is always guarded.
+	d.notifClient = &http.Client{Transport: newNotificationTransport(d.transport, d.detailedTrace.Enabled)}
+
+	return d, nil
+}
+
+// ssrfBypassKey marks a request context whose dial targets a trusted forward
+// proxy hop and should therefore skip the notification SSRF guard.
+type ssrfBypassKey struct{}
+
+// notificationRoundTripper marks requests that will traverse a forward proxy so
+// the dial-time SSRF guard skips the (trusted) proxy hop. Requests that dial the
+// target directly, including NO_PROXY and hostname-only targets, are left
+// unmarked and remain guarded. The proxy decision is per-request, so a global
+// proxy setting cannot silently disable the guard for direct-dialed targets.
+type notificationRoundTripper struct {
+	base  http.RoundTripper
+	proxy func(*http.Request) (*url.URL, error)
+}
+
+func (n *notificationRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if n.proxy != nil {
+		if proxyURL, err := n.proxy(req); err == nil && proxyURL != nil {
+			req = req.Clone(context.WithValue(req.Context(), ssrfBypassKey{}, true))
+		}
+	}
+	return n.base.RoundTrip(req)
+}
+
+// hardenNotificationTLS forces TLS verification on the notification transport
+// regardless of the webhook insecure_skip_verify compatibility flag, preserving
+// any custom-CA RootCAs. Notification targets are user-controlled and must not
+// inherit weakened transport trust.
+func hardenNotificationTLS(t *http.Transport) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if t.TLSClientConfig != nil {
+		tlsCfg = t.TLSClientConfig.Clone()
+		tlsCfg.InsecureSkipVerify = false
+		if tlsCfg.MinVersion == 0 {
+			tlsCfg.MinVersion = tls.VersionTLS12
+		}
+	}
+	t.TLSClientConfig = tlsCfg
+}
+
+// newNotificationTransport clones the dispatcher transport for internal
+// notification POSTs (e.g. Slack) whose target URL is user-controlled. It forces
+// TLS verification and installs a connect-time SSRF guard blocking
+// private/reserved destinations; on unlicensed deployments this is the only
+// egress protection, since the netjail-based filter only runs under the IpRules
+// license. The guard is bypassed only for the proxy hop (see
+// notificationRoundTripper).
+func newNotificationTransport(base *http.Transport, detailedTrace bool) http.RoundTripper {
+	t := base.Clone()
+	hardenNotificationTLS(t)
+
+	t.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		ControlContext: func(ctx context.Context, network, address string, c syscall.RawConn) error {
+			if bypass, _ := ctx.Value(ssrfBypassKey{}).(bool); bypass {
+				return nil
+			}
+			return blockPrivateNetworks(network, address, c)
+		},
+	}).DialContext
+
+	otelTransport := otelhttp.NewTransport(t, dispatcherOtelOpts(detailedTrace)...)
+	return &notificationRoundTripper{base: otelTransport, proxy: t.Proxy}
+}
+
+// blockPrivateNetworks is a net.Dialer.Control hook that rejects connections to
+// loopback, private, link-local, unspecified, or otherwise non-global-unicast
+// addresses, including IPv4-mapped, NAT64 (64:ff9b::/96), and 6to4 (2002::/16)
+// encodings of those IPv4 targets. It runs after DNS resolution with the
+// concrete IP the socket is about to dial, so it closes the DNS-rebinding
+// window a write-time URL check cannot. Fail-closed: an address that cannot
+// be parsed is rejected.
+func blockPrivateNetworks(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("ssrf guard: cannot parse dial address %q: %w", address, err)
+	}
+
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("ssrf guard: cannot parse dial ip %q: %w", host, err)
+	}
+	ip = ip.Unmap()
+	if v4, ok := embeddedV4(ip); ok {
+		ip = v4
+	}
+
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("ssrf guard: blocked connection to non-public address %s", ip)
+	}
+
+	return nil
+}
+
+// awsIMDSv6 is the fixed IPv6 address of the AWS instance metadata service.
+var awsIMDSv6 = netip.MustParseAddr("fd00:ec2::254")
+
+// nat64WellKnown is the RFC 6052 well-known NAT64 prefix used to embed an IPv4
+// address inside an IPv6 address.
+var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
+
+// blockMetadataEndpoints is the default (unlicensed) webhook egress guard.
+// Unlike blockPrivateNetworks it deliberately does NOT block general private
+// networks: self-hosted deployments legitimately deliver webhooks to RFC1918
+// internal services. It blocks only the cloud instance-metadata / link-local
+// targets that no legitimate webhook needs and that are the SSRF
+// credential-theft vector:
+//   - IPv4 link-local 169.254.0.0/16 (covers 169.254.169.254 and, post-DNS,
+//     metadata.google.internal),
+//   - IPv6 link-local (fe80::/10) and link-local multicast,
+//   - the AWS IMDS IPv6 address fd00:ec2::254,
+//
+// including IPv4-mapped, NAT64 (64:ff9b::/96) and 6to4 (2002::/16) encodings of
+// a link-local IPv4 target. It runs post-DNS with the concrete dial IP, closing
+// the DNS-rebinding window a write-time URL check cannot. Fail-closed: an
+// address that cannot be parsed is rejected. Licensed deployments layer the
+// netjail allow/block rules on top of delivery instead of this baseline.
+func blockMetadataEndpoints(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("ssrf guard: cannot parse dial address %q: %w", address, err)
+	}
+
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("ssrf guard: cannot parse dial ip %q: %w", host, err)
+	}
+
+	if isMetadataOrLinkLocal(ip) {
+		return fmt.Errorf("ssrf guard: blocked connection to metadata/link-local address %s", ip)
+	}
+
+	return nil
+}
+
+// isMetadataOrLinkLocal reports whether ip is a cloud-metadata / link-local
+// target, resolving IPv4-mapped, NAT64 and 6to4 encodings to the embedded IPv4
+// so a wrapped 169.254.x.x target cannot slip past.
+func isMetadataOrLinkLocal(ip netip.Addr) bool {
+	ip = ip.Unmap()
+
+	if ip.Is6() {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip == awsIMDSv6 {
+			return true
+		}
+		if v4, ok := embeddedV4(ip); ok {
+			ip = v4
+		}
+	}
+
+	return ip.Is4() && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast())
+}
+
+// embeddedV4 extracts the IPv4 address embedded in a NAT64 (64:ff9b::/96) or
+// 6to4 (2002::/16) IPv6 address. The zone is stripped first: netip.Prefix.Contains
+// is false for any zoned IPv6 address, which would otherwise skip NAT64 unwrap.
+func embeddedV4(ip netip.Addr) (netip.Addr, bool) {
+	ip = ip.WithZone("")
+	b := ip.As16()
+
+	if nat64WellKnown.Contains(ip) {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+
+	if b[0] == 0x20 && b[1] == 0x02 { // 6to4 2002::/16
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	}
+
+	return netip.Addr{}, false
+}
+
+// withMetadataGuard returns a clone of base whose dialer applies the default
+// webhook egress guard (blockMetadataEndpoints), blocking cloud metadata /
+// link-local targets at connect time while leaving general private-network
+// delivery intact. ForceAttemptHTTP2 is set because installing a custom
+// DialContext otherwise disables HTTP/2 negotiation for TLS targets.
+func withMetadataGuard(base *http.Transport) *http.Transport {
+	t := base.Clone()
+	t.ForceAttemptHTTP2 = true
+	t.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		ControlContext: func(_ context.Context, network, address string, c syscall.RawConn) error {
+			return blockMetadataEndpoints(network, address, c)
+		},
+	}).DialContext
+	return t
+}
+
+// NewOAuth2Dispatcher builds a dispatcher for OAuth2 token exchange. It mirrors
+// the webhook dispatcher's SSRF protection (IP allow/block rules) and proxy,
+// but always enforces TLS verification regardless of the webhook
+// `insecure_skip_verify` setting. OAuth2 token endpoints carry client secrets,
+// signed assertions, and access tokens, so their TLS trust must not be weakened
+// by a webhook compatibility flag. Custom CA trust is preserved when licensed.
+func NewOAuth2Dispatcher(l license.Licenser, ff *fflag.FFlag, logger log.Logger, cfg config.Configuration, caCertTLSConfig *tls.Config) (*Dispatcher, error) {
+	return NewDispatcher(
+		l,
+		ff,
+		LoggerOption(logger),
+		ProxyOption(cfg.Server.HTTP.HttpProxy, cfg.Server.HTTP.NoProxy),
+		AllowListOption(cfg.Dispatcher.AllowList),
+		BlockListOption(cfg.Dispatcher.BlockList),
+		TLSConfigOption(false, l, caCertTLSConfig),
+	)
+}
+
+func (d *Dispatcher) HTTPClient() *http.Client {
+	return d.client
+}
+
+// NotificationHTTPClient returns the client used for internal notification POSTs
+// (e.g. Slack). It carries an unconditional connect-time SSRF guard, so it must
+// be used instead of HTTPClient for user-controlled notification targets.
+func (d *Dispatcher) NotificationHTTPClient() *http.Client {
+	return d.notifClient
+}
+
+func (d *Dispatcher) ContextWithRules(ctx context.Context) context.Context {
+	if d.ff.CanAccessFeature(fflag.IpRules) && d.l.IpRules() {
+		return netjail.ContextWithRules(ctx, d.rules)
+	}
+	return ctx
+}
+
+// ProxyOption configures an HTTP proxy with NO_PROXY support.
+// It fails-open if the string isn't a valid HTTP URL. When a proxy is set,
+// NO_PROXY/no_proxy from config or environment is respected via Go's
+// httpproxy.Config (same logic as http.ProxyFromEnvironment).
+func ProxyOption(httpProxy string, noProxy ...string) DispatcherOption {
+	return func(d *Dispatcher) error {
+		if httpProxy == "" || !d.l.UseForwardProxy() {
+			return nil
+		}
+
+		cfgNoProxy := ""
+		if len(noProxy) > 0 {
+			cfgNoProxy = noProxy[0]
+		}
+		if cfgNoProxy == "" {
+			if v := os.Getenv("NO_PROXY"); v != "" {
+				cfgNoProxy = v
+			} else {
+				cfgNoProxy = os.Getenv("no_proxy")
+			}
+		}
+
+		cfg := httpproxy.Config{
+			HTTPProxy:  httpProxy,
+			HTTPSProxy: httpProxy,
+			NoProxy:    cfgNoProxy,
+		}
+		proxyFunc := cfg.ProxyFunc()
+
+		d.transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			return proxyFunc(req.URL)
+		}
+
+		return nil
+	}
+}
+
+// AllowListOption sets a list of IP prefixes which will outgoing traffic will be granted access
+func AllowListOption(allowList []string) DispatcherOption {
+	return func(d *Dispatcher) error {
+		if !d.l.IpRules() || !d.ff.CanAccessFeature(fflag.IpRules) {
+			return nil
+		}
+
+		if len(allowList) == 0 {
+			return ErrAllowListIsRequired
+		}
+
+		netAllow := make([]netip.Prefix, len(allowList))
+		for i, prefix := range allowList {
+			parsed, err := netip.ParsePrefix(prefix)
+			if err != nil {
+				return fmt.Errorf("%w: %v in allowlist", ErrInvalidIPPrefix, err)
+			}
+			netAllow[i] = parsed
+			d.rules.Allow = netAllow
+		}
+
+		return nil
+	}
+}
+
+// BlockListOption sets a list of IP prefixes which will outgoing traffic will be denied access
+func BlockListOption(blockList []string) DispatcherOption {
+	return func(d *Dispatcher) error {
+		if !d.l.IpRules() || !d.ff.CanAccessFeature(fflag.IpRules) {
+			return nil
+		}
+
+		if len(blockList) == 0 {
+			return ErrBlockListIsRequired
+		}
+
+		netBlock := make([]netip.Prefix, len(blockList))
+		for i, prefix := range blockList {
+			parsed, err := netip.ParsePrefix(prefix)
+			if err != nil {
+				return fmt.Errorf("%w: %v in blocklist", ErrInvalidIPPrefix, err)
+			}
+			netBlock[i] = parsed
+		}
+
+		d.rules.Block = netBlock
+		return nil
+	}
+}
+
+// TLSConfigOption configures TLS settings for the dispatcher.
+// If `insecureSkipVerify` is true, it allows self-signed certificates but is vulnerable to MITM attacks.
+// If a custom CA is provided, it is used for TLS verification.
+// Otherwise, it enforces a secure minimum TLS version.
+func TLSConfigOption(insecureSkipVerify bool, licenser license.Licenser, caCertTLSConfig *tls.Config) DispatcherOption {
+	return func(d *Dispatcher) error {
+		switch {
+		case insecureSkipVerify:
+			d.transport.TLSClientConfig = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+		case licenser.CustomCertificateAuthority() && caCertTLSConfig != nil:
+			d.transport.TLSClientConfig = caCertTLSConfig
+		default:
+			d.transport.TLSClientConfig = &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+
+		return nil
+	}
+}
+
+func LoggerOption(logger log.Logger) DispatcherOption {
+	return func(d *Dispatcher) error {
+		if logger == nil {
+			return ErrLoggerIsRequired
+		}
+
+		d.logger = logger
+		return nil
+	}
+}
+
+func DetailedTraceOption(enabled bool) DispatcherOption {
+	return func(d *Dispatcher) error {
+		d.detailedTrace.Enabled = enabled
+		return nil
+	}
+}
+
+// createClientWithMTLS creates an HTTP client configured with the provided mTLS certificate.
+// If mtlsCert is nil, returns the default dispatcher client.
+// The returned client respects IP allow/block rules when the feature is enabled.
+func (d *Dispatcher) createClientWithMTLS(mtlsCert *tls.Certificate) *http.Client {
+	if mtlsCert == nil {
+		return d.client
+	}
+
+	customTransport := d.transport.Clone()
+
+	// Clone the TLS config to avoid modifying the shared config
+	var tlsConfig *tls.Config
+	if customTransport.TLSClientConfig != nil {
+		tlsConfig = customTransport.TLSClientConfig.Clone()
+	} else {
+		tlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	// Add the client certificate
+	tlsConfig.Certificates = []tls.Certificate{*mtlsCert}
+	customTransport.TLSClientConfig = tlsConfig
+
+	// Respect IP allow/block rules by using netjail transport when enabled
+	if d.ff.CanAccessFeature(fflag.IpRules) && d.l.IpRules() {
+		netJailTransport := &netjail.Transport{
+			New: func() *http.Transport { return customTransport.Clone() },
+		}
+		return &http.Client{Transport: NewNetJailTransport(netJailTransport, d.detailedTrace.Enabled)}
+	}
+
+	return &http.Client{Transport: NewVanillaTransport(withMetadataGuard(customTransport), d.detailedTrace.Enabled)}
+}
+
+// SendWebhookWithMTLS sends a webhook request with optional mTLS client certificate configuration
+func (d *Dispatcher) SendWebhookWithMTLS(ctx context.Context, endpoint string, jsonData json.RawMessage,
+	signatureHeader, hmac string, maxResponseSize int64, headers httpheader.HTTPHeader,
+	requestIDHeader, idempotencyKey string, timeout time.Duration, contentType string, mtlsCert *tls.Certificate) (*Response, error) {
+	client := d.createClientWithMTLS(mtlsCert)
+	return d.sendWebhookInternal(ctx, endpoint, jsonData, signatureHeader, hmac, maxResponseSize, headers, requestIDHeader, idempotencyKey, timeout, contentType, client)
+}
+
+func (d *Dispatcher) SendWebhook(ctx context.Context, endpoint string, jsonData json.RawMessage,
+	signatureHeader, hmac string, maxResponseSize int64, headers httpheader.HTTPHeader,
+	requestIDHeader, idempotencyKey string, timeout time.Duration, contentType string) (*Response, error) {
+	return d.sendWebhookInternal(ctx, endpoint, jsonData, signatureHeader, hmac, maxResponseSize, headers, requestIDHeader, idempotencyKey, timeout, contentType, d.client)
+}
+
+func (d *Dispatcher) sendWebhookInternal(ctx context.Context, endpoint string, jsonData json.RawMessage,
+	signatureHeader, hmac string, maxResponseSize int64, headers httpheader.HTTPHeader,
+	requestIDHeader, idempotencyKey string, timeout time.Duration, contentType string, client *http.Client) (*Response, error) {
+	d.logger.Debugf("rules: %+v", d.rules)
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	r := &Response{}
+	if util.IsStringEmpty(signatureHeader) || util.IsStringEmpty(hmac) {
+		err := errors.New("signature header and hmac are required")
+		d.logger.Error("Dispatcher invalid arguments", "error", err)
+		r.Error = err.Error()
+		return r, err
+	}
+
+	if d.ff.CanAccessFeature(fflag.IpRules) && d.l.IpRules() {
+		ctx = netjail.ContextWithRules(ctx, d.rules)
+	}
+
+	// Convert JSON data to the appropriate content type using converter interface
+	converter := getConverter(contentType)
+	requestBody, err := converter.Convert(jsonData)
+	if err != nil {
+		d.logger.Error("error converting JSON data", "error", err)
+		r.Error = err.Error()
+		return r, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(requestBody))
+	if err != nil {
+		d.logger.Error("error occurred while creating request", "error", err)
+		return r, err
+	}
+
+	req.Header.Set(signatureHeader, hmac)
+	req.Header.Add("Content-Type", converter.ContentType())
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	header := httpheader.HTTPHeader(req.Header)
+	header.MergeHeaders(headers)
+	ensureUserAgent(header)
+	if isCustomRequestIDHeader(requestIDHeader) && len(idempotencyKey) == 0 {
+		err := ErrMissingIdempotencyKeyForCustomRequestIDHeader
+		d.logger.Error("Dispatcher invalid arguments", "error", err)
+		r.Error = err.Error()
+		return r, err
+	}
+	if len(idempotencyKey) > 0 && !util.IsStringEmpty(requestIDHeader) {
+		deleteHeaderCaseInsensitive(header, requestIDHeader)
+		header[requestIDHeader] = []string{idempotencyKey}
+	}
+
+	req.Header = http.Header(header)
+
+	r.RequestHeader = req.Header
+	r.URL = req.URL
+	r.Method = req.Method
+
+	err = d.do(req, r, maxResponseSize, client)
+	if err != nil {
+		return r, err
+	}
+
+	return r, err
+}
+
+func deleteHeaderCaseInsensitive(header httpheader.HTTPHeader, key string) {
+	for k := range header {
+		if strings.EqualFold(k, key) {
+			delete(header, k)
+		}
+	}
+}
+
+// ensureUserAgent sets Convoy/<version> only when no non-empty User-Agent is present.
+// A configured User-Agent fully replaces the default branding header and is always
+// stored under the canonical "User-Agent" key. custom_headers may preserve caller
+// casing (e.g. "user-agent"); Go's request writer only treats the canonical key as
+// the special User-Agent path, so leaving a non-canonical key can emit both Go's
+// default agent and the custom value.
+// Empty values ("" / whitespace) do not count as a custom agent.
+func ensureUserAgent(header httpheader.HTTPHeader) {
+	var custom string
+	for k, vals := range header {
+		if !strings.EqualFold(k, "User-Agent") {
+			continue
+		}
+		if custom == "" {
+			for _, v := range vals {
+				if strings.TrimSpace(v) != "" {
+					custom = v
+					break
+				}
+			}
+		}
+		delete(header, k)
+	}
+	if custom != "" {
+		header["User-Agent"] = []string{custom}
+		return
+	}
+	header["User-Agent"] = []string{defaultUserAgent()}
+}
+
+func isCustomRequestIDHeader(requestIDHeader string) bool {
+	header := strings.TrimSpace(requestIDHeader)
+	return header != "" && header != config.DefaultRequestIDHeader.String()
+}
+
+type Response struct {
+	Status         string
+	StatusCode     int
+	Method         string
+	URL            *url.URL
+	RequestHeader  http.Header
+	ResponseHeader http.Header
+	Body           []byte
+	IP             string
+	Error          string
+}
+
+func updateDispatchHeaders(r *Response, res *http.Response) {
+	r.Status = res.Status
+	r.StatusCode = res.StatusCode
+	r.ResponseHeader = res.Header
+}
+
+func defaultUserAgent() string {
+	return "Convoy/" + convoy.GetVersion()
+}
+
+func (d *Dispatcher) do(req *http.Request, res *Response, maxResponseSize int64, client *http.Client) error {
+	// Detailed-trace network-timing events (DNS / connect / TLS / first byte)
+	// are wired through otelhttp.WithClientTrace at transport construction
+	// time — see dispatcherOtelOpts in this file. Registering them here from
+	// the dispatcher's outer ctx would attach the events to the caller's
+	// (worker.task.*) span instead of the otelhttp child span where they
+	// belong, so we deliberately do not record span events here.
+	//
+	// The one hook we do attach captures the resolved remote address into
+	// res.IP. GotConn's RemoteAddr is the address the transport actually dialed,
+	// which is the forward proxy (not the endpoint) when one applies to this
+	// request. res.IP is meant to be the endpoint's address, so we skip
+	// recording it when a proxy applies and let it stay empty rather than
+	// persist a misleading proxy IP. GotConn also does not fire when no
+	// connection is established (DNS failure, connection refused, timeout), so
+	// res.IP stays empty on those no-response paths too. It records data only
+	// (no span events), so the span-attribution concern above does not apply.
+	recordIP := true
+	if d.transport != nil && d.transport.Proxy != nil {
+		if proxyURL, proxyErr := d.transport.Proxy(req); proxyErr == nil && proxyURL != nil {
+			recordIP = false
+		}
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if !recordIP || info.Conn == nil {
+				return
+			}
+			addr := info.Conn.RemoteAddr()
+			if addr == nil {
+				return
+			}
+			if host, _, splitErr := net.SplitHostPort(addr.String()); splitErr == nil {
+				res.IP = host
+			} else {
+				res.IP = addr.String()
+			}
+		},
+	}))
+
+	response, err := client.Do(req)
+	if err != nil {
+		d.logger.Error("error sending request to API endpoint", "error", err)
+		res.Error = err.Error()
+		return err
+	}
+	defer response.Body.Close()
+
+	// io.LimitReader will attempt to read from response.Body until maxResponseSize is reached.
+	// if response.Body's length is less than maxResponseSize. body.Read will return io.EOF,
+	// if it is greater than maxResponseSize. body.Read will return io.EOF,
+	// if it is equal to maxResponseSize. body.Read will return io.EOF,
+	// in all cases, io.ReadAll ignores io.EOF.
+	body := io.LimitReader(response.Body, maxResponseSize)
+
+	var reader io.Reader
+	// Check if response is gzipped
+	if response.Header.Get("Content-Encoding") == "gzip" {
+		gzReader, readErr := gzip.NewReader(body)
+		if readErr != nil {
+			return readErr
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	} else {
+		reader = body
+	}
+
+	buf, err := io.ReadAll(reader)
+	res.Body = buf
+
+	updateDispatchHeaders(res, response)
+
+	if err != nil {
+		d.logger.Error("couldn't parse response body", "error", err)
+		return err
+	}
+
+	return nil
+}
+
+// OAuth2TokenGetter is a function type for getting OAuth2 access tokens
+// It returns the formatted Authorization header value (e.g., "Bearer token" or "CustomType token")
+type OAuth2TokenGetter func(ctx context.Context) (string, error)
+
+// PingOptions contains options for the Ping operation
+type PingOptions struct {
+	Endpoint          string
+	Timeout           time.Duration
+	ContentType       string
+	MtlsCert          *tls.Certificate
+	OAuth2TokenGetter OAuth2TokenGetter
+	// Method is used internally by tryPingMethod. It's set automatically by Ping.
+	Method string
+}
+
+// Ping sends requests to the specified endpoint using configurable methods and verifies it returns a 2xx response.
+// It returns an error if the endpoint is unreachable or returns a non-2xx status code.
+// If opts.OAuth2TokenGetter is provided, it will be used to fetch an OAuth2 token and add it to the Authorization header.
+func (d *Dispatcher) Ping(ctx context.Context, opts PingOptions) error {
+	d.logger.Debugf("rules: %+v", d.rules)
+
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+
+	if d.ff.CanAccessFeature(fflag.IpRules) && d.l.IpRules() {
+		ctx = netjail.ContextWithRules(ctx, d.rules)
+	}
+
+	// Get ping methods from config
+	var methods []string
+	cfg, err := config.Get()
+	if err != nil {
+		d.logger.Warn("Failed to get config, using default ping methods", "error", err)
+		methods = []string{"HEAD", "GET", "POST"}
+	} else {
+		methods = cfg.Dispatcher.PingMethods
+		if len(methods) == 0 {
+			methods = []string{"HEAD", "GET", "POST"}
+		}
+	}
+
+	var lastErr error
+	for i, method := range methods {
+		pingOpts := opts
+		pingOpts.Method = method
+		err := d.tryPingMethod(ctx, pingOpts)
+		if err == nil {
+			if i > 0 {
+				d.logger.Infof("Ping succeeded with %s after %d attempts", method, i+1)
+			}
+			return nil
+		}
+
+		lastErr = err
+		d.logger.Debugf("Ping failed with %s: %v", method, err)
+	}
+
+	d.logger.Warnf("All ping methods failed for %s", opts.Endpoint)
+	return lastErr
+}
+
+func (d *Dispatcher) tryPingMethod(ctx context.Context, opts PingOptions) error {
+	client := d.createClientWithMTLS(opts.MtlsCert)
+
+	var body []byte
+	var reqContentType string
+
+	if opts.Method == "POST" && opts.ContentType != "" {
+		testPayload := json.RawMessage(`{"test": "ping"}`)
+		converter := getConverter(opts.ContentType)
+		var err error
+		body, err = converter.Convert(testPayload)
+		if err != nil {
+			return err
+		}
+		reqContentType = converter.ContentType()
+	}
+
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewBuffer(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, opts.Method, opts.Endpoint, bodyReader)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("User-Agent", defaultUserAgent())
+	if reqContentType != "" {
+		req.Header.Set("Content-Type", reqContentType)
+	}
+
+	// Add OAuth2 Authorization header if token getter is provided
+	if opts.OAuth2TokenGetter != nil {
+		authHeader, err := opts.OAuth2TokenGetter(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get OAuth2 token for ping: %w", err)
+		}
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	response, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return fmt.Errorf("%w: got status code %d", ErrNon2xxResponse, response.StatusCode)
+	}
+
+	return nil
+}

@@ -1,0 +1,198 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/api/policies"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/api_keys"
+	m "github.com/frain-dev/convoy/internal/pkg/middleware"
+	"github.com/frain-dev/convoy/internal/users"
+	"github.com/frain-dev/convoy/services"
+	"github.com/frain-dev/convoy/util"
+)
+
+func (h *Handler) CreatePersonalAPIKey(w http.ResponseWriter, r *http.Request) {
+	var newApiKey models.PersonalAPIKey
+	err := json.NewDecoder(r.Body).Decode(&newApiKey)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse("Request is invalid", http.StatusBadRequest))
+		return
+	}
+
+	user, ok := m.GetAuthUserFromContext(r.Context()).Metadata.(*datastore.User)
+	if !ok {
+		_ = render.Render(w, r, util.NewErrorResponse("Unauthorized", http.StatusForbidden))
+		return
+	}
+
+	cpk := &services.CreatePersonalAPIKeyService{
+		ProjectRepo: h.projectRepo(),
+		UserRepo:    users.New(h.A.Logger, h.A.DB),
+		APIKeyRepo:  api_keys.New(h.A.Logger, h.A.DB),
+		User:        user,
+		NewApiKey:   &newApiKey,
+		Logger:      h.A.Logger,
+	}
+
+	apiKey, keyString, err := cpk.Run(r.Context())
+	if err != nil {
+		h.A.Logger.Error("failed to create personal api key", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	resp := &datastore.APIKeyResponse{
+		APIKeyRes: datastore.APIKeyRes{
+			Name: apiKey.Name,
+			Role: datastore.Role{
+				Type:    apiKey.Role.Type,
+				Project: apiKey.Role.Project,
+			},
+			Type:      string(apiKey.Type),
+			ExpiresAt: apiKey.ExpiresAt,
+		},
+		UserID:    apiKey.UserID,
+		UID:       apiKey.UID,
+		CreatedAt: apiKey.CreatedAt,
+		Key:       keyString,
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Personal API Key created successfully", resp, http.StatusCreated))
+}
+
+func (h *Handler) RevokePersonalAPIKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := m.GetAuthUserFromContext(r.Context()).Metadata.(*datastore.User)
+	if !ok {
+		_ = render.Render(w, r, util.NewErrorResponse("Unauthorized", http.StatusForbidden))
+		return
+	}
+
+	rvk := &services.RevokePersonalAPIKeyService{
+		ProjectRepo: h.projectRepo(),
+		UserRepo:    users.New(h.A.Logger, h.A.DB),
+		APIKeyRepo:  api_keys.New(h.A.Logger, h.A.DB),
+		UID:         chi.URLParam(r, "keyID"),
+		User:        user,
+		Logger:      h.A.Logger,
+	}
+
+	err := rvk.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("personal api key revoked successfully", nil, http.StatusOK))
+}
+
+func (h *Handler) RegenerateProjectAPIKey(w http.ResponseWriter, r *http.Request) {
+	member, err := h.retrieveMembership(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	if err = h.A.Authz.Authorize(r.Context(), string(policies.PermissionProjectManage), project); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse("Unauthorized", http.StatusForbidden))
+		return
+	}
+
+	rgp := &services.RegenerateProjectAPIKeyService{
+		ProjectRepo: h.projectRepo(),
+		UserRepo:    users.New(h.A.Logger, h.A.DB),
+		APIKeyRepo:  api_keys.New(h.A.Logger, h.A.DB),
+		Project:     project,
+		Member:      member,
+		Logger:      h.A.Logger,
+	}
+
+	apiKey, keyString, err := rgp.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	resp := &datastore.APIKeyResponse{
+		APIKeyRes: datastore.APIKeyRes{
+			Name: apiKey.Name,
+			Role: datastore.Role{
+				Type:    apiKey.Role.Type,
+				Project: apiKey.Role.Project,
+			},
+			Type:      string(apiKey.Type),
+			ExpiresAt: apiKey.ExpiresAt,
+		},
+		UID:       apiKey.UID,
+		CreatedAt: apiKey.CreatedAt,
+		Key:       keyString,
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("api key regenerated successfully", resp, http.StatusOK))
+}
+
+func (h *Handler) GetAPIKeys(w http.ResponseWriter, r *http.Request) {
+	pageable := m.GetPageableFromContext(r.Context())
+
+	// This dashboard route only lists the caller's personal keys. Empty or
+	// invalid keyType previously left Filter empty and returned every key on
+	// the instance. Failure policy: fail closed to personal_key + auth user.
+	user, ok := m.GetAuthUserFromContext(r.Context()).Metadata.(*datastore.User)
+	if !ok {
+		_ = render.Render(w, r, util.NewErrorResponse("Unauthorized", http.StatusForbidden))
+		return
+	}
+
+	keyType := datastore.KeyType(r.URL.Query().Get("keyType"))
+	if keyType != "" && keyType != datastore.PersonalKey {
+		_ = render.Render(w, r, util.NewErrorResponse("only personal_key listing is supported on this route", http.StatusBadRequest))
+		return
+	}
+
+	f := &datastore.Filter{
+		KeyType: datastore.PersonalKey,
+		UserID:  user.UID,
+	}
+
+	apiKeys, paginationData, err := api_keys.New(h.A.Logger, h.A.DB).LoadAPIKeysPaged(r.Context(), f, &pageable)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "failed to load api keys", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("failed to load api keys", http.StatusBadRequest))
+		return
+	}
+
+	apiKeyByIDResponse := apiKeyByIDResponse(apiKeys)
+	_ = render.Render(w, r, util.NewServerResponse("api keys fetched successfully",
+		models.PagedResponse{Content: &apiKeyByIDResponse, Pagination: &paginationData}, http.StatusOK))
+}
+
+func apiKeyByIDResponse(apiKeys []datastore.APIKey) []models.APIKeyByIDResponse {
+	response := make([]models.APIKeyByIDResponse, 0, len(apiKeys))
+
+	for _, apiKey := range apiKeys {
+		resp := models.APIKeyByIDResponse{
+			UID:       apiKey.UID,
+			Name:      apiKey.Name,
+			Role:      apiKey.Role,
+			Type:      apiKey.Type,
+			ExpiresAt: apiKey.ExpiresAt,
+			UpdatedAt: apiKey.UpdatedAt,
+			CreatedAt: apiKey.CreatedAt,
+		}
+
+		response = append(response, resp)
+	}
+
+	return response
+}

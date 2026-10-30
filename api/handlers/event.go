@@ -1,0 +1,722 @@
+package handlers
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/endpoints"
+	"github.com/frain-dev/convoy/internal/events"
+	internalio "github.com/frain-dev/convoy/internal/io"
+	"github.com/frain-dev/convoy/internal/pkg/middleware"
+	"github.com/frain-dev/convoy/internal/portal_links"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/services"
+	"github.com/frain-dev/convoy/util"
+	"github.com/frain-dev/convoy/worker/task"
+)
+
+// CreateEndpointEvent
+//
+//	@Summary		Create an event
+//	@Description	This endpoint creates an endpoint event
+//	@Tags			Events
+//	@Id				CreateEndpointEvent
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path	string				true	"Project ID"
+//	@Param			event		body	models.CreateEvent	true	"Event Details"
+//	@Description	The 201 body includes uid (the event id). Use GET /events/{eventID} or GET /eventdeliveries?eventId= to follow the send.
+//	@Success		201			{object}	util.ServerResponse{data=models.EventQueuedResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events [post]
+func (h *Handler) CreateEndpointEvent(w http.ResponseWriter, r *http.Request) {
+	var newMessage models.CreateEvent
+	err := util.ReadJSON(r, &newMessage)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	err = newMessage.Validate()
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+	projectID := project.UID
+
+	// A portal-link token may only create events against an endpoint it owns. This
+	// fails closed (401) for a portal request with an empty or foreign endpoint id.
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if h.IsReqWithPortalLinkToken(authUser) && !h.ensurePortalLinkOwnsEndpoints(w, r, authUser, newMessage.EndpointID) {
+		return
+	}
+
+	if err := project.ValidateOutgoingEventIdempotencyKey(newMessage.IdempotencyKey); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if !util.IsStringEmpty(newMessage.EndpointID) {
+		_, err = h.retrieveEndpoint(r.Context(), newMessage.EndpointID, projectID)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+	} else {
+		// Validate() guarantees the deprecated app_id alias is set here. Mirror the
+		// endpoint_id existence check so an app_id that resolves to no endpoints is
+		// rejected now instead of queueing an event that fans out to nothing.
+		eps, innerErr := endpoints.New(h.A.Logger, h.A.DB).FindEndpointsByAppID(r.Context(), newMessage.AppID, projectID)
+		if innerErr != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(innerErr))
+			return
+		}
+
+		if len(eps) == 0 {
+			_ = render.Render(w, r, util.NewErrorResponse("app ID has no configured endpoints", http.StatusBadRequest))
+			return
+		}
+	}
+
+	if h.enforceTrialEventCapForNewEvent(w, r, project.OrganisationID, projectID, newMessage.IdempotencyKey, h.duplicateByAnyEvent) {
+		return
+	}
+
+	id := ulid.Make().String()
+	jobId := queue.JobId{ProjectID: projectID, ResourceID: id}.SingleJobId()
+	e := task.CreateEvent{
+		JobID: jobId,
+		Params: task.CreateEventTaskParams{
+			UID:            id,
+			ProjectID:      projectID,
+			AppID:          newMessage.AppID,
+			EndpointID:     newMessage.EndpointID,
+			EventType:      newMessage.EventType,
+			Data:           newMessage.Data,
+			CustomHeaders:  newMessage.CustomHeaders,
+			IdempotencyKey: newMessage.IdempotencyKey,
+			AcknowledgedAt: time.Now(),
+		},
+		// Validate() plus the existence checks above guarantee a resolvable target
+		// (endpoint_id or the deprecated app_id alias) at this point, and both
+		// addressing modes resolve to concrete endpoints in the worker, so both get
+		// a catch-all subscription auto-provisioned for subscription-less endpoints.
+		CreateSubscription: true,
+	}
+
+	eventByte, err := msgpack.EncodeMsgPack(e)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	job := &queue.Job{
+		ID:      jobId,
+		Payload: eventByte,
+	}
+
+	err = h.A.Queue.Write(r.Context(), convoy.CreateEventProcessor, convoy.CreateEventQueue, job)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), fmt.Sprintf("Error occurred sending new event to the queue %s", err))
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Event queued successfully", models.NewEventQueuedResponse(id, newMessage.EventType, newMessage.IdempotencyKey), http.StatusCreated))
+}
+
+// CreateBroadcastEvent
+//
+//	@Summary		Create a broadcast event
+//	@Id				CreateBroadcastEvent
+//	@Description	This endpoint creates a event that is broadcast to every endpoint whose subscription matches the given event type.
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path	string					true	"Project ID"
+//	@Param			event		body	models.BroadcastEvent	true	"Broadcast Event Details"
+//	@Description	The 201 body includes uid (the event id). Use GET /events/{eventID} or GET /eventdeliveries?eventId= to follow the send.
+//	@Success		201			{object}	util.ServerResponse{data=models.EventQueuedResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/broadcast [post]
+func (h *Handler) CreateBroadcastEvent(w http.ResponseWriter, r *http.Request) {
+	if h.rejectPortalLinkToken(w, r) {
+		return
+	}
+
+	var newMessage models.BroadcastEvent
+	err := util.ReadJSON(r, &newMessage)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	err = newMessage.Validate()
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if err := project.ValidateOutgoingEventIdempotencyKey(newMessage.IdempotencyKey); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if h.enforceTrialEventCapForNewEvent(w, r, project.OrganisationID, project.UID, newMessage.IdempotencyKey, h.duplicateByAnyEvent) {
+		return
+	}
+
+	cbe := services.CreateBroadcastEventService{
+		Queue:          h.A.Queue,
+		BroadcastEvent: &newMessage,
+		Project:        project,
+		Logger:         h.A.Logger,
+	}
+
+	err = cbe.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Broadcast event created successfully", models.NewEventQueuedResponse(cbe.BroadcastEvent.EventID, cbe.BroadcastEvent.EventType, cbe.BroadcastEvent.IdempotencyKey), http.StatusCreated))
+}
+
+// CreateEndpointFanoutEvent
+//
+//	@Summary		Fan out an event
+//	@Description	This endpoint uses the owner_id to fan out an event to multiple endpoints.
+//	@Id				CreateEndpointFanoutEvent
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path	string				true	"Project ID"
+//	@Param			event		body	models.FanoutEvent	true	"Event Details"
+//	@Description	The 201 body includes uid (the event id). Use GET /events/{eventID} or GET /eventdeliveries?eventId= to follow the send.
+//	@Success		201			{object}	util.ServerResponse{data=models.EventQueuedResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/fanout [post]
+func (h *Handler) CreateEndpointFanoutEvent(w http.ResponseWriter, r *http.Request) {
+	if h.rejectPortalLinkToken(w, r) {
+		return
+	}
+
+	start := time.Now()
+
+	// Wrap the request body to count bytes in real-time
+	var bodySize int
+	r.Body = internalio.NewCountingReadCloser(r.Body, &bodySize)
+
+	var newMessage models.FanoutEvent
+	err := util.ReadJSON(r, &newMessage)
+	afterRead := time.Now()
+	if err != nil {
+		h.A.Logger.Error("failed to read fanout event json", "error", err, "body_size_bytes", bodySize, "read_duration", afterRead.Sub(start).Milliseconds())
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	h.A.Logger.Debug("read fanout event json completed", "body_size_bytes", bodySize, "duration", afterRead.Sub(start).Milliseconds())
+
+	err = newMessage.Validate()
+	afterValidation := time.Now()
+	if err != nil {
+		h.A.Logger.Error("failed to validate fanout event", "error", err, "owner_id", newMessage.OwnerID, "event_type", newMessage.EventType, "body_size_bytes", bodySize)
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.getProjectFromContext(r)
+	afterProject := time.Now()
+	if err != nil {
+		h.A.Logger.Error("failed to retrieve project for fanout event", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	h.A.Logger.Info("processing fanout event", "project_id", project.UID, "owner_id", newMessage.OwnerID, "event_type", newMessage.EventType, "body_size_bytes", bodySize)
+
+	if err := project.ValidateOutgoingEventIdempotencyKey(newMessage.IdempotencyKey); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	// Fanout decides novelty with FindFirstEventWithIdempotencyKey (non-duplicate rows
+	// only), so the gate must use the same predicate; see trialCapDuplicateVerdict.
+	if h.enforceTrialEventCapForNewEvent(w, r, project.OrganisationID, project.UID, newMessage.IdempotencyKey, h.duplicateByFirstNonDuplicateEvent) {
+		return
+	}
+
+	cf := services.CreateFanoutEventService{
+		EndpointRepo:   endpoints.New(h.A.Logger, h.A.DB),
+		EventRepo:      events.New(h.A.Logger, h.A.DB),
+		PortalLinkRepo: portal_links.New(h.A.Logger, h.A.DB),
+		Queue:          h.A.Queue,
+		NewMessage:     &newMessage,
+		Project:        project,
+		Logger:         h.A.Logger,
+	}
+
+	event, err := cf.Run(r.Context())
+	afterService := time.Now()
+	if err != nil {
+		h.A.Logger.Error("failed to run fanout event service", "error", err, "project_id", project.UID, "owner_id", newMessage.OwnerID, "body_size_bytes", bodySize)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	duration := time.Since(start)
+	// Log detailed timing breakdown for performance monitoring
+	h.A.Logger.Info("fanout event timing breakdown",
+		"project_id", project.UID,
+		"event_id", event.UID,
+		"body_size_bytes", bodySize,
+		"read_parse_duration", afterRead.Sub(start).Milliseconds(),
+		"validation_duration", afterValidation.Sub(afterRead).Milliseconds(),
+		"project_duration", afterProject.Sub(afterValidation).Milliseconds(),
+		"service_duration", afterService.Sub(afterProject).Milliseconds(),
+		"total_duration", duration.Milliseconds(),
+		"endpoints_count", len(event.Endpoints),
+		"is_duplicate", event.IsDuplicateEvent,
+	)
+
+	receipt := models.NewEventQueuedResponse(event.UID, string(event.EventType), event.IdempotencyKey)
+	if event.IsDuplicateEvent {
+		_ = render.Render(w, r, util.NewServerResponse("Duplicate event received, but will not be sent", receipt, http.StatusCreated))
+	} else {
+		_ = render.Render(w, r, util.NewServerResponse("Endpoint fanout event queued successfully", receipt, http.StatusCreated))
+	}
+}
+
+// CreateDynamicEvent
+//
+//	@Summary		Dynamic Events
+//	@Description	This endpoint creates a dynamic event without creating the endpoint and subscription ahead of time.
+//	@Description	The 201 body includes uid (the event id). Use GET /events/{eventID} or GET /eventdeliveries?eventId= to follow the send.
+//	@Id				CreateDynamicEvent
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string				true	"Project ID"
+//	@Param			event		body		models.DynamicEvent	true	"Event Details"
+//	@Success		201			{object}	util.ServerResponse{data=models.EventQueuedResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/dynamic [post]
+func (h *Handler) CreateDynamicEvent(w http.ResponseWriter, r *http.Request) {
+	if h.rejectPortalLinkToken(w, r) {
+		return
+	}
+
+	var newMessage models.DynamicEvent
+	err := util.ReadJSON(r, &newMessage)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	err = newMessage.Validate()
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if err := project.ValidateOutgoingEventIdempotencyKey(newMessage.IdempotencyKey); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if h.enforceTrialEventCapForNewEvent(w, r, project.OrganisationID, project.UID, newMessage.IdempotencyKey, h.duplicateByAnyEvent) {
+		return
+	}
+
+	cde := services.CreateDynamicEventService{
+		Queue:        h.A.Queue,
+		Acker:        h.A.Acker,
+		DynamicEvent: &newMessage,
+		Project:      project,
+		Logger:       h.A.Logger,
+	}
+
+	err = cde.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Dynamic event created successfully", models.NewEventQueuedResponse(cde.DynamicEvent.EventID, cde.DynamicEvent.EventType, cde.DynamicEvent.IdempotencyKey), http.StatusCreated))
+}
+
+// ReplayEndpointEvent
+//
+//	@Summary		Replay event
+//	@Description	This endpoint replays an event afresh assuming it is a new event.
+//	@Id				ReplayEndpointEvent
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string	true	"Project ID"
+//	@Param			eventID		path		string	true	"event id"
+//	@Success		200			{object}	util.ServerResponse{data=models.EventResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/{eventID}/replay [put]
+func (h *Handler) ReplayEndpointEvent(w http.ResponseWriter, r *http.Request) {
+	event, err := h.retrieveEvent(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	// Replay re-queues the event to every endpoint on event.Endpoints, so a portal
+	// caller must own all of them; owning one endpoint must not trigger redelivery to
+	// foreign endpoints. Fail closed if any endpoint is not owned.
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if !h.ensurePortalLinkOwnsEndpoints(w, r, authUser, event.Endpoints...) {
+		return
+	}
+
+	rs := services.ReplayEventService{
+		EndpointRepo: endpoints.New(h.A.Logger, h.A.DB),
+		Queue:        h.A.Queue,
+		Event:        event,
+		Logger:       h.A.Logger,
+	}
+
+	err = rs.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	resp := &models.EventResponse{Event: event}
+	_ = render.Render(w, r, util.NewServerResponse("Endpoint event replayed successfully", resp, http.StatusOK))
+}
+
+// BatchReplayEvents
+//
+//	@Summary		Batch replay events
+//	@Description	This endpoint replays multiple events at once.
+//	@Id				BatchReplayEvents
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string					true	"Project ID"
+//	@Param			request		query		models.QueryListEvent	false	"Query Params"
+//	@Success		200			{object}	util.ServerResponse{data=string}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/batchreplay [post]
+func (h *Handler) BatchReplayEvents(w http.ResponseWriter, r *http.Request) {
+	var q *models.QueryListEvent
+	p, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	data, err := q.Transform(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if data.IdempotencyValue != "" {
+		_ = render.Render(w, r, util.NewErrorResponse("batch replay does not support idempotencyValue", http.StatusBadRequest))
+		return
+	}
+
+	data.Filter.Project = p
+
+	var ownedEndpointIDs []string
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if h.IsReqWithPortalLinkToken(authUser) {
+		portalLink, innerErr := h.retrievePortalLinkFromToken(r)
+		if innerErr != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(innerErr))
+			return
+		}
+
+		// Filter may narrow to the caller's endpointId; ownership must stay the full
+		// portal allowlist so multi-endpoint events that only touch owned endpoints still replay.
+		allowed, innerErr := h.getEndpoints(r, portalLink)
+		if innerErr != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(innerErr))
+			return
+		}
+
+		endpointIDs := filterAllowedEndpointIDs(data.Filter.EndpointIDs, allowed)
+		if len(endpointIDs) == 0 {
+			_ = render.Render(w, r, util.NewServerResponse("0 successful, 0 failed", nil, http.StatusOK))
+			return
+		}
+
+		data.Filter.EndpointIDs = endpointIDs
+		ownedEndpointIDs = allowed
+	}
+
+	if !util.IsStringEmpty(data.Filter.Query) || len(data.Filter.Body) > 0 {
+		_ = render.Render(w, r, util.NewErrorResponse("batch replay does not support search filters", http.StatusBadRequest))
+		return
+	}
+
+	ep := datastore.Pageable{}
+	if data.Filter.Pageable == ep {
+		data.Filter.Pageable.PerPage = 2000000000
+	}
+
+	bs := services.BatchReplayEventService{
+		EndpointRepo:     endpoints.New(h.A.Logger, h.A.DB),
+		Queue:            h.A.Queue,
+		EventRepo:        events.New(h.A.Logger, h.A.DB),
+		Filter:           data.Filter,
+		OwnedEndpointIDs: ownedEndpointIDs,
+		Logger:           h.A.Logger,
+	}
+
+	successes, failures, err := bs.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse(fmt.Sprintf("%d successful, %d failed", successes, failures), nil, http.StatusOK))
+}
+
+// GetEndpointEvent
+//
+//	@Summary		Retrieve an event
+//	@Description	This endpoint retrieves an event
+//	@Tags			Events
+//	@Id				GetEndpointEvent
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string	true	"Project ID"
+//	@Param			eventID		path		string	true	"event id"
+//	@Success		200			{object}	util.ServerResponse{data=models.EventResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/{eventID} [get]
+func (h *Handler) GetEndpointEvent(w http.ResponseWriter, r *http.Request) {
+	event, err := h.retrieveEvent(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusNotFound))
+		return
+	}
+
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if !h.ensurePortalLinkOwnsAnyEndpoint(w, r, authUser, event.Endpoints...) {
+		return
+	}
+
+	resp := &models.EventResponse{Event: event}
+	_ = render.Render(w, r, util.NewServerResponse("Endpoint event fetched successfully",
+		resp, http.StatusOK))
+}
+
+// GetEventsPaged
+//
+//	@Summary		List all events
+//	@Description	This endpoint fetches app events with pagination
+//	@Tags			Events
+//	@Id				GetEventsPaged
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID			path		string					true	"Project ID"
+//	@Param			request				query		models.QueryListEvent	false	"Query Params"
+//	@Success		200					{object}	util.ServerResponse{data=models.PagedResponse{content=[]models.EventResponse}}
+//	@Failure		400,401,403,404,504	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events [get]
+func (h *Handler) GetEventsPaged(w http.ResponseWriter, r *http.Request) {
+	var q *models.QueryListEvent
+	data, err := q.Transform(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	if data.IdempotencyValue != "" {
+		if err := h.rejectPortalIdempotencyValue(r, data.IdempotencyValue); err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+		keys, err := h.idempotencyValueKeys(r.Context(), project.UID, data.IdempotencyValue, data.Filter.SourceIDs)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+		if len(keys) > 1 {
+			_ = render.Render(w, r, util.NewErrorResponse("idempotencyValue matches more than one source; pass sourceId", http.StatusBadRequest))
+			return
+		}
+		data.Filter.IdempotencyKey = keys[0]
+	}
+
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if h.IsReqWithPortalLinkToken(authUser) {
+		portalLink, err := h.retrievePortalLinkFromToken(r)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+
+		endpointIDs, err := h.portalScopedEndpointIDs(r, portalLink, data.Filter.EndpointIDs)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+
+		if len(endpointIDs) == 0 {
+			_ = render.Render(w, r, util.NewServerResponse("App events fetched successfully",
+				models.PagedResponse{Content: []models.EventResponse{}, Pagination: &datastore.PaginationData{PerPage: int64(data.Filter.Pageable.PerPage)}}, http.StatusOK))
+			return
+		}
+
+		data.Filter.EndpointIDs = endpointIDs
+	}
+
+	data.Filter.Project = project
+
+	if err := events.ApplyEventListSearch(data.Filter, project, h.A.Licenser.EventSearch(), time.Now()); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, events.ErrSearchUnlicensed) {
+			status = http.StatusForbidden
+		}
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), status))
+		return
+	}
+
+	eventsPaged, paginationData, err := events.New(h.A.Logger, h.A.DB).LoadEventsPaged(r.Context(), project.UID, data.Filter)
+	if err != nil {
+		if events.IsSearchTimeout(err) {
+			_ = render.Render(w, r, util.NewErrorResponse("Search took too long. Try again.", http.StatusGatewayTimeout))
+			return
+		}
+		h.A.Logger.ErrorContext(r.Context(), "failed to fetch events", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("an error occurred while fetching app events", http.StatusInternalServerError))
+		return
+	}
+
+	resp := models.NewListResponse(eventsPaged, func(event datastore.Event) models.EventResponse {
+		return models.EventResponse{Event: &event}
+	})
+	_ = render.Render(w, r, util.NewServerResponse("App events fetched successfully",
+		models.PagedResponse{Content: resp, Pagination: &paginationData}, http.StatusOK))
+}
+
+// CountAffectedEvents
+//
+//	@Summary		Count events matching batch replay filters
+//	@Description	This endpoint returns how many events would be affected by a batch replay with the given filters.
+//	@Id				CountAffectedEvents
+//	@Tags			Events
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string					true	"Project ID"
+//	@Param			request		query		models.QueryListEvent	false	"Query Params"
+//	@Success		200			{object}	util.ServerResponse{data=models.CountResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/events/countbatchreplayevents [get]
+func (h *Handler) CountAffectedEvents(w http.ResponseWriter, r *http.Request) {
+	var q *models.QueryListEvent
+	p, err := h.getProjectFromContext(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	data, err := q.Transform(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if data.IdempotencyValue != "" {
+		_ = render.Render(w, r, util.NewErrorResponse("batch replay count does not support idempotencyValue", http.StatusBadRequest))
+		return
+	}
+
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if h.IsReqWithPortalLinkToken(authUser) {
+		portalLink, err := h.retrievePortalLinkFromToken(r)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+
+		endpointIDs, err := h.portalScopedEndpointIDs(r, portalLink, data.Filter.EndpointIDs)
+		if err != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+
+		if len(endpointIDs) == 0 {
+			_ = render.Render(w, r, util.NewServerResponse("events count successful", models.CountResponse{Num: 0}, http.StatusOK))
+			return
+		}
+
+		data.Filter.EndpointIDs = endpointIDs
+	}
+
+	if !util.IsStringEmpty(data.Filter.Query) || len(data.Filter.Body) > 0 {
+		_ = render.Render(w, r, util.NewErrorResponse("batch replay count does not support search filters", http.StatusBadRequest))
+		return
+	}
+
+	count, err := events.New(h.A.Logger, h.A.DB).CountEvents(r.Context(), p.UID, data.Filter)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "an error occurred while fetching event", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("events count successful", models.CountResponse{Num: count}, http.StatusOK))
+}
+
+func (h *Handler) retrieveEvent(r *http.Request) (*datastore.Event, error) {
+	project, err := h.getProjectFromContext(r)
+	if err != nil {
+		return &datastore.Event{}, err
+	}
+
+	eventID := chi.URLParam(r, "eventID")
+	eventRepo := events.New(h.A.Logger, h.A.DB)
+	return eventRepo.FindEventByID(r.Context(), project.UID, eventID)
+}

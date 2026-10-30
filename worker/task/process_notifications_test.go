@@ -1,0 +1,253 @@
+package task
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/hibiken/asynq"
+	"github.com/jarcoal/httpmock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/internal/pkg/fflag"
+	"github.com/frain-dev/convoy/mocks"
+	"github.com/frain-dev/convoy/net"
+	"github.com/frain-dev/convoy/queue"
+)
+
+func TestProcessNotifications(t *testing.T) {
+	tests := []struct {
+		name          string
+		payload       string
+		nFn           func(client *http.Client) func()
+		clientFn      func(sc *mocks.MockSmtpClient)
+		expectedError error
+	}{
+		{
+			name:    "should_fail_for_invalid_payload",
+			payload: `bad payload`,
+			clientFn: func(sc *mocks.MockSmtpClient) {
+				sc.EXPECT().
+					SendEmail(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil).Times(0)
+			},
+			expectedError: ErrInvalidNotificationPayload,
+		},
+		{
+			name: "should_fail_for_invalid_notification_type",
+			payload: `
+				{
+					"notification_type": "invalid"
+				}
+			`,
+			clientFn:      nil,
+			expectedError: ErrInvalidNotificationType,
+		},
+		{
+			name: "should_fail_for_invalid_email_payload",
+			payload: `
+				{
+					"notification_type": "email",
+					"payload": "invalid"
+				}
+			`,
+			clientFn:      nil,
+			expectedError: ErrInvalidEmailPayload,
+		},
+		{
+			name: "should_pass_for_valid_email_notification",
+			payload: `
+				{
+					"notification_type": "email",
+					"payload": {
+						"email": "user@default.com",
+						"subject": "organisation invite",
+						"template_name": "organisation.invite"
+					}
+				}
+			`,
+			clientFn: func(sc *mocks.MockSmtpClient) {
+				sc.EXPECT().
+					SendEmail(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil).Times(1)
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should_fail_for_invalid_slack_payload",
+			payload: `
+				{
+					"notification_type": "slack",
+					"payload": "invalid"
+				}
+			`,
+			clientFn:      nil,
+			expectedError: ErrInvalidSlackPayload,
+		},
+		{
+			name: "should_fail_for_valid_slack_message",
+			payload: `
+				{
+					"notification_type": "slack",
+					"payload": {
+						"webhook_url": "https://hooks.slack.com/services/T00/B00/X",
+						"text": "endpoint re-activated"
+					}
+				}
+			`,
+			nFn: func(client *http.Client) func() {
+				// Patch the dispatcher's notification client (not
+				// http.DefaultClient) since the slack POST now goes through the
+				// SSRF-guarded notification client.
+				httpmock.ActivateNonDefault(client)
+
+				url := "https://hooks.slack.com/services/T00/B00/X"
+
+				httpmock.RegisterResponder(http.MethodPost, url,
+					httpmock.NewStringResponder(http.StatusOK, string("200 Ok!")))
+
+				return func() {
+					httpmock.DeactivateAndReset()
+				}
+			},
+			clientFn:      nil,
+			expectedError: nil,
+		},
+		{
+			name: "should_fail_for_invalid_teams_payload",
+			payload: `
+				{
+					"notification_type": "teams",
+					"payload": "invalid"
+				}
+			`,
+			clientFn:      nil,
+			expectedError: ErrInvalidTeamsPayload,
+		},
+		{
+			name: "should_pass_for_valid_teams_message",
+			payload: `
+				{
+					"notification_type": "teams",
+					"payload": {
+						"webhook_url": "https://example.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=redacted",
+						"text": "endpoint disabled"
+					}
+				}
+			`,
+			nFn: func(client *http.Client) func() {
+				// Teams posts through the same SSRF-guarded notification client
+				// as slack, so httpmock has to patch that client too.
+				httpmock.ActivateNonDefault(client)
+
+				httpmock.RegisterResponder(http.MethodPost,
+					"https://example.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke",
+					httpmock.NewStringResponder(http.StatusAccepted, ""))
+
+				return func() {
+					httpmock.DeactivateAndReset()
+				}
+			},
+			clientFn:      nil,
+			expectedError: nil,
+		},
+		{
+			name: "should_pass_when_email_payload_is_valid_but_type_is_missing",
+			payload: `
+				{
+					"notification_type": "",
+					"payload": {
+						"email": "user@default.com",
+						"subject": "Endpoint Disabled - Circuit Breaker Triggered",
+						"template_name": "endpoint.update",
+						"params": {
+							"name": "test-endpoint",
+							"target_url": "https://example.com",
+							"failure_msg": "Circuit breaker threshold exceeded",
+							"endpoint_status": "inactive"
+						}
+					}
+				}
+			`,
+			clientFn: func(sc *mocks.MockSmtpClient) {
+				// Should be called once when fix is applied
+				sc.EXPECT().
+					SendEmail(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil).Times(1)
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should_pass_when_raw_email_message_is_sent",
+			payload: `
+				{
+					"email": "user@default.com",
+					"subject": "Endpoint Disabled - Circuit Breaker Triggered",
+					"template_name": "endpoint.update",
+					"params": {
+						"name": "test-endpoint",
+						"target_url": "https://example.com",
+						"failure_msg": "Circuit breaker threshold exceeded",
+						"endpoint_status": "inactive"
+					}
+				}
+			`,
+			clientFn: func(sc *mocks.MockSmtpClient) {
+				// Should be called once when fix is applied
+				sc.EXPECT().
+					SendEmail(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil).Times(1)
+			},
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange.
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			sc := mocks.NewMockSmtpClient(ctrl)
+			if tc.clientFn != nil {
+				tc.clientFn(sc)
+			}
+
+			// Build a dispatcher with IpRules off (vanilla transport); the slack
+			// path routes through its client so httpmock patches that client.
+			licenser := mocks.NewMockLicenser(ctrl)
+			dispatcher, err := net.NewDispatcher(licenser, fflag.NewFFlag([]string{}))
+			require.NoError(t, err)
+
+			if tc.nFn != nil {
+				deferFn := tc.nFn(dispatcher.NotificationHTTPClient())
+				defer deferFn()
+			}
+
+			buf := []byte(strings.TrimSpace(tc.payload))
+			job := &queue.Job{
+				Payload: json.RawMessage(buf),
+				Delay:   0,
+			}
+
+			task := asynq.NewTask(
+				string(convoy.NotificationProcessor),
+				job.Payload,
+				asynq.Queue(string(convoy.DefaultQueue)),
+				asynq.ProcessIn(job.Delay))
+
+			processFn := ProcessNotifications(sc, dispatcher)
+
+			// Act.
+			err = processFn(context.Background(), task)
+
+			// Assert.
+			assert.Equal(t, tc.expectedError, err)
+		})
+	}
+}

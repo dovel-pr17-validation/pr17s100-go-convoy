@@ -1,0 +1,93 @@
+name: Build and Run Redis Sentinel E2E
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      has_backend: ${{ steps.filter.outputs.has_backend }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # has_backend is true when ANY changed file is NOT under web/ui/dashboard/**
+      # or docs/**. With predicate-quantifier 'every', a file counts only if it
+      # matches '**' AND none of the negated frontend globs, so a single .go/go.mod/
+      # cmd/** change (or a change to this workflow) marks the set as backend. This
+      # suite is skipped only when has_backend is explicitly 'false', so the gate is
+      # fail-safe and a mixed UI+backend PR always runs it.
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@668c092af3649c4b664c54e4b704aa46782f6f7c # v3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            has_backend:
+              - '**'
+              - '!web/ui/dashboard/**'
+              - '!docs/**'
+
+  sentinel-e2e-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.has_backend != 'false' }}
+    runs-on: ubuntu-latest
+    env:
+      CONVOY_JWT_SECRET: test-access-secret
+      CONVOY_JWT_REFRESH_SECRET: test-refresh-secret
+    strategy:
+      matrix:
+        go-version: [ 1.26.2 ]
+
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Cache go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+
+      - name: Check out code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Get and verify dependencies
+        run: go mod download && go mod verify
+
+      - name: Prepare sentinel config
+        run: cp convoy.sentinel.json.example convoy.sentinel.json
+
+      - name: Start Redis Sentinel Cluster
+        run: |
+          docker compose -f docker-compose.sentinel.yml up -d
+          # Wait for sentinel to be ready
+          sleep 10
+          docker ps
+
+      - name: Run Redis Sentinel E2E Test
+        run: go test -race -v ./e2e/ -run TestE2E_RedisSentinel
+        env:
+          CONVOY_REDIS_SCHEME: redis-sentinel
+          CONVOY_REDIS_ADDRESSES: 127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+          CONVOY_REDIS_SENTINEL_MASTER_NAME: mymaster
+          TEST_LICENSE_KEY: ${{ secrets.CONVOY_TEST_LICENSE_KEY }}
+          CONVOY_LICENSE_KEY: ${{ secrets.CONVOY_TEST_LICENSE_KEY }}
+          CONVOY_LOCAL_ENCRYPTION_KEY: ${{ secrets.CONVOY_TEST_ENCRYPTION_KEY }}
+          CONVOY_DISPATCHER_SKIP_PING_VALIDATION: true
+
+      - name: Teardown Redis Sentinel Cluster
+        if: always()
+        run: docker compose -f docker-compose.sentinel.yml down -v

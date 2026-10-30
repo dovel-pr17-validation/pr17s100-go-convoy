@@ -1,0 +1,304 @@
+import {Injectable} from '@angular/core';
+import {HttpService} from '../http/http.service';
+import {HTTP_RESPONSE} from 'src/app/models/global.model';
+
+@Injectable({
+	providedIn: 'root'
+})
+export class LicensesService {
+	// Two license sets are kept side by side. The instance set is the deployment
+	// license (self-hosted CONVOY_LICENSE_KEY or the cloud operator license); the
+	// org set is the current org's plan entitlements. In cloud both carry real
+	// limits, so org-context gating is the intersection (instance AND org): a
+	// feature is granted only if both licenses allow it. The org plan is the
+	// per-customer gate; the instance license is the platform capability and the
+	// instance-wide limit. Self-hosted/OSS return the same set for both scopes,
+	// so instance AND org collapses to the single license there.
+	private readonly ORG_LICENSES_KEY = 'licenses';
+	private readonly INSTANCE_LICENSES_KEY = 'instanceLicenses';
+	// Portal sessions keep their own cache so they never overwrite the
+	// dashboard's instance/org caches in a shared-browser session.
+	private readonly PORTAL_LICENSES_KEY = 'portalLicenses';
+	// Dedupe the shared portal bootstrap (PortalComponent) and the create-endpoint
+	// call into a single in-flight fetch so the portal cache is loaded exactly once
+	// per page load instead of racing two requests.
+	private portalLicensesInFlight: Promise<void> | null = null;
+
+	constructor(private http: HttpService) {}
+
+	private readLicenseData(storageKey: string): Record<string, any> | null {
+		const raw = localStorage.getItem(storageKey);
+		if (!raw) return null;
+		try {
+			return JSON.parse(raw) as Record<string, any>;
+		} catch {
+			// Fail closed: unreadable/corrupt cache reads as no license data,
+			// so callers deny access rather than trusting a partial parse.
+			return null;
+		}
+	}
+
+	// Whether a single cache grants a boolean/limit feature. Fail closed: a
+	// missing cache, missing feature, or denied value all read as not-allowed.
+	private allowsInCache(storageKey: string, feature: string): boolean {
+		const data = this.readLicenseData(storageKey);
+		if (!data) return false;
+		const v = data[feature];
+		if (v && typeof v === 'object' && 'allowed' in v) return (v as { allowed: boolean }).allowed === true;
+		if (typeof v === 'boolean') return v === true;
+		return false;
+	}
+
+	// Limit block from a single cache, or null when the cache does not define it.
+	private rawLimit(storageKey: string, limitKey: string): { current: number; limit: number; available: boolean; limit_reached: boolean } | null {
+		const data = this.readLicenseData(storageKey);
+		const l = data?.[limitKey];
+		if (l && typeof l === 'object' && 'current' in l && 'limit' in l && 'available' in l && 'limit_reached' in l) {
+			return {
+				current: l.current || 0,
+				limit: l.limit ?? 0,
+				available: l.available === true,
+				limit_reached: l.limit_reached === true
+			};
+		}
+		return null;
+	}
+
+	// Treat -1 as unlimited so the smaller (more restrictive) limit wins.
+	private normLimit(limit: number): number {
+		return limit === -1 ? Number.POSITIVE_INFINITY : limit;
+	}
+
+	getLicenses(orgId?: string, instanceLevelOnly = false): Promise<HTTP_RESPONSE> {
+		return new Promise(async (resolve, reject) => {
+			const query: Record<string, string> = {};
+			if (!instanceLevelOnly) {
+				const fromStorage = this.http.getOrganisation();
+				const org = orgId ?? fromStorage?.uid;
+				if (org) query['orgID'] = org;
+			}
+			const queryUndefined = Object.keys(query).length === 0 ? undefined : query;
+		try {
+			const response = await this.http.request({
+				url: `/license/features`,
+				method: 'get',
+				query: queryUndefined,
+				hideNotification: true
+			});
+				return resolve(response);
+			} catch (error) {
+				return reject(error);
+			}
+		});
+	}
+
+	/**
+	 * SSO/slug availability. The deployment must be SSO-capable (instance license)
+	 * AND the org's plan must include it (not every cloud org gets SSO), so this is
+	 * the instance AND org intersection like every other org-context feature.
+	 */
+	async hasEnterpriseSSO(): Promise<boolean> {
+		return this.hasLicense('EnterpriseSSO');
+	}
+
+	/**
+	 * Persist a single scope. instanceLevelOnly=true writes the deployment
+	 * (instance) feature list; false writes the current org's plan features.
+	 * Call with true from login/signup (public pages, no org context).
+	 */
+	async setLicenses(instanceLevelOnly = false) {
+		try {
+			const response = await this.getLicenses(undefined, instanceLevelOnly);
+			const key = instanceLevelOnly ? this.INSTANCE_LICENSES_KEY : this.ORG_LICENSES_KEY;
+			localStorage.setItem(key, JSON.stringify(response.data));
+		} catch {
+			// Fail open: a license fetch/cache failure must not block login or
+			// signup. Feature gates read fail-closed from the (now absent) cache.
+		}
+	}
+
+	/**
+	 * Populate both the instance and org feature caches. Used by the
+	 * authenticated dashboard bootstrap (and after a purchase) so instance
+	 * platform features and org plan features are both fresh without one
+	 * scope overwriting the other.
+	 */
+	async loadAllLicenses() {
+		await Promise.all([this.setLicenses(true), this.setLicenses(false)]);
+	}
+
+	/**
+	 * Populate the portal-only cache. A portal token has a single authority: the
+	 * org that owns the link. The portal license endpoint resolves that org from
+	 * the token and returns its plan. We keep this in a dedicated portal cache so
+	 * it never overwrites the dashboard's instance/org caches in a shared-browser
+	 * session. Call from portal components before reading hasPortalLicense.
+	 */
+	setPortalLicenses(): Promise<void> {
+		// Coalesce concurrent callers (the PortalComponent bootstrap and the
+		// create-endpoint await) onto one request so they share a single fetch and
+		// the same completion point.
+		if (this.portalLicensesInFlight) return this.portalLicensesInFlight;
+		this.portalLicensesInFlight = this.fetchPortalLicenses().finally(() => {
+			this.portalLicensesInFlight = null;
+		});
+		return this.portalLicensesInFlight;
+	}
+
+	private async fetchPortalLicenses(): Promise<void> {
+		// Portal-only: HttpService.request() routes to /portal-api only when a
+		// portal token/owner is present, otherwise it falls back to the dashboard
+		// /ui/license/features route with the operator's access token. Fail closed
+		// if there is no portal credential so the portal cache is never filled from
+		// the wrong (deployment/operator) plan.
+		if (!this.http.token && !this.http.ownerId) {
+			localStorage.removeItem(this.PORTAL_LICENSES_KEY);
+			return;
+		}
+
+		try {
+			// The portal license endpoint resolves the org from the portal token and
+			// ignores any client-supplied orgID, so we send none. Going through
+			// getLicenses() would attach the dashboard org id from a shared-browser
+			// session, which is unused at best and misleading at worst.
+			const response = await this.http.request({
+				url: `/license/features`,
+				method: 'get'
+			});
+			localStorage.setItem(this.PORTAL_LICENSES_KEY, JSON.stringify(response.data));
+		} catch {
+			// Fail closed: drop the portal cache so a failed fetch cannot leave
+			// gates unlocked. hasPortalLicense then reads not-allowed.
+			localStorage.removeItem(this.PORTAL_LICENSES_KEY);
+		}
+	}
+
+	clearLicenses() {
+		localStorage.removeItem(this.ORG_LICENSES_KEY);
+		localStorage.removeItem(this.INSTANCE_LICENSES_KEY);
+		localStorage.removeItem(this.PORTAL_LICENSES_KEY);
+	}
+
+	hasOrgLicense(org: { license_data?: string } | null): boolean {
+		return !!(org?.license_data);
+	}
+
+	/**
+	 * Org-context entitlement: granted only if both the instance and org licenses
+	 * allow it (intersection). Used by all dashboard gates except the instance-only
+	 * consumers below.
+	 */
+	hasLicense(license: string): boolean {
+		return this.allowsInCache(this.INSTANCE_LICENSES_KEY, license) && this.allowsInCache(this.ORG_LICENSES_KEY, license);
+	}
+
+	/**
+	 * Portal-context entitlement. A portal token's only authority is the org that
+	 * owns the link, so the portal reads its own cache and never depends on the
+	 * dashboard instance/org caches. Used by portal feature gates.
+	 */
+	hasPortalLicense(license: string): boolean {
+		return this.allowsInCache(this.PORTAL_LICENSES_KEY, license);
+	}
+
+	/**
+	 * Instance-only entitlement (deployment license, no org context). Use for
+	 * public pages (signup/login) and instance-admin platform tools that no org
+	 * plan grants (e.g. queue monitoring).
+	 */
+	hasInstanceLicense(license: string): boolean {
+		return this.allowsInCache(this.INSTANCE_LICENSES_KEY, license);
+	}
+
+	isMultiUserMode(): boolean {
+		return this.multiUserInCache(this.INSTANCE_LICENSES_KEY) && this.multiUserInCache(this.ORG_LICENSES_KEY);
+	}
+
+	private multiUserInCache(storageKey: string): boolean {
+		const data = this.readLicenseData(storageKey);
+		const userLimit = data?.['user_limit'];
+		if (userLimit && typeof userLimit === 'object' && 'allowed' in userLimit && 'limit' in userLimit) {
+			return userLimit.allowed === true && (userLimit.limit === -1 || userLimit.limit > 1);
+		}
+		return false;
+	}
+
+	// Both licenses must offer the limit for it to be available.
+	isLimitAvailable(limitKey: string): boolean {
+		const inst = this.rawLimit(this.INSTANCE_LICENSES_KEY, limitKey);
+		const org = this.rawLimit(this.ORG_LICENSES_KEY, limitKey);
+		const defined = [inst, org].filter((d): d is NonNullable<typeof d> => d !== null);
+		if (defined.length === 0) return false;
+		return defined.every(d => d.available === true);
+	}
+
+	// Reached if either license is at its limit.
+	isLimitReached(limitKey: string): boolean {
+		const inst = this.rawLimit(this.INSTANCE_LICENSES_KEY, limitKey);
+		const org = this.rawLimit(this.ORG_LICENSES_KEY, limitKey);
+		const defined = [inst, org].filter((d): d is NonNullable<typeof d> => d !== null);
+		if (defined.length === 0) return false;
+		return defined.some(d => d.limit_reached === true);
+	}
+
+	// -1 means unlimited; render it as ∞. Single owner of the -1 → ∞ formatting.
+	formatLimit(limit: number | undefined | null): string {
+		return limit === -1 ? '∞' : String(limit ?? 0);
+	}
+
+	// "Limit reached (current/limit)" copy for an exhausted limit.
+	limitReachedMessage(limitKey: string): string {
+		const limitInfo = this.getLimitInfo(limitKey);
+		const current = limitInfo?.current ?? 0;
+		return `Limit reached (${current}/${this.formatLimit(limitInfo?.limit)})`;
+	}
+
+	// Hover copy for disabled limit actions: plain language, no current/limit fraction.
+	limitActionTooltip(limitKey: string, resource: 'organization' | 'project' | 'team member'): string {
+		const message = this.limitMessage(limitKey);
+		if (message === 'Premium') {
+			const actions: Record<typeof resource, string> = {
+				organization: 'add organizations',
+				project: 'create projects',
+				'team member': 'invite team members'
+			};
+			return `Upgrade to Premium to ${actions[resource]}.`;
+		}
+		if (message) {
+			return `You've reached your ${resource} limit on this plan. Upgrade to Premium for more.`;
+		}
+		return '';
+	}
+
+	// Shared project/user limit gating copy: upsell label when the plan does not
+	// include the limit, the reached message when it is included and exhausted.
+	// "Premium" matches getconvoy.io/pricing (Community / Premium / Enterprise).
+	limitMessage(limitKey: string): string {
+		if (!this.hasLicense(limitKey)) {
+			if (!this.isLimitAvailable(limitKey)) {
+				return 'Premium';
+			}
+			if (this.isLimitAvailable(limitKey) && this.isLimitReached(limitKey)) {
+				return this.limitReachedMessage(limitKey);
+			}
+		}
+		return '';
+	}
+
+	// Combined view: the more restrictive (smaller) limit, with that side's usage.
+	getLimitInfo(limitKey: string): {current: number, limit: number, available: boolean, limit_reached: boolean} | null {
+		const inst = this.rawLimit(this.INSTANCE_LICENSES_KEY, limitKey);
+		const org = this.rawLimit(this.ORG_LICENSES_KEY, limitKey);
+		if (!inst && !org) return null;
+		if (!inst) return org;
+		if (!org) return inst;
+
+		const binding = this.normLimit(org.limit) <= this.normLimit(inst.limit) ? org : inst;
+		return {
+			current: binding.current,
+			limit: binding.limit,
+			available: inst.available && org.available,
+			limit_reached: inst.limit_reached || org.limit_reached
+		};
+	}
+}

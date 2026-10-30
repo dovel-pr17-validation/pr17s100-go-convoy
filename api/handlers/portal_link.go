@@ -1,0 +1,465 @@
+package handlers
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+
+	apiModels "github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/datastore/cached"
+	endpointsvc "github.com/frain-dev/convoy/internal/endpoints"
+	"github.com/frain-dev/convoy/internal/pkg/middleware"
+	"github.com/frain-dev/convoy/internal/portal_links"
+	"github.com/frain-dev/convoy/util"
+)
+
+// CreatePortalLink
+//
+//	@Summary		Create a portal link
+//	@Description	This endpoint creates a portal link
+//	@Tags			Portal Links
+//	@Id				CreatePortalLink
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string								true	"Project ID"
+//	@Param			portallink	body		datastore.CreatePortalLinkRequest	true	"Portal Link Details"
+//	@Success		201			{object}	util.ServerResponse{data=datastore.PortalLinkResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links [post]
+func (h *Handler) CreatePortalLink(w http.ResponseWriter, r *http.Request) {
+	migrator, err := h.Versioning.For(r)
+	if err != nil {
+		h.A.Logger.Errorf("Failed to create migrator: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid API version", http.StatusBadRequest))
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.A.Logger.Errorf("Failed to read request body: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid request", http.StatusBadRequest))
+		return
+	}
+
+	var newPortalLink datastore.CreatePortalLinkRequest
+	if err = migrator.Unmarshal(body, &newPortalLink); err != nil {
+		h.A.Logger.Errorf("Failed to parse portal link creation request: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid request format", http.StatusBadRequest))
+		return
+	}
+
+	if util.IsStringEmpty(newPortalLink.AuthType) {
+		// makes sure that the auth type is set for backward compatibility
+		newPortalLink.SetDefaultAuthType()
+	}
+
+	if err = newPortalLink.Validate(); err != nil {
+		h.A.Logger.Errorf("Portal link creation validation failed: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid input provided", http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+	portalLink, err := svc.CreatePortalLink(r.Context(), project.UID, &newPortalLink)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	// Fetch the portal link to populate calculated fields like EndpointCount
+	portalLink, err = svc.GetPortalLink(r.Context(), project.UID, portalLink.UID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	pl := portalLinkResponse(portalLink, baseUrl)
+	_ = render.Render(w, r, util.NewServerResponse("Portal link created successfully", pl, http.StatusCreated))
+}
+
+// GetPortalLink
+//
+//	@Summary		Retrieve a portal link
+//	@Description	This endpoint retrieves a portal link by its id.
+//	@Tags			Portal Links
+//	@Id				GetPortalLink
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID		path		string	true	"Project ID"
+//	@Param			portalLinkID	path		string	true	"portal link id"
+//	@Success		200				{object}	util.ServerResponse{data=datastore.PortalLinkResponse}
+//	@Failure		400,401,404		{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links/{portalLinkID} [get]
+func (h *Handler) GetPortalLink(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+
+	var pLink *datastore.PortalLink
+	pLink, err = h.retrievePortalLinkFromToken(r)
+	if err != nil {
+		pLink, err = svc.GetPortalLink(r.Context(), project.UID, chi.URLParam(r, "portalLinkID"))
+		if err != nil {
+			if errors.Is(err, datastore.ErrPortalLinkNotFound) {
+				_ = render.Render(w, r, util.NewErrorResponse("Resource not found", http.StatusNotFound))
+				return
+			}
+			_ = render.Render(w, r, util.NewServiceErrResponse(err))
+			return
+		}
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	pl := portalLinkResponse(pLink, baseUrl)
+	_ = render.Render(w, r, util.NewServerResponse("Portal link fetched successfully", pl, http.StatusOK))
+}
+
+// UpdatePortalLink
+//
+//	@Summary		Update a portal link
+//	@Description	This endpoint updates a portal link
+//	@Id				UpdatePortalLink
+//	@Tags			Portal Links
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID		path		string								true	"Project ID"
+//	@Param			portalLinkID	path		string								true	"portal link id"
+//	@Param			portallink		body		datastore.UpdatePortalLinkRequest	true	"Portal Link Details"
+//	@Success		202				{object}	util.ServerResponse{data=datastore.PortalLinkResponse}
+//	@Failure		400,401,404		{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links/{portalLinkID} [put]
+func (h *Handler) UpdatePortalLink(w http.ResponseWriter, r *http.Request) {
+	migrator, err := h.Versioning.For(r)
+	if err != nil {
+		h.A.Logger.Errorf("Failed to create migrator: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid API version", http.StatusBadRequest))
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.A.Logger.Errorf("Failed to read request body: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid request", http.StatusBadRequest))
+		return
+	}
+
+	var updatePortalLink datastore.UpdatePortalLinkRequest
+	err = migrator.Unmarshal(body, &updatePortalLink)
+	if err != nil {
+		h.A.Logger.Errorf("Failed to parse portal link update request: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid request format", http.StatusBadRequest))
+		return
+	}
+
+	if util.IsStringEmpty(updatePortalLink.AuthType) {
+		// makes sure that the auth type is set for backward compatibility
+		updatePortalLink.SetDefaultAuthType()
+	}
+
+	if err := updatePortalLink.Validate(); err != nil {
+		h.A.Logger.Errorf("Portal link update validation failed: %v", err)
+		_ = render.Render(w, r, util.NewErrorResponse("Invalid input provided", http.StatusBadRequest))
+		return
+	}
+
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+
+	portalLink, err := svc.GetPortalLink(r.Context(), project.UID, chi.URLParam(r, "portalLinkID"))
+	if err != nil {
+		if errors.Is(err, datastore.ErrPortalLinkNotFound) {
+			h.A.Logger.Errorf("Portal link not found during update: %v", err)
+			_ = render.Render(w, r, util.NewErrorResponse("Resource not found", http.StatusNotFound))
+			return
+		}
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	portalLink, err = svc.UpdatePortalLink(r.Context(), project.UID, portalLink, &updatePortalLink)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	// Fetch the portal link to populate calculated fields like EndpointCount
+	portalLink, err = svc.GetPortalLink(r.Context(), project.UID, portalLink.UID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	pl := portalLinkResponse(portalLink, baseUrl)
+	_ = render.Render(w, r, util.NewServerResponse("Portal link updated successfully", pl, http.StatusAccepted))
+}
+
+// RefreshPortalLinkAuthToken
+//
+//	@Summary		Get a portal link auth token
+//	@Description	This endpoint retrieves a portal link auth token
+//	@Id				RefreshPortalLinkAuthToken
+//	@Tags			Portal Links
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID		path		string	true	"Project ID"
+//	@Param			portalLinkID	path		string	true	"portal link id"
+//	@Success		200				{object}	util.ServerResponse{data=string}
+//	@Failure		400,401,404		{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links/{portalLinkID}/refresh_token [get]
+func (h *Handler) RefreshPortalLinkAuthToken(w http.ResponseWriter, r *http.Request) {
+	// Portal tokens must not mint auth_keys (requireJWTProjectManage skips them).
+	// Failure policy: fail closed 401 for portal credentials.
+	if h.rejectPortalLinkToken(w, r) {
+		return
+	}
+
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	// Minting a portal auth_key is a privileged mutation. Project view alone
+	// must not refresh another link's token. Failure policy: fail closed 403.
+	if !h.requireJWTProjectManage(w, r, project) {
+		return
+	}
+
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+
+	pLink, err := svc.RefreshPortalLinkAuthToken(r.Context(), project.UID, chi.URLParam(r, "portalLinkID"))
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse("portal link not found", http.StatusBadRequest))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Portal link fetched successfully", pLink.AuthKey, http.StatusOK))
+}
+
+// RevokePortalLink
+//
+//	@Summary		Revoke a portal link
+//	@Description	This endpoint revokes a portal link
+//	@Id				RevokePortalLink
+//	@Tags			Portal Links
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID		path		string	true	"Project ID"
+//	@Param			portalLinkID	path		string	true	"portal link id"
+//	@Success		200				{object}	util.ServerResponse{data=Stub}
+//	@Failure		400,401,404		{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links/{portalLinkID}/revoke [put]
+func (h *Handler) RevokePortalLink(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	// The portal realm authenticates refresh tokens through the cached portal
+	// link repo (portal_links_by_mask). Revoke must go through the same cached
+	// repo so its mask-id cache entries are invalidated; a bare service would
+	// soft-delete the row but leave the token authenticating until the TTL
+	// expires. The TTL value is irrelevant here since revoke only issues deletes.
+	svc := h.portalLinkRepo()
+
+	err = svc.RevokePortalLink(r.Context(), project.UID, chi.URLParam(r, "portalLinkID"))
+	if err != nil {
+		if errors.Is(err, datastore.ErrPortalLinkNotFound) {
+			_ = render.Render(w, r, util.NewErrorResponse("Resource not found", http.StatusNotFound))
+			return
+		}
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Portal link revoked successfully", nil, http.StatusOK))
+}
+
+// portalLinkRepo returns the portal link repository used for mutations that must
+// invalidate the realm's mask-id cache (revoke). When a cache is configured it
+// wraps the service in the same cached decorator the realm reads through, so
+// invalidation reaches the live cache; without a cache (tests) it returns the
+// bare service.
+func (h *Handler) portalLinkRepo() datastore.PortalLinkRepository {
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+	if h.A.Cache == nil {
+		return svc
+	}
+	return cached.NewCachedPortalLinkRepository(svc, h.A.Cache, 5*time.Minute, h.A.Logger)
+}
+
+// LoadPortalLinksPaged
+//
+//	@Summary		List all portal links
+//	@Description	This endpoint fetches multiple portal links
+//	@Tags			Portal Links
+//	@Id				LoadPortalLinksPaged
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string						true	"Project ID"
+//	@Param			request		query		models.QueryListEndpoint	false	"Query Params"
+//	@Success		200			{object}	util.ServerResponse{data=models.PagedResponse{content=[]datastore.PortalLinkResponse}}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/portal-links [get]
+func (h *Handler) LoadPortalLinksPaged(w http.ResponseWriter, r *http.Request) {
+	pageable := middleware.GetPageableFromContext(r.Context())
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	var q *apiModels.QueryListPortalLink
+	data := q.Transform(r)
+
+	svc := portal_links.New(h.A.Logger, h.A.DB)
+	portalLinks, paginationData, err := svc.LoadPortalLinksPaged(r.Context(), project.UID, data.FilterBy, pageable)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	plResponse := make([]datastore.PortalLinkResponse, 0, len(portalLinks))
+	for _, portalLink := range portalLinks {
+		pl := portalLinkResponse(&portalLink, baseUrl)
+		plResponse = append(plResponse, pl)
+	}
+
+	resp := apiModels.NewListResponse(plResponse, func(p datastore.PortalLinkResponse) datastore.PortalLinkResponse {
+		return p
+	})
+	_ = render.Render(w, r, util.NewServerResponse("Portal links fetched successfully", apiModels.PagedResponse{Content: resp, Pagination: &paginationData}, http.StatusOK))
+}
+
+func portalLinkResponse(pl *datastore.PortalLink, baseUrl string) datastore.PortalLinkResponse {
+	url := fmt.Sprintf("%s/portal?token=%s", baseUrl, pl.Token)
+	if len(pl.AuthKey) > 0 {
+		url = fmt.Sprintf("%s&auth_token=%s", url, pl.AuthKey)
+	}
+
+	return datastore.PortalLinkResponse{
+		UID:               pl.UID,
+		ProjectID:         pl.ProjectID,
+		Name:              pl.Name,
+		URL:               url,
+		Token:             pl.Token,
+		OwnerID:           pl.OwnerID,
+		Endpoints:         pl.Endpoints,
+		EndpointCount:     pl.EndpointCount,
+		EndpointsMetadata: pl.EndpointsMetadata,
+		CanManageEndpoint: pl.CanManageEndpoint,
+		CreatedAt:         pl.CreatedAt,
+		UpdatedAt:         pl.UpdatedAt,
+		AuthType:          pl.AuthType,
+		AuthKey:           pl.AuthKey,
+	}
+}
+
+// filterAllowedEndpointIDs returns the requested endpoint IDs that fall within
+// the portal link's allowed set. If no endpoint IDs were requested, the full
+// allowed set is returned. Requested IDs outside the allowed set are dropped,
+// so a portal token can never widen its scope.
+func filterAllowedEndpointIDs(requested, allowed []string) []string {
+	if len(requested) == 0 {
+		return allowed
+	}
+
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, id := range allowed {
+		allowedSet[id] = struct{}{}
+	}
+
+	results := make([]string, 0, len(requested))
+	for _, id := range requested {
+		if _, ok := allowedSet[id]; ok {
+			results = append(results, id)
+		}
+	}
+
+	return results
+}
+
+// portalScopedEndpointIDs resolves the portal allowlist, then intersects it with
+// any caller-supplied endpoint filter. Failure policy: empty intersection means
+// no accessible endpoints (caller should return empty success, not widen scope).
+func (h *Handler) portalScopedEndpointIDs(r *http.Request, portalLink *datastore.PortalLink, requested []string) ([]string, error) {
+	allowed, err := h.getEndpoints(r, portalLink)
+	if err != nil {
+		return nil, err
+	}
+	return filterAllowedEndpointIDs(requested, allowed), nil
+}
+
+func (h *Handler) getEndpoints(r *http.Request, pl *datastore.PortalLink) ([]string, error) {
+	results := make([]string, 0)
+	if !util.IsStringEmpty(pl.OwnerID) {
+		endpointRepo := endpointsvc.New(h.A.Logger, h.A.DB)
+		endpoints, err := endpointRepo.FindEndpointsByOwnerID(r.Context(), pl.ProjectID, pl.OwnerID)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, endpoint := range endpoints {
+			results = append(results, endpoint.UID)
+		}
+
+		return results, nil
+	}
+
+	if pl.Endpoints == nil {
+		return results, nil
+	}
+
+	return pl.Endpoints, nil
+}

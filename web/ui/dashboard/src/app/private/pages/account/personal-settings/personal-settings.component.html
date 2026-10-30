@@ -1,0 +1,151 @@
+@if (!showCreateNewTokenForm) {
+  <!-- Section header -->
+  <div class="flex items-start justify-between gap-16px mb-20px">
+    <div class="flex flex-col gap-2px">
+      <h3 class="font-heading font-semibold text-[16px] leading-[24px] text-new.text-primary">Personal access tokens</h3>
+      <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary">Tokens you can use to authenticate against the Convoy API.</p>
+    </div>
+    @if (personalAccessKeys?.content?.length > 0) {
+      <button
+        type="button"
+        class="shrink-0 flex items-center gap-4px px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90"
+        (click)="showCreateNewTokenForm = true"
+        >
+        <img src="/assets/img/svg/plus-white.svg" class="w-14px h-14px" alt="" />
+        Token
+      </button>
+    }
+  </div>
+
+  <div class="bg-white-100 border border-new.border rounded-12px overflow-hidden">
+    <!-- loader -->
+    @if (isFetchingKeys) {
+      @for (index of loaderIndex; track $index) {
+        <div class="flex justify-between items-center px-20px py-14px border-b border-new.border last:border-b-0">
+          <div>
+            <div class="flex items-center mb-8px">
+              <convoy-skeleton-loader className="h-20px w-100px"></convoy-skeleton-loader>
+              <convoy-skeleton-loader className="h-14px w-60px ml-10px"></convoy-skeleton-loader>
+            </div>
+            <convoy-skeleton-loader className="h-14px w-120px"></convoy-skeleton-loader>
+          </div>
+          <convoy-skeleton-loader className="h-14px w-120px"></convoy-skeleton-loader>
+        </div>
+      }
+    } @else if (personalAccessKeys?.content?.length === 0) {
+      <!-- empty state -->
+      <div class="flex flex-col items-center justify-center gap-16px py-56px px-32px">
+        <img src="/assets/img/svg/deliveries-empty.svg" class="w-48px h-48px" alt="" />
+        <div class="flex flex-col items-center gap-4px text-center max-w-[360px]">
+          <p class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary">No personal access tokens yet</p>
+          <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Generate a token to authenticate against the Convoy API on your own behalf.</p>
+        </div>
+        <button
+          type="button"
+          class="flex items-center gap-4px min-w-[100px] px-16px py-12px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90"
+          (click)="showCreateNewTokenForm = true"
+          >
+          <img src="/assets/img/svg/plus-white.svg" class="w-14px h-14px" alt="" />
+          Generate New Token
+        </button>
+      </div>
+    } @else if (personalAccessKeys) {
+      <!-- token rows -->
+      @for (key of personalAccessKeys.content; track $index) {
+        <div class="flex justify-between items-center gap-16px px-20px py-14px border-b border-new.border last:border-b-0 transition-colors hover:bg-new.surface-subtle">
+          <div class="min-w-0">
+            <div class="flex items-center gap-10px">
+              <p class="font-body font-medium text-[14px] leading-[18px] text-new.text-primary truncate">{{ key.name }}</p>
+              <convoy-tag size="sm" [color]="getKeyStatus(key.expires_at) | statuscolor">{{ getKeyStatus(key.expires_at) }}</convoy-tag>
+            </div>
+            @if (key.expires_at) {
+              <p class="font-body font-normal text-[12px] leading-[16px] text-new.text-secondary mt-4px">Expires {{ key.expires_at | date: 'mediumDate' }}</p>
+            }
+          </div>
+          @if (getKeyStatus(key.expires_at) === 'active') {
+            <button
+              type="button"
+              class="shrink-0 flex items-center gap-6px px-12px py-8px rounded-full font-body font-medium text-[13px] leading-[16px] text-new.error-500 transition-colors hover:bg-new.error-25"
+              (click)="selectedKey = key; settingsDialog.showModal()"
+              >
+              <svg width="14" height="14" class="fill-new.error-500">
+                <use xlink:href="#delete-icon"></use>
+              </svg>
+              Revoke
+            </button>
+          }
+        </div>
+      }
+    }
+  </div>
+
+  <!-- pagination -->
+  @if (personalAccessKeys?.content?.length >= 10) {
+    <div class="flex items-center gap-8px mt-16px">
+      <button
+        type="button"
+        class="w-28px h-28px flex items-center justify-center rounded-[6px] border border-new.border bg-new.surface-page transition-colors hover:bg-new.surface-muted disabled:opacity-40 disabled:pointer-events-none"
+        routerLink="./"
+        [queryParams]="{ page: personalAccessKeys?.pagination?.prev }"
+        [disabled]="personalAccessKeys?.pagination?.prev === 0"
+        (click)="fetchPersonalKeys({ page: personalAccessKeys?.pagination?.prev })"
+        >
+        <img src="/assets/img/svg/chevron-left-small.svg" class="w-16px h-16px" alt="previous page" />
+      </button>
+      <button
+        type="button"
+        class="w-28px h-28px flex items-center justify-center rounded-[6px] border border-new.border bg-new.surface-page transition-colors hover:bg-new.surface-muted disabled:opacity-40 disabled:pointer-events-none"
+        routerLink="./"
+        [queryParams]="{ page: personalAccessKeys?.pagination?.next }"
+        [disabled]="personalAccessKeys?.pagination?.next === 0"
+        (click)="fetchPersonalKeys({ page: personalAccessKeys?.pagination?.next })"
+        >
+        <img src="/assets/img/svg/chevron-right-small.svg" class="w-16px h-16px" alt="next page" />
+      </button>
+    </div>
+  }
+}
+
+<!-- generate personal access token form  -->
+@if (showCreateNewTokenForm) {
+  <div class="bg-white-100 border border-new.border rounded-16px p-24px">
+    <h3 class="font-heading font-semibold text-[16px] leading-[24px] text-new.text-primary">Generate token</h3>
+    <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary mt-2px mb-20px">Name your token and choose how long it stays valid.</p>
+    <form [formGroup]="generateKeyForm" (ngSubmit)="generateNewKey()" class="max-w-[480px]">
+      <convoy-input-field>
+        <label for="name" required="true" convoy-label>Token Name</label>
+        <input type="text" id="name" convoy-input autocomplete="name" formControlName="name" placeholder="Token name" />
+        @if (generateKeyForm.get('name')?.touched && generateKeyForm.get('name')?.invalid) {
+          <convoy-input-error>Please enter a name for your token</convoy-input-error>
+        }
+      </convoy-input-field>
+      <convoy-select label="Expiry Duration" name="expiration" formControlName="expiration" [options]="expirationDates" (selectedOption)="generateKeyForm.patchValue({ expiration: $event })"></convoy-select>
+      <div class="flex justify-end gap-12px mt-40px">
+        <button
+          type="button"
+          class="px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-all hover:opacity-80"
+          (click)="showCreateNewTokenForm = false"
+          >
+          Discard
+        </button>
+        <button class="px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90">Generate Key</button>
+      </div>
+    </form>
+  </div>
+}
+
+<!-- token generated  -->
+<dialog #tokenDialog convoy-dialog position="center" size="sm">
+  <convoy-token-modal
+    title="Generate Token"
+    description="Your personal API key has been generated successfully"
+    notificationText="Personal API key has been copied to your clipboard."
+    [token]="accessKey"
+    (closeModal)="tokenDialog.close(); fetchPersonalKeys()"
+  ></convoy-token-modal>
+</dialog>
+
+<!-- revoke token modal  -->
+<dialog #settingsDialog convoy-dialog position="center" class="!w-[480px] !max-w-[92vw] !rounded-24px !mt-[24vh] !bg-new.surface-page border border-new.border">
+  <app-delete-modal [isLoading]="isRevokingKey" [deleteText]="'revoke “' + selectedKey?.name + ' api key”'" deleteButtonText="revoke" (closeModal)="settingsDialog.close()" (deleteData)="revokeKey()"></app-delete-modal>
+</dialog>

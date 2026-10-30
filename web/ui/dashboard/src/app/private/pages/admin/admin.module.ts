@@ -1,0 +1,68 @@
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { CanDeactivateFn, RouterModule, Routes } from '@angular/router';
+import { ReactiveFormsModule } from '@angular/forms';
+import { AdminComponent } from './admin.component';
+import { FeatureFlagsComponent } from './feature-flags/feature-flags.component';
+import { OrganisationOverridesComponent } from './organisation-overrides/organisation-overrides.component';
+import { CircuitBreakerConfigComponent } from './circuit-breaker-config/circuit-breaker-config.component';
+import { ResendEventsComponent } from './resend-events/resend-events.component';
+import { TablePartitionsComponent } from './table-partitions/table-partitions.component';
+import { TableIndexesComponent } from './table-indexes/table-indexes.component';
+import { RetentionDropsComponent } from './retention-drops/retention-drops.component';
+import { RunCardComponent } from './runs/run-card.component';
+import { RetentionRunCardComponent } from './runs/retention-run-card.component';
+import { ConfigurationsComponent } from '../settings/configurations/configurations.component';
+import { SelectComponent } from 'src/app/components/select/select.component';
+import { ToggleComponent } from 'src/app/components/toggle/toggle.component';
+import { TagComponent } from 'src/app/components/tag/tag.component';
+import { ButtonComponent } from 'src/app/components/button/button.component';
+import { LoaderModule } from '../../components/loader/loader.module';
+import { LabelComponent, InputFieldDirective, InputErrorComponent, InputDirective } from 'src/app/components/input/input.component';
+import { CardComponent } from 'src/app/components/card/card.component';
+import { StatusColorModule } from 'src/app/pipes/status-color/status-color.module';
+import { QueueMonitoringComponent } from '../queue-monitoring/queue-monitoring.component';
+import { RadioComponent } from 'src/app/components/radio/radio.component';
+import { ConfigButtonComponent } from '../../components/config-button/config-button.component';
+import { TooltipComponent } from 'src/app/components/tooltip/tooltip.component';
+
+const adminUnsavedGuard: CanDeactivateFn<AdminComponent> = component => component.canDeactivate();
+
+const routes: Routes = [{ path: '', component: AdminComponent, canDeactivate: [adminUnsavedGuard] }];
+
+@NgModule({
+	declarations: [
+		AdminComponent,
+		ConfigurationsComponent,
+		FeatureFlagsComponent,
+		OrganisationOverridesComponent,
+		CircuitBreakerConfigComponent,
+		ResendEventsComponent,
+		TablePartitionsComponent,
+		RetentionDropsComponent,
+		TableIndexesComponent,
+		RunCardComponent,
+		RetentionRunCardComponent
+	],
+	imports: [
+		CommonModule,
+		RouterModule.forChild(routes),
+		ReactiveFormsModule,
+		QueueMonitoringComponent,
+		CardComponent,
+		SelectComponent,
+		RadioComponent,
+		ToggleComponent,
+		TagComponent,
+		StatusColorModule,
+		ButtonComponent,
+		ConfigButtonComponent,
+		LoaderModule,
+		LabelComponent,
+		InputFieldDirective,
+		InputErrorComponent,
+		InputDirective,
+		TooltipComponent
+	]
+})
+export class AdminModule {}

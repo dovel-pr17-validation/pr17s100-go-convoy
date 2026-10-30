@@ -1,0 +1,102 @@
+package services
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/tracer"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/worker/task"
+)
+
+type RetryEventDeliveryService struct {
+	EventDeliveryRepo datastore.EventDeliveryRepository
+	EndpointRepo      datastore.EndpointRepository
+	Queue             queue.Queuer
+
+	EventDelivery *datastore.EventDelivery
+	Project       *datastore.Project
+	Logger        log.Logger
+}
+
+func (e *RetryEventDeliveryService) Run(ctx context.Context) (err error) {
+	ctx, span := otel.Tracer(tracer.TracerNameServices).Start(ctx, tracer.SpanServicesEventDeliveryRetry)
+	if e.Project != nil {
+		span.SetAttributes(tracer.AttrProjectID.String(e.Project.UID))
+	}
+	if e.EventDelivery != nil {
+		span.SetAttributes(
+			tracer.AttrEventDeliveryID.String(e.EventDelivery.UID),
+			tracer.AttrEndpointID.String(e.EventDelivery.EndpointID),
+		)
+	}
+	defer func() {
+		tracer.RecordError(span, err)
+		span.End()
+	}()
+
+	switch e.EventDelivery.Status {
+	case datastore.SuccessEventStatus:
+		return &ServiceError{ErrMsg: "event already sent"}
+	case datastore.ScheduledEventStatus,
+		datastore.ProcessingEventStatus,
+		datastore.RetryEventStatus:
+		return &ServiceError{ErrMsg: "cannot resend event that did not fail previously"}
+	}
+
+	endpoint, err := e.EndpointRepo.FindEndpointByID(ctx, e.EventDelivery.EndpointID, e.Project.UID)
+	if err != nil {
+		return &ServiceError{ErrMsg: datastore.ErrEndpointNotFound.Error(), Err: err}
+	}
+
+	switch endpoint.Status {
+	case datastore.PausedEndpointStatus:
+		return &ServiceError{ErrMsg: "the endpoint is currently paused"}
+	case datastore.InactiveEndpointStatus:
+		return &ServiceError{ErrMsg: "the endpoint is currently inactive"}
+	}
+
+	return requeueEventDelivery(ctx, e.EventDelivery, e.Project, e.EventDeliveryRepo, e.Queue, e.Logger)
+}
+
+func requeueEventDelivery(ctx context.Context, eventDelivery *datastore.EventDelivery, g *datastore.Project, ed datastore.EventDeliveryRepository, q queue.Queuer, logger log.Logger) error {
+	eventDelivery.Status = datastore.ScheduledEventStatus
+	err := ed.UpdateStatusOfEventDelivery(ctx, g.UID, *eventDelivery, datastore.ScheduledEventStatus)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to update event delivery status", "error", err)
+		return &ServiceError{ErrMsg: "an error occurred while trying to resend event", Err: err}
+	}
+
+	taskName := convoy.EventProcessor
+	payload := task.EventDelivery{
+		EventDeliveryID: eventDelivery.UID,
+		ProjectID:       g.UID,
+	}
+
+	bytes, err := msgpack.EncodeMsgPack(payload)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to marshal process event delivery payload", "error", err)
+		return &ServiceError{ErrMsg: "error occurred marshaling event delivery payload", Err: err}
+	}
+
+	job := &queue.Job{
+		ID:      eventDelivery.UID,
+		Payload: bytes,
+		Delay:   1 * time.Second,
+	}
+
+	err = q.Write(ctx, taskName, convoy.EventQueue, job)
+	if err != nil {
+		logger.ErrorContext(ctx, fmt.Sprintf("error occurred re-enqueing old event - %s: %v", eventDelivery.UID, err))
+		return &ServiceError{ErrMsg: fmt.Sprintf("error occurred re-enqueing old event - %s", eventDelivery.UID), Err: err}
+	}
+
+	return nil
+}

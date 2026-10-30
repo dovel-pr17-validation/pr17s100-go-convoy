@@ -1,0 +1,126 @@
+<div class="max-w-[1300px] w-full mx-auto px-24px pt-80px pb-100px">
+  <div class="pt-24px">
+    <h1 class="font-heading font-medium text-[20px] leading-[28px] text-new.text-primary">Event Deliveries</h1>
+  </div>
+
+  <!-- Summary controls -->
+  <div class="flex items-center justify-between gap-16px mt-24px flex-wrap">
+    <div class="flex items-center gap-16px flex-wrap">
+      <!-- Interval segmented control -->
+      <div class="flex items-stretch h-44px drop-shadow-[0px_2px_1px_rgba(0,0,0,0.04)]">
+        @for (filterOption of filterOptions; track $index; let first = $first; let last = $last) {
+          <button
+            type="button"
+            (click)="dashboardFrequency = filterOption; fetchDashboardData()"
+            class="px-12px font-body font-medium text-[14px] leading-[16px] border transition-colors capitalize"
+            [class]="
+              (first ? 'rounded-l-8px ' : '-ml-[1px] ') +
+              (last ? 'rounded-r-8px ' : '') +
+              (dashboardFrequency === filterOption ? 'bg-new.primary-400 border-new.primary-400 text-white-100 z-[1] relative' : 'bg-white-100 border-new.border text-new.text-primary hover:bg-new.surface-muted')
+            "
+            >
+            {{ filterOption }}
+          </button>
+        }
+      </div>
+
+      <!-- Date range -->
+      <convoy-date-picker [dateRangeValue]="dateRangeValue" (selectedDateRange)="getSelectedDateRange($event)" (clearDates)="getSelectedDateRange()">
+        <button dropdownTrigger type="button" class="h-44px flex items-center gap-12px px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-colors hover:bg-new.surface-muted">
+          {{ dateRangeLabel }}
+          <img src="/assets/img/svg/calendar-small.svg" class="w-16px h-16px" alt="" />
+        </button>
+      </convoy-date-picker>
+    </div>
+
+    <!-- Endpoint scope for delivery counts -->
+    <div convoy-dropdown size="md" position="right">
+      <button dropdownTrigger type="button" class="w-[160px] h-44px flex items-center justify-between pl-12px pr-8px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary">
+        <span class="truncate">{{ selectedSummaryEndpoint?.title || selectedSummaryEndpoint?.name || 'All endpoints' }}</span>
+        <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px shrink-0" alt="" />
+      </button>
+      <ul dropdownOptions class="py-4px max-h-[240px] overflow-y-auto">
+        <li>
+          <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted" (click)="selectSummaryEndpoint()">All endpoints</button>
+        </li>
+        @for (endpoint of summaryEndpoints; track endpoint.uid) {
+          <li>
+            <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary truncate transition-colors hover:bg-new.surface-muted" (click)="selectSummaryEndpoint(endpoint)">
+              {{ endpoint.title || endpoint.name }}
+            </button>
+          </li>
+        }
+      </ul>
+    </div>
+  </div>
+
+  <!-- Metric cards -->
+  <div class="grid grid-cols-4 desktop:grid-cols-2 mobile:!grid-cols-1 gap-20px mt-24px max-w-[860px]">
+    <div class="bg-white-100 border border-new.border rounded-8px p-12px flex flex-col gap-4px min-h-[84px]">
+      @if (isloadingDashboardData) {
+        <convoy-skeleton-loader className="w-100px h-32px mb-4px"></convoy-skeleton-loader>
+      } @else {
+        <span class="font-body font-medium text-[32px] leading-[40px] text-new.text-primary">{{ dashboardData.events_sent | number }}</span>
+      }
+      <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">{{ dashboardData.events_sent | countLabel:'Event sent':'Events sent' }}</span>
+    </div>
+    <div class="bg-white-100 border border-new.border rounded-8px p-12px flex flex-col gap-4px min-h-[84px]">
+      @if (isLoadingDeliveryCounts) {
+        <convoy-skeleton-loader className="w-100px h-32px mb-4px"></convoy-skeleton-loader>
+      } @else {
+        <span class="font-body font-medium text-[32px] leading-[40px] text-new.text-primary">{{ deliveryCounts.success === null ? '–' : (deliveryCounts.success | number) }}</span>
+      }
+      <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">{{ deliveryCounts.success | countLabel:'Successful delivery':'Successful deliveries' }}</span>
+    </div>
+    <div class="bg-white-100 border border-new.border rounded-8px p-12px flex flex-col gap-4px min-h-[84px]">
+      @if (isLoadingDeliveryCounts) {
+        <convoy-skeleton-loader className="w-100px h-32px mb-4px"></convoy-skeleton-loader>
+      } @else {
+        <span class="font-body font-medium text-[32px] leading-[40px] text-new.text-primary">{{ deliveryCounts.failure === null ? '–' : (deliveryCounts.failure | number) }}</span>
+      }
+      <span class="font-body font-normal text-[14px] leading-normal" [class]="(deliveryCounts.failure ?? 0) > 0 ? 'text-[#df3520]' : 'text-new.text-secondary'">{{ deliveryCounts.failure | countLabel:'Failed delivery':'Failed deliveries' }}</span>
+    </div>
+    <div class="bg-white-100 border border-new.border rounded-8px p-12px flex flex-col gap-4px min-h-[84px]">
+      @if (isLoadingSummaryEndpoints) {
+        <convoy-skeleton-loader className="w-100px h-32px mb-4px"></convoy-skeleton-loader>
+      } @else {
+        <span class="font-body font-medium text-[32px] leading-[40px] text-new.text-primary">{{ activeEndpointCount | number }}</span>
+      }
+      <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">{{ activeEndpointCount | countLabel:'Active endpoint':'Active endpoints' }}</span>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="bg-white-100 border border-new.border rounded-12px mt-20px p-16px">
+    <h2 class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary">Event Deliveries over time</h2>
+    @if (isloadingDashboardData) {
+      <div class="h-[200px] flex items-end gap-14px mt-24px">
+        <convoy-skeleton-loader className="w-full h-120px"></convoy-skeleton-loader>
+      </div>
+    } @else if (!chartData.length) {
+      <div class="h-[200px] flex items-center justify-center mt-24px">
+        <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">No delivery activity in this range</p>
+      </div>
+    } @else {
+      <div class="mt-32px flex items-end gap-8px overflow-x-auto pb-4px min-h-[200px]">
+        @for (bucket of chartData; track $index) {
+          <div class="flex flex-col items-center gap-8px flex-1 min-w-[26px] max-w-[48px] group relative self-stretch justify-end">
+            <div class="w-full max-w-[32px] bg-[#40cf8e] rounded-[2px] transition-opacity group-hover:opacity-80" [style.height.px]="barHeight(bucket.data) * 1.6"></div>
+            <span class="font-body font-normal text-[12px] leading-normal text-new.text-placeholder whitespace-nowrap">{{ bucket.label }}</span>
+
+            <!-- Hover tooltip -->
+            <div class="pointer-events-none absolute bottom-[calc(100%+8px)] left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-[#1c1c1c] rounded-8px px-12px py-8px z-10 whitespace-nowrap flex flex-col gap-4px">
+              <span class="font-body font-medium text-[12px] text-white-100">{{ bucket.label }}</span>
+              <span class="font-body font-normal text-[12px] text-white-100 flex items-center gap-6px">
+                <span class="w-8px h-8px rounded-[2px] bg-[#40cf8e] inline-block"></span>
+                Events: {{ bucket.data | number }}
+              </span>
+            </div>
+          </div>
+        }
+      </div>
+    }
+  </div>
+
+  <app-event-deliveries [dateRange]="statsDateRangeForRequest"></app-event-deliveries>
+</div>

@@ -1,0 +1,79 @@
+package services
+
+import (
+	"context"
+	"time"
+
+	"github.com/dchest/uniuri"
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/cache"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/pubsub"
+	log "github.com/frain-dev/convoy/pkg/logger"
+)
+
+type CreateSourceService struct {
+	SourceRepo datastore.SourceRepository
+	Cache      cache.Cache
+	NewSource  *models.CreateSource
+	Project    *datastore.Project
+	Logger     log.Logger
+}
+
+func (s *CreateSourceService) Run(ctx context.Context) (*datastore.Source, error) {
+	if s.NewSource.Type == datastore.PubSubSource {
+		if err := pubsub.Validate(s.NewSource.PubSub.Transform()); err != nil {
+			return nil, &ServiceError{ErrMsg: err.Error()}
+		}
+	}
+
+	cfg, err := config.Get()
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: "failed to load configuration", Err: err}
+	}
+
+	source := &datastore.Source{
+		UID:               ulid.Make().String(),
+		ProjectID:         s.Project.UID,
+		MaskID:            uniuri.NewLen(16),
+		Name:              s.NewSource.Name,
+		Type:              s.NewSource.Type,
+		Provider:          s.NewSource.Provider,
+		Verifier:          s.NewSource.Verifier.Transform(),
+		PubSub:            s.NewSource.PubSub.Transform(),
+		IdempotencyKeys:   s.NewSource.IdempotencyKeys,
+		EventTypeLocation: s.NewSource.EventTypeLocation,
+		CustomResponse: datastore.CustomResponse{
+			Body:        s.NewSource.CustomResponse.Body,
+			ContentType: s.NewSource.CustomResponse.ContentType,
+		},
+		BodyFunction:   s.NewSource.BodyFunction,
+		HeaderFunction: s.NewSource.HeaderFunction,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	buf := uint64(len([]byte(source.CustomResponse.Body)))
+	if buf > cfg.MaxResponseSize {
+		return nil, &ServiceError{ErrMsg: "source custom response too large"}
+	}
+
+	if source.Provider == datastore.TwitterSourceProvider {
+		source.ProviderConfig = &datastore.ProviderConfig{Twitter: &datastore.TwitterProviderConfig{}}
+	}
+
+	if datastore.SourceUsesPayloadSignature(source) && datastore.EventTypeLocationUsesRequestMetadata(source.EventTypeLocation) {
+		return nil, &ServiceError{ErrMsg: "event type location cannot use request headers or query parameters with payload signature verification"}
+	}
+
+	err = s.SourceRepo.CreateSource(ctx, source)
+	if err != nil {
+		s.Logger.ErrorContext(ctx, "failed to create source", "error", err)
+		return nil, &ServiceError{ErrMsg: "failed to create source", Err: err}
+	}
+
+	return source, nil
+}

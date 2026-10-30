@@ -1,0 +1,353 @@
+package datastore
+
+import (
+	"context"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/frain-dev/convoy/pkg/circuit_breaker"
+	"github.com/frain-dev/convoy/pkg/flatten"
+)
+
+type EventDeliveryRepository interface {
+	ExportRepository
+	CreateEventDelivery(context.Context, *EventDelivery) error
+	CreateEventDeliveries(context.Context, []*EventDelivery) error
+	FindEventDeliveryByID(ctx context.Context, projectID string, id string) (*EventDelivery, error)
+	FindEventDeliveryByIDSlim(ctx context.Context, projectID string, id string) (*EventDelivery, error)
+	FindEventDeliveriesByIDs(ctx context.Context, projectID string, ids []string) ([]EventDelivery, error)
+	FindEventDeliveriesByEventID(ctx context.Context, projectID string, id string) ([]EventDelivery, error)
+	CountDeliveriesByStatus(ctx context.Context, projectID string, status EventDeliveryStatus, params SearchParams) (int64, error)
+	UpdateStatusOfEventDelivery(ctx context.Context, projectID string, eventDelivery EventDelivery, status EventDeliveryStatus) error
+	UpdateStatusOfEventDeliveries(ctx context.Context, projectID string, ids []string, status EventDeliveryStatus) error
+	FindDiscardedEventDeliveries(ctx context.Context, projectID, deviceId string, params SearchParams) ([]EventDelivery, error)
+	FindStuckEventDeliveriesByStatus(ctx context.Context, status EventDeliveryStatus) ([]EventDelivery, error)
+	UpdateEventDeliveryMetadata(ctx context.Context, projectID string, eventDelivery *EventDelivery) error
+	CountEventDeliveries(ctx context.Context, projectID string, endpointIDs []string, eventID string, status []EventDeliveryStatus, params SearchParams) (int64, error)
+	CountDeliveriesByEndpointAndStatus(ctx context.Context, projectID string, endpointIDs []string, statuses []EventDeliveryStatus, params SearchParams) ([]EndpointStatusDeliveryCount, error)
+	LoadEventDeliveriesPaged(
+		ctx context.Context, projectID string, endpointIDs []string, eventID, subscriptionID string,
+		status []EventDeliveryStatus, params SearchParams, pageable Pageable,
+		idempotencyKey, eventType, brokerMessageId string,
+	) ([]EventDelivery, PaginationData, error)
+	LoadEventDeliveriesIntervals(ctx context.Context, projectID string, params SearchParams, period Period, ids []string) ([]EventInterval, error)
+	PartitionEventDeliveriesTable(ctx context.Context) error
+	UnPartitionEventDeliveriesTable(ctx context.Context) error
+}
+
+type EventRepository interface {
+	ExportRepository
+	CreateEvent(context.Context, *Event) error
+	UpdateEventEndpoints(context.Context, *Event, []string) error
+	// UpdateEventStatus sets the status and the operator facing failure reason.
+	// Pass an empty reason for non-failure statuses so a later success clears
+	// the reason recorded by an earlier failed attempt.
+	UpdateEventStatus(context.Context, *Event, EventStatus, string) error
+	FindEventByID(ctx context.Context, projectID string, id string) (*Event, error)
+	FindEventsByIDs(ctx context.Context, projectID string, ids []string) ([]Event, error)
+	CountProjectMessages(ctx context.Context, projectID string) (int64, error)
+	CountEvents(ctx context.Context, projectID string, f *Filter) (int64, error)
+	LoadEventsPaged(ctx context.Context, projectID string, f *Filter) ([]Event, PaginationData, error)
+	FindEventsByIdempotencyKey(ctx context.Context, projectID string, idempotencyKey string) (bool, error)
+	FindFirstEventWithIdempotencyKey(ctx context.Context, projectID string, idempotencyKey string) (*Event, error)
+	CopyRows(ctx context.Context, projectID string, interval int) error
+	PartitionEventsTable(ctx context.Context) error
+	UnPartitionEventsTable(ctx context.Context) error
+	PartitionEventsSearchTable(ctx context.Context) error
+	UnPartitionEventsSearchTable(ctx context.Context) error
+}
+
+type ProjectRepository interface {
+	LoadProjects(context.Context, *ProjectFilter) ([]*Project, error)
+	CreateProject(context.Context, *Project) error
+	CountProjects(ctx context.Context) (int64, error)
+	UpdateProject(context.Context, *Project) error
+	DeleteProject(ctx context.Context, uid string) error
+	FetchProjectByID(context.Context, string) (*Project, error)
+	GetProjectsWithEventsInTheInterval(ctx context.Context, interval int) ([]ProjectEvents, error)
+	FillProjectsStatistics(ctx context.Context, project *Project) error
+}
+
+// OrganisationRepository defines the interface for organisation operations using SQLc
+type OrganisationRepository interface {
+	// CreateOrganisation creates a new organisation
+	CreateOrganisation(ctx context.Context, org *Organisation) error
+
+	// UpdateOrganisation updates an existing organisation
+	UpdateOrganisation(ctx context.Context, org *Organisation) error
+
+	// UpdateOrganisationLicenseData updates only the license_data field for an organisation.
+	// Lifecycle invariant: license_data may move empty -> provisional -> authoritative;
+	// no writer may move it provisional -> empty. Never call this with an empty value
+	// directly; route clears through services.ClearOrgLicenseData, which preserves a
+	// payload carrying the explicit provisional marker (license.LicenseDataPayload.Provisional).
+	UpdateOrganisationLicenseData(ctx context.Context, orgID, licenseData string) error
+
+	// DeleteOrganisation soft deletes an organisation by ID
+	DeleteOrganisation(ctx context.Context, id string) error
+
+	// FetchOrganisationByID retrieves an organisation by its ID
+	FetchOrganisationByID(ctx context.Context, id string) (*Organisation, error)
+
+	// FetchOrganisationByCustomDomain retrieves an organisation by its custom domain
+	FetchOrganisationByCustomDomain(ctx context.Context, domain string) (*Organisation, error)
+
+	// FetchOrganisationByAssignedDomain retrieves an organisation by its assigned domain
+	FetchOrganisationByAssignedDomain(ctx context.Context, domain string) (*Organisation, error)
+
+	// LoadOrganisationsPaged retrieves organisations with pagination
+	LoadOrganisationsPaged(ctx context.Context, pageable Pageable) ([]Organisation, PaginationData, error)
+
+	// LoadOrganisationsPagedWithSearch retrieves organisations with pagination and search
+	LoadOrganisationsPagedWithSearch(ctx context.Context, pageable Pageable, search string) ([]Organisation, PaginationData, error)
+
+	// CountOrganisations returns the total count of organisations
+	CountOrganisations(ctx context.Context) (int64, error)
+
+	// CalculateUsage calculates usage metrics for an organisation
+	CalculateUsage(ctx context.Context, orgID string, startTime, endTime time.Time) (*OrganisationUsage, error)
+}
+
+// APIKeyRepository defines the interface for API key operations
+type APIKeyRepository interface {
+	// CreateAPIKey creates a new API key
+	CreateAPIKey(ctx context.Context, apiKey *APIKey) error
+
+	// UpdateAPIKey updates an existing API key
+	UpdateAPIKey(ctx context.Context, apiKey *APIKey) error
+
+	// GetAPIKeyByID retrieves an API key by its ID
+	GetAPIKeyByID(ctx context.Context, id string) (*APIKey, error)
+
+	// GetAPIKeyByMaskID retrieves an API key by its mask ID (used for authentication)
+	GetAPIKeyByMaskID(ctx context.Context, maskID string) (*APIKey, error)
+
+	// GetAPIKeyByHash retrieves an API key by its hash
+	GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey, error)
+
+	// GetAPIKeyByProjectID retrieves an API key by its project ID
+	GetAPIKeyByProjectID(ctx context.Context, projectID string) (*APIKey, error)
+
+	// RevokeAPIKeys revokes (soft deletes) multiple API keys
+	RevokeAPIKeys(ctx context.Context, ids []string) error
+
+	// LoadAPIKeysPaged retrieves API keys with pagination and filtering
+	LoadAPIKeysPaged(ctx context.Context, filter *Filter, pageable *Pageable) ([]APIKey, PaginationData, error)
+}
+
+// PortalLinkRepository defines the interface for portal link operations
+type PortalLinkRepository interface {
+	// CreatePortalLink creates a new portal link
+	CreatePortalLink(ctx context.Context, projectId string, request *CreatePortalLinkRequest) (*PortalLink, error)
+
+	// UpdatePortalLink updates an existing portal link
+	UpdatePortalLink(ctx context.Context, projectID string, portalLink *PortalLink, request *UpdatePortalLinkRequest) (*PortalLink, error)
+
+	// GetPortalLink retrieves a portal link by project and portal link ID
+	GetPortalLink(ctx context.Context, projectID, portalLinkID string) (*PortalLink, error)
+
+	// GetPortalLinkByToken retrieves a portal link by its token
+	GetPortalLinkByToken(ctx context.Context, token string) (*PortalLink, error)
+
+	// GetPortalLinkByOwnerID retrieves a portal link by owner ID
+	GetPortalLinkByOwnerID(ctx context.Context, projectID, ownerID string) (*PortalLink, error)
+
+	// RefreshPortalLinkAuthToken refreshes the authentication token for a portal link
+	RefreshPortalLinkAuthToken(ctx context.Context, projectID, portalLinkID string) (*PortalLink, error)
+
+	// RevokePortalLink revokes (soft deletes) a portal link
+	RevokePortalLink(ctx context.Context, projectID, portalLinkID string) error
+
+	// LoadPortalLinksPaged retrieves portal links with pagination and filtering
+	LoadPortalLinksPaged(ctx context.Context, projectID string, filter *FilterBy, pageable Pageable) ([]PortalLink, PaginationData, error)
+
+	// FindPortalLinksByOwnerID finds all portal links for a specific owner
+	FindPortalLinksByOwnerID(ctx context.Context, ownerID string) ([]PortalLink, error)
+
+	// FindPortalLinkByMaskId finds a portal link by its mask ID
+	FindPortalLinkByMaskId(ctx context.Context, maskId string) (*PortalLink, error)
+
+	// FindPortalLinkTokenMaskIDs returns every refresh-token mask id issued for a portal link
+	FindPortalLinkTokenMaskIDs(ctx context.Context, portalLinkID string) ([]string, error)
+}
+
+type OrganisationInviteRepository interface {
+	LoadOrganisationsInvitesPaged(ctx context.Context, orgID string, inviteStatus InviteStatus, pageable Pageable) ([]OrganisationInvite, PaginationData, error)
+	CountOrganisationInvites(ctx context.Context, orgID string, inviteStatus InviteStatus) (int64, error)
+	CreateOrganisationInvite(ctx context.Context, iv *OrganisationInvite) error
+	UpdateOrganisationInvite(ctx context.Context, iv *OrganisationInvite) error
+	DeleteOrganisationInvite(ctx context.Context, uid string) error
+	FetchOrganisationInviteByID(ctx context.Context, uid string) (*OrganisationInvite, error)
+	FetchOrganisationInviteByToken(ctx context.Context, token string) (*OrganisationInvite, error)
+}
+
+type OrganisationMemberRepository interface {
+	LoadOrganisationMembersPaged(ctx context.Context, organisationID, userID string, pageable Pageable) ([]*OrganisationMember, PaginationData, error)
+	CountOrganisationMembers(ctx context.Context, organisationID string) (int64, error)
+	LoadUserOrganisationsPaged(ctx context.Context, userID string, pageable Pageable) ([]Organisation, PaginationData, error)
+	CountUserOrganisations(ctx context.Context, userID string, search string) (int64, error)
+	FindUserProjects(ctx context.Context, userID string) ([]Project, error)
+	CreateOrganisationMember(ctx context.Context, member *OrganisationMember) error
+	UpdateOrganisationMember(ctx context.Context, member *OrganisationMember) error
+	DeleteOrganisationMember(ctx context.Context, memberID string, orgID string) error
+	FetchOrganisationMemberByID(ctx context.Context, memberID string, organisationID string) (*OrganisationMember, error)
+	FetchOrganisationMemberByUserID(ctx context.Context, userID string, organisationID string) (*OrganisationMember, error)
+	FetchInstanceAdminByUserID(ctx context.Context, userID string) (*OrganisationMember, error)
+	FetchAnyOrganisationAdminByUserID(ctx context.Context, userID string) (*OrganisationMember, error)
+	CountInstanceAdminUsers(ctx context.Context) (int64, error)
+	CountOrganisationAdminUsers(ctx context.Context) (int64, error)
+	HasInstanceAdminAccess(ctx context.Context, userID string) (bool, error)
+	IsFirstInstanceAdmin(ctx context.Context, userID string) (bool, error)
+}
+
+type EndpointRepository interface {
+	CreateEndpoint(ctx context.Context, endpoint *Endpoint, projectID string) error
+	FindEndpointByID(ctx context.Context, id string, projectID string) (*Endpoint, error)
+	FindEndpointsByID(ctx context.Context, ids []string, projectID string) ([]Endpoint, error)
+	FindEndpointsByAppID(ctx context.Context, appID string, projectID string) ([]Endpoint, error)
+	FindEndpointsByOwnerID(ctx context.Context, projectID string, ownerID string) ([]Endpoint, error)
+	FetchEndpointIDsByOwnerID(ctx context.Context, projectID string, ownerID string) ([]string, error)
+	FindEndpointByTargetURL(ctx context.Context, projectID string, targetURL string) (*Endpoint, error)
+	FindEndpointsWithURLTemplates(ctx context.Context, projectID string) ([]Endpoint, error)
+	UpdateEndpoint(ctx context.Context, endpoint *Endpoint, projectID string) error
+	// UpdateEndpointStatus writes the status, re-applying one the endpoint
+	// already holds without erroring, because callers do that on a schedule. It
+	// reports whether the write changed the status, which is what callers alert
+	// on so a repeated write does not repeat the alert.
+	UpdateEndpointStatus(ctx context.Context, projectID, endpointID string, status EndpointStatus) (bool, error)
+	DeleteEndpoint(ctx context.Context, endpoint *Endpoint, projectID string) error
+	CountProjectEndpoints(ctx context.Context, projectID string) (int64, error)
+	LoadEndpointsPaged(ctx context.Context, projectID string, filter *Filter, pageable Pageable) ([]Endpoint, PaginationData, error)
+	UpdateSecrets(ctx context.Context, endpointID string, projectID string, secrets Secrets) error
+	DeleteSecret(ctx context.Context, endpoint *Endpoint, secretID string, projectID string) error
+}
+
+type SubscriptionRepository interface {
+	CreateSubscription(context.Context, string, *Subscription) error
+	FindOrCreateDynamicSubscription(ctx context.Context, projectID string, subscription *Subscription) (*Subscription, error)
+	UpdateSubscription(ctx context.Context, projectID string, subscription *Subscription) error
+	LoadSubscriptionsPaged(ctx context.Context, projectID string, filter *FilterBy, pageable Pageable) ([]Subscription, PaginationData, error)
+	DeleteSubscription(ctx context.Context, projectID string, subscription *Subscription) error
+	FindSubscriptionByID(ctx context.Context, projectID, id string) (*Subscription, error)
+	FindSubscriptionsBySourceID(ctx context.Context, projectID, sourceID string) ([]Subscription, error)
+	FindSubscriptionsByEndpointID(ctx context.Context, projectId string, endpointID string) ([]Subscription, error)
+	FindCLISubscriptions(ctx context.Context, projectID string) ([]Subscription, error)
+	CountEndpointSubscriptions(context.Context, string, string, string) (int64, error)
+	TestSubscriptionFilter(ctx context.Context, payload, filter interface{}, isFlattened bool) (bool, error)
+	CompareFlattenedPayload(_ context.Context, payload, filter flatten.M, isFlattened bool) (bool, error)
+	LoadAllSubscriptionConfig(ctx context.Context, projectIDs []string, pageSize int64) ([]Subscription, error)
+	FetchDeletedSubscriptions(ctx context.Context, projectIDs []string, subscriptionUpdates []SubscriptionUpdate, pageSize int64) ([]Subscription, error)
+	FetchUpdatedSubscriptions(ctx context.Context, projectIDs []string, subscriptionUpdates []SubscriptionUpdate, pageSize int64) ([]Subscription, error)
+	FetchNewSubscriptions(ctx context.Context, projectIDs []string, knownSubscriptionIDs []string, lastSyncTime time.Time, pageSize int64) ([]Subscription, error)
+}
+
+type FilterRepository interface {
+	CreateFilter(ctx context.Context, filter *EventTypeFilter) error
+	CreateFilters(ctx context.Context, filters []EventTypeFilter) error
+	UpdateFilter(ctx context.Context, filter *EventTypeFilter) error
+	UpdateFilters(ctx context.Context, filters []EventTypeFilter) error
+	DeleteFilter(ctx context.Context, filterID string) error
+	FindFilterByID(ctx context.Context, filterID string) (*EventTypeFilter, error)
+	FindFiltersBySubscriptionID(ctx context.Context, subscriptionID string) ([]EventTypeFilter, error)
+	FindFilterBySubscriptionAndEventType(ctx context.Context, subscriptionID, eventType string) (*EventTypeFilter, error)
+	TestFilter(ctx context.Context, subscriptionID, eventType string, payload interface{}) (bool, error)
+}
+
+type SourceRepository interface {
+	CreateSource(context.Context, *Source) error
+	UpdateSource(ctx context.Context, projectId string, source *Source) error
+	FindSourceByID(ctx context.Context, projectId string, id string) (*Source, error)
+	FindSourceByName(ctx context.Context, projectId string, name string) (*Source, error)
+	FindSourceByMaskID(ctx context.Context, maskId string) (*Source, error)
+	DeleteSourceByID(ctx context.Context, projectId string, id string, sourceVerifierId string) error
+	LoadSourcesPaged(ctx context.Context, projectId string, filter *SourceFilter, pageable Pageable) ([]Source, PaginationData, error)
+	LoadPubSubSourcesByProjectIDs(ctx context.Context, projectIds []string, pageable Pageable) ([]Source, PaginationData, error)
+}
+
+type JobRepository interface {
+	CreateJob(ctx context.Context, job *Job) error
+	MarkJobAsStarted(ctx context.Context, uid, projectID string) error
+	MarkJobAsCompleted(ctx context.Context, uid, projectID string) error
+	MarkJobAsFailed(ctx context.Context, uid, projectID string) error
+	DeleteJob(ctx context.Context, uid string, projectID string) error
+	FetchJobById(ctx context.Context, uid string, projectID string) (*Job, error)
+	FetchRunningJobsByProjectId(ctx context.Context, projectID string) ([]Job, error)
+	FetchJobsByProjectId(ctx context.Context, projectID string) ([]Job, error)
+	LoadJobsPaged(ctx context.Context, projectID string, pageable Pageable) ([]Job, PaginationData, error)
+}
+
+type UserRepository interface {
+	CreateUser(context.Context, *User) error
+	UpdateUser(ctx context.Context, user *User) error
+	// RotateEmailVerificationToken updates token fields only while email_verified
+	// is still false. 0 rows means the account verified concurrently.
+	RotateEmailVerificationToken(ctx context.Context, userID, token string, expiresAt time.Time) error
+	CountUsers(ctx context.Context) (int64, error)
+	FindUserByEmail(context.Context, string) (*User, error)
+	FindUserByID(context.Context, string) (*User, error)
+	FindUserByToken(context.Context, string) (*User, error)
+	FindUserByEmailVerificationToken(ctx context.Context, token string) (*User, error)
+}
+
+type ConfigurationRepository interface {
+	CreateConfiguration(context.Context, *Configuration) error
+	LoadConfiguration(context.Context) (*Configuration, error)
+	UpdateConfiguration(context.Context, *Configuration) error
+}
+
+type MetaEventRepository interface {
+	CreateMetaEvent(context.Context, *MetaEvent) error
+	FindMetaEventByID(ctx context.Context, projectID string, id string) (*MetaEvent, error)
+	LoadMetaEventsPaged(ctx context.Context, projectID string, f *Filter) ([]MetaEvent, PaginationData, error)
+	UpdateMetaEvent(ctx context.Context, projectID string, metaEvent *MetaEvent) error
+}
+
+type ExportRepository interface {
+	ExportRecords(ctx context.Context, start, end time.Time, w io.Writer) (int64, error)
+}
+
+type DeliveryAttemptsRepository interface {
+	ExportRepository
+	CreateDeliveryAttempt(context.Context, *DeliveryAttempt) error
+	FindDeliveryAttemptById(context.Context, string, string) (*DeliveryAttempt, error)
+	FindDeliveryAttempts(context.Context, string) ([]DeliveryAttempt, error)
+	GetFailureAndSuccessCounts(ctx context.Context, lookBackDuration uint64, resetTimes map[string]time.Time) (resultsMap map[string]circuit_breaker.PollResult, err error)
+	PartitionDeliveryAttemptsTable(ctx context.Context) error
+	UnPartitionDeliveryAttemptsTable(ctx context.Context) error
+}
+
+type BackupJobRepository interface {
+	EnqueueBackupJob(ctx context.Context, hourStart, hourEnd time.Time) error
+	EnqueueBackupJobIfIdle(ctx context.Context, start, end time.Time) error
+	ClaimBackupJob(ctx context.Context, agentID string) (*BackupJob, error)
+	CompleteBackupJob(ctx context.Context, jobID string, recordCounts map[string]int64) error
+	FailBackupJob(ctx context.Context, jobID string, errMsg string) error
+	ReclaimStaleJobs(ctx context.Context, staleMinutes int32) (int64, error)
+	DeleteCompletedJobs(ctx context.Context) (int64, error)
+	FindLatestCompletedBackup(ctx context.Context) (*BackupJob, error)
+}
+
+type EventTypesRepository interface {
+	CreateEventType(context.Context, *ProjectEventType) error
+	UpdateEventType(context.Context, *ProjectEventType) error
+	CreateDefaultEventType(ctx context.Context, projectId string) error
+	DeprecateEventType(context.Context, string, string) (*ProjectEventType, error)
+	FetchEventTypeById(context.Context, string, string) (*ProjectEventType, error)
+	FetchEventTypeByName(context.Context, string, string) (*ProjectEventType, error)
+	FetchAllEventTypes(context.Context, string) ([]ProjectEventType, error)
+	CheckEventTypeExists(context.Context, string, string) (bool, error)
+}
+
+type BatchRetryRepository interface {
+	CreateBatchRetry(ctx context.Context, batchRetry *BatchRetry) error
+	UpdateBatchRetry(ctx context.Context, batchRetry *BatchRetry) error
+	FindBatchRetryByID(ctx context.Context, id string) (*BatchRetry, error)
+	FindActiveBatchRetry(ctx context.Context, projectID string) (*BatchRetry, error)
+}
+
+// Filter errors
+var (
+	ErrFilterNotFound  = errors.New("filter not found")
+	ErrDuplicateFilter = errors.New("duplicate filter")
+)

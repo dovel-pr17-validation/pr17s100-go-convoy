@@ -1,0 +1,111 @@
+package listener
+
+import (
+	"context"
+	"time"
+
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/pkg/httpheader"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/services"
+)
+
+type EventDeliveryListener struct {
+	mEvent       *services.MetaEvent
+	attemptsRepo datastore.DeliveryAttemptsRepository
+	logger       log.Logger
+}
+
+type MetaEventDelivery struct {
+	UID            string                `json:"uid"`
+	ProjectID      string                `json:"project_id,omitempty"`
+	EventID        string                `json:"event_id,omitempty"`
+	EndpointID     string                `json:"endpoint_id,omitempty"`
+	DeviceID       string                `json:"device_id"`
+	SubscriptionID string                `json:"subscription_id,omitempty"`
+	Headers        httpheader.HTTPHeader `json:"headers"`
+	URLQueryParams string                `json:"url_query_params"`
+	IdempotencyKey string                `json:"idempotency_key"`
+
+	Endpoint *datastore.Endpoint `json:"endpoint_metadata,omitempty"`
+	Event    *datastore.Event    `json:"event_metadata,omitempty"`
+	Source   *datastore.Source   `json:"source_metadata,omitempty"`
+	Device   *datastore.Device   `json:"device_metadata,omitempty"`
+
+	DeliveryAttempt datastore.DeliveryAttempt     `json:"attempt"`
+	Status          datastore.EventDeliveryStatus `json:"status"`
+	Metadata        *datastore.Metadata           `json:"metadata"`
+	CLIMetadata     *datastore.CLIMetadata        `json:"cli_metadata"`
+	Description     string                        `json:"description,omitempty"`
+	AcknowledgedAt  null.Time                     `json:"acknowledged_at,omitempty"`
+	CreatedAt       time.Time                     `json:"created_at,omitempty"`
+	UpdatedAt       time.Time                     `json:"updated_at,omitempty"`
+	DeletedAt       null.Time                     `json:"deleted_at,omitempty"`
+}
+
+func NewEventDeliveryListener(queue queue.Queuer, projectRepo datastore.ProjectRepository, metaEventRepo datastore.MetaEventRepository, attemptsRepo datastore.DeliveryAttemptsRepository, logger log.Logger) *EventDeliveryListener {
+	mEvent := services.NewMetaEvent(queue, projectRepo, metaEventRepo, logger)
+	return &EventDeliveryListener{mEvent: mEvent, attemptsRepo: attemptsRepo, logger: logger}
+}
+
+func (e *EventDeliveryListener) AfterUpdate(ctx context.Context, data, _ interface{}) {
+	eventDelivery, ok := data.(*datastore.EventDelivery)
+	if !ok {
+		e.logger.Error("invalid type for event - eventdelivery.updated")
+		return
+	}
+
+	var hookType datastore.HookEventType
+	switch eventDelivery.Status {
+	case datastore.SuccessEventStatus:
+		hookType = datastore.EventDeliverySuccess
+	case datastore.FailureEventStatus:
+		hookType = datastore.EventDeliveryFailed
+	case datastore.RetryEventStatus:
+		hookType = datastore.EventDeliveryRetrying
+	default:
+		return
+	}
+
+	mEventDelivery := getMetaEventDelivery(eventDelivery)
+	attempts, err := e.attemptsRepo.FindDeliveryAttempts(ctx, mEventDelivery.UID)
+	if err != nil {
+		e.logger.Error("event delivery meta event failed", "error", err)
+	}
+
+	if len(attempts) > 0 {
+		mEventDelivery.DeliveryAttempt = attempts[len(attempts)-1]
+	}
+
+	if err = e.mEvent.Run(ctx, string(hookType), eventDelivery.ProjectID, mEventDelivery); err != nil {
+		e.logger.Error("event delivery meta event failed", "error", err)
+	}
+}
+
+func getMetaEventDelivery(eventDelivery *datastore.EventDelivery) *MetaEventDelivery {
+	return &MetaEventDelivery{
+		UID:            eventDelivery.UID,
+		ProjectID:      eventDelivery.ProjectID,
+		EventID:        eventDelivery.EventID,
+		EndpointID:     eventDelivery.EndpointID,
+		DeviceID:       eventDelivery.DeviceID,
+		SubscriptionID: eventDelivery.SubscriptionID,
+		Headers:        eventDelivery.Headers,
+		URLQueryParams: eventDelivery.URLQueryParams,
+		IdempotencyKey: eventDelivery.IdempotencyKey,
+		Endpoint:       eventDelivery.Endpoint,
+		Event:          eventDelivery.Event,
+		Source:         eventDelivery.Source,
+		Device:         eventDelivery.Device,
+		Status:         eventDelivery.Status,
+		Metadata:       eventDelivery.Metadata,
+		CLIMetadata:    eventDelivery.CLIMetadata,
+		Description:    eventDelivery.Description,
+		AcknowledgedAt: eventDelivery.AcknowledgedAt,
+		CreatedAt:      eventDelivery.CreatedAt,
+		UpdatedAt:      eventDelivery.UpdatedAt,
+	}
+}

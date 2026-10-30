@@ -1,0 +1,90 @@
+package cli
+
+import (
+	"github.com/redis/go-redis/v9"
+	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/trace"
+
+	flag "github.com/spf13/pflag"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/frain-dev/convoy/cache"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/internal/pkg/broker"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/limiter"
+	"github.com/frain-dev/convoy/internal/pkg/tracer"
+	"github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/queue"
+)
+
+// App is the core dependency of the entire binary.
+type App struct {
+	Version  string
+	DB       database.Database
+	Redis    redis.UniversalClient
+	Queue    queue.Queuer
+	Logger   logger.Logger
+	Cache    cache.Cache
+	Rate     limiter.RateLimiter
+	Licenser license.Licenser
+	Broker   *broker.Dependencies
+
+	TracerBackend tracer.Backend
+
+	// JobTracker is an optional field used only in E2E tests
+	// to capture job IDs for verification
+	JobTracker interface{}
+
+	// SubscriptionLoader is an optional field used only in E2E tests
+	// to trigger manual subscription syncs for broadcast tests
+	SubscriptionLoader interface{}
+
+	// SubscriptionTable is an optional field used only in E2E tests
+	// to trigger manual subscription syncs for broadcast tests
+	SubscriptionTable interface{}
+}
+
+type ConvoyCli struct {
+	cmd *cobra.Command
+}
+
+// TracerProvider returns the trace.TracerProvider for span creation. Always
+// returns a non-nil provider; if the tracer backend has not been initialised
+// (e.g. early in startup or in tests) it returns a no-op provider.
+func (a *App) TracerProvider() trace.TracerProvider {
+	if a == nil || a.TracerBackend == nil {
+		return tracenoop.NewTracerProvider()
+	}
+	return a.TracerBackend.TracerProvider()
+}
+
+func NewCli(app *App) *ConvoyCli {
+	cmd := &cobra.Command{
+		Use:     "Convoy",
+		Version: app.Version,
+		Short:   "High Performance Webhooks Gateway",
+	}
+
+	return &ConvoyCli{cmd: cmd}
+}
+
+func (c *ConvoyCli) Flags() *flag.FlagSet {
+	return c.cmd.PersistentFlags()
+}
+
+func (c *ConvoyCli) PersistentPreRunE(fn func(*cobra.Command, []string) error) {
+	c.cmd.PersistentPreRunE = fn
+}
+
+func (c *ConvoyCli) PersistentPostRunE(fn func(*cobra.Command, []string) error) {
+	c.cmd.PersistentPostRunE = fn
+}
+
+func (c *ConvoyCli) AddCommand(subCmd *cobra.Command) {
+	c.cmd.AddCommand(subCmd)
+}
+
+func (c *ConvoyCli) Execute() error {
+	return c.cmd.Execute()
+}

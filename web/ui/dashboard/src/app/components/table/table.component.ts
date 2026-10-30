@@ -1,0 +1,84 @@
+import {Component, Directive, Input, OnInit} from '@angular/core';
+
+
+@Directive({
+	selector: 'convoy-table, [convoy-table]',
+	standalone: true,
+	host: { class: 'w-full h-fit text-new.text-secondary font-body', id: 'table' }
+})
+export class TableComponent implements OnInit {
+	constructor() {}
+
+	ngOnInit(): void {}
+}
+
+/* ============== Table Cell ============== */
+@Component({
+    selector: 'convoy-table-cell, [convoy-table-cell]',
+    imports: [],
+    host: { class: 'p-0 ' },
+    template: `
+		<div [class]="forDate ? 'pt-16px pl-16px pb-8px text-new.text-secondary' : 'pt-12px pb-12px whitespace-nowrap text-new.text-primary'" class="flex flex-row items-center text-12 font-normal font-body">
+			<ng-content></ng-content>
+		</div>
+	`
+})
+export class TableCellComponent implements OnInit {
+	@Input('forDate') forDate: boolean = false;
+
+	constructor() {}
+
+	ngOnInit(): void {}
+}
+
+/* ============== Table Head ============== */
+@Component({
+    selector: 'convoy-table-head, [convoy-table-head]',
+    imports: [],
+    host: { class: '' },
+    template: `
+		<tr>
+			<ng-content></ng-content>
+		</tr>
+	`
+})
+export class TableHeadComponent implements OnInit {
+	@Input('className') class!: string;
+
+	constructor() {}
+
+	ngOnInit(): void {}
+}
+
+/* ============== Table Head Cell ============== */
+@Directive({
+	selector: 'convoy-table-head-cell, [convoy-table-head-cell]',
+	standalone: true,
+	host: { class: 'text-left whitespace-nowrap pt-10px pb-10px font-medium text-12 uppercase font-body text-new.text-secondary', scope: 'col' }
+})
+export class TableHeadCellComponent implements OnInit {
+	@Input('className') class!: string;
+
+	constructor() {}
+
+	ngOnInit(): void {}
+}
+
+/* ============== Table Row ============== */
+@Directive({
+	selector: 'convoy-table-row, [convoy-table-row]',
+	standalone: true,
+	host: { '[class]': 'getClassNames' }
+})
+export class TableRowComponent implements OnInit {
+	@Input('forDate') forDate: boolean = false;
+	@Input('active') active: boolean = false;
+
+	constructor() {}
+
+	ngOnInit(): void {}
+
+	get getClassNames() {
+		return `${this.forDate ? 'border-t border-new.primary-25 ' : 'hover:bg-new.primary-25 transition-all duration-300'} ${this.active ? 'bg-new.primary-25' : ''}`;
+	}
+}

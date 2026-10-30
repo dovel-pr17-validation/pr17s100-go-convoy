@@ -1,0 +1,158 @@
+@use './scss/font' as *;
+
+@use './scss/forms' as *;
+@use './scss/auth' as *;
+@use './scss/prism' as *;
+@use './scss/material-design-reset' as *;
+@use 'prismjs/plugins/toolbar/prism-toolbar.css' as *;
+@use '@radix-ui/colors/gray.css' as *;
+@use '@radix-ui/colors/gray-alpha.css' as *;
+@use '@radix-ui/colors/gray-dark.css' as *;
+@use '@radix-ui/colors/gray-dark-alpha.css' as *;
+@use '@radix-ui/colors/green.css' as *;
+@use '@radix-ui/colors/green-alpha.css' as *;
+@use '@radix-ui/colors/green-dark.css' as *;
+@use '@radix-ui/colors/green-dark-alpha.css' as *;
+@use '@radix-ui/colors/red.css' as *;
+@use '@radix-ui/colors/red-alpha.css' as *;
+@use '@radix-ui/colors/red-dark.css' as *;
+@use '@radix-ui/colors/red-dark-alpha.css' as *;
+@use '@radix-ui/colors/amber.css' as *;
+@use '@radix-ui/colors/amber-alpha.css' as *;
+@use '@radix-ui/colors/amber-dark.css' as *;
+@use '@radix-ui/colors/amber-dark-alpha.css' as *;
+
+@tailwind base;
+
+/* Firefox */
+* {
+	scrollbar-width: 5px;
+}
+
+/* Default text color on the root only so utilities like text-white-100 on a
+   parent (primary buttons) can inherit into child spans. A universal * color
+   painted every nested span dark and broke primary CTA labels. */
+body {
+	@apply text-neutral-12;
+}
+
+/* Chrome, Edge, and Safari */
+*::-webkit-scrollbar {
+	width: 5px;
+	height: 5px;
+}
+
+*::-webkit-scrollbar-track {
+	border-radius: 5px;
+}
+
+*::-webkit-scrollbar-thumb {
+	border-radius: 14px;
+	@apply bg-neutral-4;
+}
+
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+	:root {
+		--color-white: 255, 255, 255;
+	}
+
+	/* System-wide font rendering improvements */
+	* {
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+		text-rendering: optimizeLegibility;
+	}
+
+	/* Ensure consistent font rendering for all text elements */
+	body, html {
+		font-family: 'Open Sauce Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+		text-rendering: optimizeLegibility;
+	}
+
+	/* Apply font family to common text elements without overriding sizes */
+	/* Exclude Monaco Editor and code elements - they should use monospace fonts */
+	p, span, div, h1, h2, h3, h4, h5, h6, a, button, input, textarea, select, label, td, th, li {
+		font-family: 'Open Sauce Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+	}
+
+	/* 2026 UI refresh fonts: must out-specify the legacy Open Sauce Sans rule above */
+	.font-heading, .font-heading * {
+		font-family: 'Pretendard Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+	}
+	.font-body, .font-body *,
+	.auth-input, .auth-label {
+		font-family: 'Archivo', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+	}
+
+	/* Monaco Editor should use monospace fonts, not Open Sauce Sans */
+	.monaco-editor,
+	.monaco-editor * {
+		font-family: 'Menlo Regular', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace !important;
+	}
+
+	h1 {
+		@apply text-h1;
+	}
+	h2 {
+		@apply text-h2;
+	}
+	h3 {
+		@apply text-h3;
+	}
+	h4 {
+		@apply text-h4;
+	}
+
+	dialog:modal {
+		@apply max-w-full max-h-full;
+	}
+
+	.no-scrollbar::-webkit-scrollbar {
+		@apply hidden;
+	}
+	.no-scrollbar {
+		scrollbar-width: none;
+	}
+	.no-scrollbar {
+		-ms-overflow-style: none;
+	}
+
+	.docs {
+		article {
+			h3 {
+				@apply text-h3 font-semibold mb-8px;
+			}
+			p {
+				@apply mb-24px text-14 text-neutral-11;
+			}
+
+			code {
+				@apply bg-neutral-a3 rounded-4px py-2px px-8px my-0 mx-[1px] text-12 font-menlo text-black border border-none;
+			}
+
+			pre {
+				@apply rounded-8px font-normal px-16px py-20px bg-[#F3F3F8] mb-22px font-menlo text-14 whitespace-pre overflow-auto text-neutral-11;
+			}
+		}
+	}
+
+	.disabled {
+		@apply opacity-50 pointer-events-none;
+	}
+
+	.billing-section-title {
+      color: var(--Zinc-600, #52525B);
+      font-family: 'Open Sauce Sans', Arial, sans-serif;
+      font-size: 14px;
+      font-style: normal;
+      font-weight: 400;
+      line-height: 20px;
+      align-self: stretch;
+      margin-bottom: 16px;
+	}
+}

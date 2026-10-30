@@ -1,0 +1,107 @@
+@if (showPicker) {
+  <div convoyOverlay (click)="showPicker = false"></div>
+}
+<div class="relative">
+  <button type="button" class="flex items-center px-10px justify-between h-36px min-w-[117px] border border-new.border rounded-8px font-body text-[14px] text-new.text-primary bg-white-100 transition-colors hover:bg-new.surface-muted" [ngClass]="{ '!border-new.primary-400 !bg-new.surface-muted': filterIsActive() }" (click)="showPicker = !showPicker">
+    <img src="assets/img/clock.svg" class="mr-10px w-14px" alt="time filter icon" />
+    <span class="font-body text-new.text-secondary mr-4px">Time</span>
+    @if (!filterIsActive()) {
+      <img class="ml-16px mr-0px w-14px" src="/assets/img/angle-arrow-down.svg" alt="arrow down icon" />
+    }
+
+    @if (filterIsActive()) {
+      <button type="button" (click)="clearFilter($event)" class="ml-16px">
+        <svg width="10" height="10" class="fill-new.primary-400">
+          <use xlink:href="#close-icon"></use>
+        </svg>
+      </button>
+    }
+  </button>
+
+  <div convoy-dropdown-container position="left" [show]="showPicker" class="p-10px !w-fit">
+    <div class="px-10px">
+      <label class="font-body text-[12px] text-new.text-secondary">Start</label>
+      <div class="flex items-center mb-20px">
+        <input
+          type="number"
+          [(ngModel)]="filterStartHour"
+          pattern="[0-9]*"
+          maxlength="2"
+          id="startTimeHour"
+          (input)="validateTime('startTimeHour')"
+          class="border border-new.border rounded-4px text-16 font-body text-new.text-primary text-center focus:border-new.primary-400 outline-none w-80px"
+          />
+        <span class="mx-6px text-new.text-secondary">:</span>
+        <input
+          type="number"
+          [(ngModel)]="filterStartMinute"
+          pattern="[0-9]*"
+          maxlength="2"
+          id="startTimeMinute"
+          (input)="validateTime('startTimeMinute')"
+          class="border border-new.border bg-new.surface-muted rounded-4px text-16 font-body text-new.text-primary text-center focus:border-new.primary-400 outline-none w-80px"
+          />
+        <div class="flex border border-new.border rounded-4px ml-10px">
+          <button
+            type="button"
+            class="py-4px px-10px text-10 font-body rounded-bl-4px rounded-tl-4px transition-colors"
+            (click)="filterStartHour = filterStartHour - 12 < 0 ? filterStartHour : filterStartHour - 12"
+            [ngClass]="{ 'bg-new.primary-400 text-white-100': filterStartHour < 12, 'text-new.text-secondary': filterStartHour >= 12 }"
+            >
+            AM
+          </button>
+          <button
+            type="button"
+            class="py-4px px-10px text-10 font-body rounded-br-4px rounded-tr-4px transition-colors"
+            (click)="filterStartHour = filterStartHour + 12 > 24 ? filterStartHour : filterStartHour + 12"
+            [ngClass]="{ 'bg-new.primary-400 text-white-100': filterStartHour >= 12, 'text-new.text-secondary': filterStartHour < 12 }"
+            >
+            PM
+          </button>
+        </div>
+      </div>
+
+      <label class="font-body text-[12px] text-new.text-secondary">End</label>
+      <div class="flex items-center mb-20px">
+        <input
+          type="number"
+          [(ngModel)]="filterEndHour"
+          pattern="[0-9]*"
+          maxlength="2"
+          id="endTimeHour"
+          (input)="validateTime('endTimeHour')"
+          class="border border-new.border rounded-4px text-16 font-body text-new.text-primary text-center focus:border-new.primary-400 outline-none w-80px"
+          />
+        <span class="mx-6px text-new.text-secondary">:</span>
+        <input
+          type="number"
+          [(ngModel)]="filterEndMinute"
+          pattern="[0-9]*"
+          maxlength="2"
+          id="endTimeMinute"
+          (input)="validateTime('endTimeMinute')"
+          class="border border-new.border bg-new.surface-muted rounded-4px text-16 font-body text-new.text-primary text-center focus:border-new.primary-400 outline-none w-80px"
+          />
+        <div class="flex border border-new.border rounded-4px ml-10px">
+          <button type="button" class="py-4px px-10px text-10 font-body rounded-bl-4px rounded-tl-4px transition-colors" (click)="filterEndHour = filterEndHour - 12 < 0 ? filterEndHour : filterEndHour - 12" [ngClass]="{ 'bg-new.primary-400 text-white-100': filterEndHour < 12, 'text-new.text-secondary': filterEndHour >= 12 }">
+            AM
+          </button>
+          <button
+            type="button"
+            class="py-4px px-10px text-10 font-body rounded-br-4px rounded-tr-4px transition-colors"
+            (click)="filterEndHour = filterEndHour + 12 > 24 ? filterEndHour : filterEndHour + 12"
+            [ngClass]="{ 'bg-new.primary-400 text-white-100': filterEndHour >= 12, 'text-new.text-secondary': filterEndHour < 12 }"
+            >
+            PM
+          </button>
+        </div>
+      </div>
+      <div class="mb-20px flex items-center justify-end gap-8px">
+        @if (filterIsActive()) {
+          <button type="button" class="px-12px py-6px rounded-full font-body font-medium text-[12px] text-new.error-500 transition-colors hover:bg-new.surface-muted" (click)="clearFilter()">Clear</button>
+        }
+        <button type="button" class="px-12px py-6px rounded-full bg-new.primary-400 font-body font-medium text-[12px] text-white-100 transition-all hover:opacity-90" (click)="onApplyFilter()">Apply</button>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,299 @@
+package fflag
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"text/tabwriter"
+)
+
+var ErrCircuitBreakerNotEnabled = errors.New("[feature flag] circuit breaker is not enabled")
+var ErrFullTextSearchNotEnabled = errors.New("[feature flag] full text search is not enabled")
+var ErrPrometheusMetricsNotEnabled = errors.New("[feature flag] prometheus metrics is not enabled")
+var ErrPostgresQueueNotEnabled = errors.New("[feature flag] postgres queue is not enabled")
+var ErrCredentialEncryptionNotEnabled = errors.New("[feature flag] credential encryption is not enabled")
+var ErrMTLSNotEnabled = errors.New("[feature flag] mTLS is not enabled")
+var ErrOAuthTokenExchangeNotEnabled = errors.New("[feature flag] OAuth token exchange is not enabled")
+var ErrEndpointURLTemplatesNotEnabled = errors.New("[feature flag] endpoint URL templates is not enabled")
+
+// ErrEarlyAdopterFeatureNotFound reports that an organisation has no row for an
+// early adopter feature. Fetchers must return this (or wrap it) so callers can
+// tell "the org never enabled this" apart from "the lookup itself failed".
+var ErrEarlyAdopterFeatureNotFound = errors.New("[feature flag] early adopter feature not found")
+
+type (
+	FeatureFlagKey string
+)
+
+const (
+	IpRules              FeatureFlagKey = "ip-rules"
+	Prometheus           FeatureFlagKey = "prometheus"
+	PostgresQueue        FeatureFlagKey = "postgres-queue"
+	CircuitBreaker       FeatureFlagKey = "circuit-breaker"
+	FullTextSearch       FeatureFlagKey = "full-text-search"
+	ReadReplicas         FeatureFlagKey = "read-replicas"
+	CredentialEncryption FeatureFlagKey = "credential-encryption"
+	MTLS                 FeatureFlagKey = "mtls"
+	OAuthTokenExchange   FeatureFlagKey = "oauth-token-exchange"
+	BasicAuthEndpoint    FeatureFlagKey = "basic-auth-endpoint"
+	EndpointURLTemplates FeatureFlagKey = "endpoint-url-templates"
+)
+
+type (
+	FeatureFlagState bool
+)
+
+const (
+	enabled  FeatureFlagState = true
+	disabled FeatureFlagState = false
+)
+
+var DefaultFeaturesState = map[FeatureFlagKey]FeatureFlagState{
+	IpRules:              disabled,
+	Prometheus:           disabled,
+	PostgresQueue:        disabled,
+	FullTextSearch:       disabled,
+	CircuitBreaker:       disabled,
+	ReadReplicas:         disabled,
+	CredentialEncryption: disabled,
+	MTLS:                 disabled,
+	OAuthTokenExchange:   disabled,
+	BasicAuthEndpoint:    disabled,
+	EndpointURLTemplates: disabled,
+}
+
+type FFlag struct {
+	Features map[FeatureFlagKey]FeatureFlagState
+}
+
+func NewFFlag(enableFeatureFlags []string) *FFlag {
+	f := &FFlag{
+		Features: clone(DefaultFeaturesState),
+	}
+
+	for _, flag := range enableFeatureFlags {
+		switch flag {
+		case string(IpRules):
+			f.Features[IpRules] = enabled
+		case string(Prometheus):
+			f.Features[Prometheus] = enabled
+		case string(PostgresQueue):
+			f.Features[PostgresQueue] = enabled
+		case string(FullTextSearch):
+			f.Features[FullTextSearch] = enabled
+		case string(CircuitBreaker):
+			f.Features[CircuitBreaker] = enabled
+		case string(ReadReplicas):
+			f.Features[ReadReplicas] = enabled
+		case string(CredentialEncryption):
+			f.Features[CredentialEncryption] = enabled
+		case string(MTLS):
+			f.Features[MTLS] = enabled
+		case string(OAuthTokenExchange):
+			f.Features[OAuthTokenExchange] = enabled
+		case string(BasicAuthEndpoint):
+			f.Features[BasicAuthEndpoint] = enabled
+		case string(EndpointURLTemplates):
+			f.Features[EndpointURLTemplates] = enabled
+		}
+	}
+
+	return f
+}
+
+func NoopFflag() *FFlag {
+	return &FFlag{
+		Features: clone(DefaultFeaturesState),
+	}
+}
+
+func clone(src map[FeatureFlagKey]FeatureFlagState) map[FeatureFlagKey]FeatureFlagState {
+	dst := make(map[FeatureFlagKey]FeatureFlagState)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// CanAccessFeature checks if a system-wide feature is enabled
+// This only checks system-wide configuration (CLI/environment variables)
+// For org-level feature flags, use CanAccessOrgFeature instead
+func (c *FFlag) CanAccessFeature(key FeatureFlagKey) bool {
+	state, ok := c.Features[key]
+	if !ok {
+		return false
+	}
+
+	return bool(state)
+}
+
+func (c *FFlag) CanAccessOrgFeature(ctx context.Context, key FeatureFlagKey, fetcher FeatureFlagFetcher, earlyAdopterFetcher EarlyAdopterFeatureFetcher, orgID string) bool {
+	if key == Prometheus || key == PostgresQueue || key == ReadReplicas || key == IpRules || key == FullTextSearch {
+		return c.CanAccessFeature(key)
+	}
+
+	if IsEarlyAdopterFeature(key) {
+		if earlyAdopterFetcher == nil {
+			return c.CanAccessFeature(key)
+		}
+
+		enabled, err := ResolveEarlyAdopterFeature(ctx, key, earlyAdopterFetcher, orgID)
+		if err != nil {
+			// Fail closed: a lookup we could not complete must not grant access.
+			// Callers that can retry should use ResolveEarlyAdopterFeature directly.
+			return false
+		}
+		return enabled
+	}
+	if fetcher == nil {
+		return c.CanAccessFeature(key)
+	}
+
+	flagInfo, err := fetcher.FetchFeatureFlag(ctx, string(key))
+	if err != nil {
+		return c.CanAccessFeature(key)
+	}
+
+	// Check for org override
+	overrideInfo, _ := fetcher.FetchFeatureFlagOverride(ctx, "organisation", orgID, flagInfo.UID)
+
+	data := &FeatureFlagData{
+		FeatureFlag: flagInfo,
+		Override:    overrideInfo,
+	}
+
+	return CanAccessFeatureWithOrg(c, key, data)
+}
+
+// FeatureFlagData contains the feature flag and optional override data
+type FeatureFlagData struct {
+	FeatureFlag *FeatureFlagInfo
+	Override    *FeatureFlagOverrideInfo
+}
+
+// FeatureFlagInfo contains feature flag information from the database
+type FeatureFlagInfo struct {
+	UID     string
+	Enabled bool
+}
+
+// FeatureFlagOverrideInfo contains override information from the database
+type FeatureFlagOverrideInfo struct {
+	Enabled bool
+}
+
+// FeatureFlagFetcher is an interface for fetching system-controlled org feature flags from the database
+type FeatureFlagFetcher interface {
+	FetchFeatureFlag(ctx context.Context, key string) (*FeatureFlagInfo, error)
+	FetchFeatureFlagOverride(ctx context.Context, ownerType, ownerID, featureFlagID string) (*FeatureFlagOverrideInfo, error)
+	// AnyEnabledOverride reports whether any owner has an enabled override for the
+	// given feature flag id. Used to decide whether instance-wide background work
+	// (e.g. the circuit breaker sampler) must run even when the instance default is off.
+	AnyEnabledOverride(ctx context.Context, featureFlagID string) (bool, error)
+}
+
+// EarlyAdopterFeatureInfo contains early adopter feature information from the database
+type EarlyAdopterFeatureInfo struct {
+	Enabled bool
+}
+
+// EarlyAdopterFeatureFetcher is an interface for fetching early adopter features from the database
+type EarlyAdopterFeatureFetcher interface {
+	FetchEarlyAdopterFeature(ctx context.Context, orgID, featureKey string) (*EarlyAdopterFeatureInfo, error)
+}
+
+// ResolveEarlyAdopterFeature reports whether an early adopter feature is enabled
+// for an organisation.
+//
+// The read is deliberately three-valued. An organisation with no row has simply
+// never enabled the feature, so that is a definitive "off" and returns
+// (false, nil), identical to a row with enabled = false. Only a genuine lookup
+// failure returns an error, letting async callers retry instead of acting on a
+// verdict the database never gave. Every caller must resolve the feature through
+// here so the sync and async paths cannot disagree about what a missing row means.
+func ResolveEarlyAdopterFeature(ctx context.Context, key FeatureFlagKey, earlyAdopterFetcher EarlyAdopterFeatureFetcher, orgID string) (bool, error) {
+	feature, err := earlyAdopterFetcher.FetchEarlyAdopterFeature(ctx, orgID, string(key))
+	if err != nil {
+		if errors.Is(err, ErrEarlyAdopterFeatureNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if feature == nil {
+		return false, nil
+	}
+
+	return feature.Enabled, nil
+}
+
+func CanAccessFeatureWithOrg(systemFFlag *FFlag, key FeatureFlagKey, data *FeatureFlagData) bool {
+	if data == nil || data.FeatureFlag == nil {
+		state, ok := systemFFlag.Features[key]
+		if !ok {
+			return false
+		}
+		return bool(state)
+	}
+
+	if data.Override != nil {
+		return data.Override.Enabled
+	}
+
+	return data.FeatureFlag.Enabled
+}
+
+// EarlyAdopterFeatures defines which features are available under Early Adopter program
+var EarlyAdopterFeatures = []FeatureFlagKey{
+	MTLS,
+	OAuthTokenExchange,
+	BasicAuthEndpoint,
+	EndpointURLTemplates,
+}
+
+// GetEarlyAdopterFeatures returns the list of features available under Early Adopter
+func GetEarlyAdopterFeatures() []FeatureFlagKey {
+	return EarlyAdopterFeatures
+}
+
+// IsEarlyAdopterFeature checks if a feature is part of the Early Adopter program
+func IsEarlyAdopterFeature(key FeatureFlagKey) bool {
+	for _, feature := range EarlyAdopterFeatures {
+		if feature == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *FFlag) ListFeatures() error {
+	keys := make([]string, 0, len(c.Features))
+
+	for k := range c.Features {
+		keys = append(keys, string(k))
+	}
+	sort.Strings(keys)
+
+	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
+	_, err := fmt.Fprintln(w, "Features\tState")
+	if err != nil {
+		return err
+	}
+
+	for _, k := range keys {
+		stateBool := c.Features[FeatureFlagKey(k)]
+		state := "disabled"
+		if stateBool {
+			state = "enabled"
+		}
+
+		_, err = fmt.Fprintf(w, "%s\t%s\n", k, state)
+		if err != nil {
+			return err
+		}
+	}
+
+	return w.Flush()
+}

@@ -1,0 +1,151 @@
+package google
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	//nolint:staticcheck // SA1019: cloud.google.com/go/pubsub deprecated; we don't want to use v2 yet
+	"cloud.google.com/go/pubsub"
+	"google.golang.org/api/option"
+
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/limiter"
+	"github.com/frain-dev/convoy/internal/pkg/metrics"
+	common "github.com/frain-dev/convoy/internal/pkg/pubsub/const"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+)
+
+var ErrInvalidCredentials = errors.New("your google pub/sub credentials are invalid. please verify you're providing the correct credentials")
+
+type Google struct {
+	Cfg         *datastore.GooglePubSubConfig
+	source      *datastore.Source
+	workers     int
+	ctx         context.Context
+	handler     datastore.PubSubHandler
+	log         log.Logger
+	rateLimiter limiter.RateLimiter
+	licenser    license.Licenser
+}
+
+func New(source *datastore.Source, handler datastore.PubSubHandler, log log.Logger, rateLimiter limiter.RateLimiter, licenser license.Licenser) *Google {
+	return &Google{
+		Cfg:         source.PubSub.Google,
+		source:      source,
+		workers:     source.PubSub.Workers,
+		handler:     handler,
+		log:         log,
+		rateLimiter: rateLimiter,
+		licenser:    licenser,
+	}
+}
+
+func (g *Google) Start(ctx context.Context) {
+	g.ctx = ctx
+	if g.workers > 0 {
+		go g.consume()
+	}
+}
+
+// Verify ensures the pub sub credentials are valid
+func (g *Google) Verify() error {
+	ctx := context.Background()
+
+	// The SDK automatically detects PUBSUB_EMULATOR_HOST and disables authentication when set
+	client, err := pubsub.NewClient(ctx, g.Cfg.ProjectID, option.WithCredentialsJSON(g.Cfg.ServiceAccount))
+	if err != nil {
+		g.log.Error("failed to create new Google PubSub client", "error", err)
+		return ErrInvalidCredentials
+	}
+
+	defer g.handleError(client)
+
+	exists, err := client.Subscription(g.Cfg.SubscriptionID).Exists(ctx)
+	if err != nil {
+		g.log.Error("failed to find subscription", "error", err)
+		return ErrInvalidCredentials
+	}
+
+	if !exists {
+		return fmt.Errorf("subscription ID with name %s does not exist", g.Cfg.SubscriptionID)
+	}
+
+	return nil
+}
+
+func (g *Google) consume() {
+	// The SDK automatically detects PUBSUB_EMULATOR_HOST and disables authentication when set
+	client, err := pubsub.NewClient(g.ctx, g.Cfg.ProjectID, option.WithCredentialsJSON(g.Cfg.ServiceAccount))
+	if err != nil {
+		g.log.Error("failed to create new Google PubSub client", "error", err)
+		return
+	}
+
+	if client == nil {
+		g.log.Error("Pub/Sub client is nil")
+		return
+	}
+
+	defer g.handleError(client)
+
+	g.log.Infof("Successfully created Pub/Sub client, getting subscription: %s", g.Cfg.SubscriptionID)
+	sub := client.Subscription(g.Cfg.SubscriptionID)
+
+	// NumGoroutines determines the number of goroutines sub.Receive will spawn to pull messages
+	sub.ReceiveSettings.NumGoroutines = g.workers
+
+	err = sub.Receive(g.ctx, func(ctx context.Context, m *pubsub.Message) {
+		if m.Attributes == nil {
+			m.Attributes = map[string]string{}
+		}
+
+		m.Attributes[common.BrokerMessageHeader] = m.ID
+
+		attributes, err := msgpack.EncodeMsgPack(m.Attributes)
+		if err != nil {
+			g.log.Error("failed to marshall message attributes", "error", err)
+			return
+		}
+
+		// Google Pub/Sub sends a slice with a single non UTF-8 value,
+		// looks like this: [192], which can cause a panic when marshaling headers
+		if len(attributes) == 1 && attributes[0] == 192 {
+			emptyMap := map[string]string{}
+			emptyBytes, err := msgpack.EncodeMsgPack(emptyMap)
+			if err != nil {
+				g.log.Error("an error occurred creating an empty attributes map", "error", err)
+				return
+			}
+			attributes = emptyBytes
+		}
+
+		mm := metrics.GetDPInstance(g.licenser)
+		mm.IncrementIngestTotal(g.source.UID, g.source.ProjectID)
+
+		if err := g.handler(ctx, g.source, string(m.Data), attributes); err != nil {
+			g.log.Error("failed to write message to create event queue - google pub sub", "error", err)
+			mm.IncrementIngestErrorsTotal(g.source)
+		} else {
+			m.Ack()
+			mm.IncrementIngestConsumedTotal(g.source)
+		}
+	})
+
+	if err != nil {
+		g.log.Error("subscription receive error - google pub sub", "error", err)
+		return
+	}
+}
+
+func (g *Google) handleError(client *pubsub.Client) {
+	if err := client.Close(); err != nil {
+		g.log.Error("an error occurred while closing the client", "error", err)
+	}
+
+	if err := recover(); err != nil {
+		g.log.Error("google pubsub source crashed", "error", fmt.Errorf("sourceID: %s, Error: %s", g.source.UID, err))
+	}
+}

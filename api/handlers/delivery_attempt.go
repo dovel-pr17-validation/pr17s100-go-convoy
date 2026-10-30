@@ -1,0 +1,112 @@
+package handlers
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/delivery_attempts"
+	"github.com/frain-dev/convoy/internal/pkg/middleware"
+	"github.com/frain-dev/convoy/util"
+)
+
+// GetDeliveryAttempt
+//
+//	@Summary		Retrieve a delivery attempt
+//	@Description	This endpoint fetches an app event delivery attempt
+//	@Tags			Delivery Attempts
+//	@Id				GetDeliveryAttempt
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID			path		string	true	"Project ID"
+//	@Param			eventDeliveryID		path		string	true	"event delivery id"
+//	@Param			deliveryAttemptID	path		string	true	"delivery attempt id"
+//	@Success		200					{object}	util.ServerResponse{data=datastore.DeliveryAttempt}
+//	@Failure		400,401,404			{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/eventdeliveries/{eventDeliveryID}/deliveryattempts/{deliveryAttemptID} [get]
+func (h *Handler) GetDeliveryAttempt(w http.ResponseWriter, r *http.Request) {
+	deliveryAttemptID := chi.URLParam(r, "deliveryAttemptID")
+	eventDelivery, err := h.retrieveEventDelivery(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if !h.ensurePortalLinkOwnsEndpoints(w, r, authUser, eventDelivery.EndpointID) {
+		return
+	}
+
+	showRawHeaders := h.canViewRawHeaders(authUser)
+
+	if len(eventDelivery.DeliveryAttempts) > 0 {
+		deliveryAttempt, deliveryErr := findDeliveryAttempt(eventDelivery.DeliveryAttempts, deliveryAttemptID)
+		if deliveryErr != nil {
+			_ = render.Render(w, r, util.NewServiceErrResponse(deliveryErr))
+			return
+		}
+
+		_ = render.Render(w, r, util.NewServerResponse("Event delivery attempt fetched successfully", models.NewDeliveryAttemptResponse(deliveryAttempt, showRawHeaders), http.StatusOK))
+		return
+	}
+
+	attemptsService := delivery_attempts.New(h.A.Logger, h.A.DB)
+	deliveryAttempt, err := attemptsService.FindDeliveryAttemptById(r.Context(), eventDelivery.UID, deliveryAttemptID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Event delivery attempt fetched successfully", models.NewDeliveryAttemptResponse(deliveryAttempt, showRawHeaders), http.StatusOK))
+}
+
+// GetDeliveryAttempts
+//
+//	@Summary		List delivery attempts
+//	@Description	This endpoint fetches an app message's delivery attempts
+//	@Tags			Delivery Attempts
+//	@Id				GetDeliveryAttempts
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID		path		string	true	"Project ID"
+//	@Param			eventDeliveryID	path		string	true	"event delivery id"
+//	@Success		200				{object}	util.ServerResponse{data=[]datastore.DeliveryAttempt}
+//	@Failure		400,401,404		{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/eventdeliveries/{eventDeliveryID}/deliveryattempts [get]
+func (h *Handler) GetDeliveryAttempts(w http.ResponseWriter, r *http.Request) {
+	eventDelivery, err := h.retrieveEventDelivery(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	authUser := middleware.GetAuthUserFromContext(r.Context())
+	if !h.ensurePortalLinkOwnsEndpoints(w, r, authUser, eventDelivery.EndpointID) {
+		return
+	}
+
+	attemptsService := delivery_attempts.New(h.A.Logger, h.A.DB)
+	attempts, err := attemptsService.FindDeliveryAttempts(r.Context(), eventDelivery.UID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	eventDelivery.DeliveryAttempts = append(eventDelivery.DeliveryAttempts, attempts...)
+
+	_ = render.Render(w, r, util.NewServerResponse("Event delivery attempts fetched successfully", models.NewDeliveryAttemptResponses(eventDelivery.DeliveryAttempts, h.canViewRawHeaders(authUser)), http.StatusOK))
+}
+
+func findDeliveryAttempt(attempts []datastore.DeliveryAttempt, id string) (*datastore.DeliveryAttempt, error) {
+	for _, a := range attempts {
+		if a.UID == id {
+			return &a, nil
+		}
+	}
+	return nil, datastore.ErrDeliveryAttemptNotFound
+}

@@ -1,0 +1,855 @@
+package cached
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/mocks"
+)
+
+// ============================================================================
+// ProjectRepository Tests
+// ============================================================================
+
+func TestCachedProjectRepo_FetchProjectByID_CacheHit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	project := &datastore.Project{UID: "proj-123", Name: "test"}
+	mockCache.EXPECT().Get(gomock.Any(), ProjectCacheKey("proj-123"), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, data interface{}) error {
+			*data.(*datastore.Project) = *project
+			return nil
+		})
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FetchProjectByID(context.Background(), "proj-123")
+	require.NoError(t, err)
+	require.Equal(t, "proj-123", result.UID)
+}
+
+func TestCachedProjectRepo_FetchProjectByID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	project := &datastore.Project{UID: "proj-123"}
+	mockCache.EXPECT().Get(gomock.Any(), ProjectCacheKey("proj-123"), gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FetchProjectByID(gomock.Any(), "proj-123").Return(project, nil)
+	mockCache.EXPECT().Set(gomock.Any(), ProjectCacheKey("proj-123"), project, 5*time.Minute).Return(nil)
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FetchProjectByID(context.Background(), "proj-123")
+	require.NoError(t, err)
+	require.Equal(t, "proj-123", result.UID)
+}
+
+func TestCachedProjectRepo_UpdateProject_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	project := &datastore.Project{UID: "proj-123"}
+	mockRepo.EXPECT().UpdateProject(gomock.Any(), project).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), ProjectCacheKey("proj-123")).Return(nil)
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	require.NoError(t, repo.UpdateProject(context.Background(), project))
+}
+
+func TestCachedProjectRepo_DeleteProject_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	mockRepo.EXPECT().DeleteProject(gomock.Any(), "proj-123").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), ProjectCacheKey("proj-123")).Return(nil)
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	require.NoError(t, repo.DeleteProject(context.Background(), "proj-123"))
+}
+
+// ============================================================================
+// EndpointRepository Tests
+// ============================================================================
+
+func TestCachedEndpointRepo_FindEndpointByID_CacheHit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123", Url: "https://example.com"}
+	mockCache.EXPECT().Get(gomock.Any(), "endpoints:proj-1:ep-123", gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, data interface{}) error {
+			*data.(*datastore.Endpoint) = *ep
+			return nil
+		})
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	result, err := repo.FindEndpointByID(context.Background(), "ep-123", "proj-1")
+	require.NoError(t, err)
+	require.Equal(t, "ep-123", result.UID)
+}
+
+func TestCachedEndpointRepo_FindEndpointByID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123"}
+	mockCache.EXPECT().Get(gomock.Any(), "endpoints:proj-1:ep-123", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindEndpointByID(gomock.Any(), "ep-123", "proj-1").Return(ep, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "endpoints:proj-1:ep-123", ep, 2*time.Minute).Return(nil)
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	result, err := repo.FindEndpointByID(context.Background(), "ep-123", "proj-1")
+	require.NoError(t, err)
+	require.Equal(t, "ep-123", result.UID)
+}
+
+func TestCachedEndpointRepo_UpdateEndpoint_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123", OwnerID: "owner-1"}
+	mockRepo.EXPECT().UpdateEndpoint(gomock.Any(), ep, "proj-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints:proj-1:ep-123").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints_by_owner:proj-1:owner-1").Return(nil)
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	require.NoError(t, repo.UpdateEndpoint(context.Background(), ep, "proj-1"))
+}
+
+func TestCachedEndpointRepo_CreateEndpoint_InvalidatesOwner(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-new", OwnerID: "owner-1"}
+	mockRepo.EXPECT().CreateEndpoint(gomock.Any(), ep, "proj-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints_by_owner:proj-1:owner-1").Return(nil)
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	require.NoError(t, repo.CreateEndpoint(context.Background(), ep, "proj-1"))
+}
+
+// Deleting an endpoint cascade deletes its subscriptions in SQL, below this
+// repository, so the subscription list has to be evicted here or nothing evicts
+// it and the match path keeps routing to a deleted endpoint until the TTL.
+func TestCachedEndpointRepo_DeleteEndpoint_InvalidatesSubscriptionList(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123", OwnerID: "owner-1"}
+	mockRepo.EXPECT().DeleteEndpoint(gomock.Any(), ep, "proj-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints:proj-1:ep-123").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints_by_owner:proj-1:owner-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), SubscriptionsByEndpointCacheKey("proj-1", "ep-123")).Return(nil)
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, DefaultEndpointTTL, logger)
+	require.NoError(t, repo.DeleteEndpoint(context.Background(), ep, "proj-1"))
+}
+
+// Writers read the database, never the cache. UpdateEndpointService and the
+// pause and activate services read the endpoint through this repository and then
+// merge or toggle onto it, so a cached read here would let a stale record become
+// the base of the next write. The mock cache expects no calls at all.
+func TestInvalidatingEndpointRepo_ReadsBypassCache(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	fresh := &datastore.Endpoint{UID: "ep-123", OwnerID: "owner-1"}
+	mockRepo.EXPECT().FindEndpointByID(gomock.Any(), "ep-123", "proj-1").Return(fresh, nil)
+	mockRepo.EXPECT().FindEndpointsByOwnerID(gomock.Any(), "proj-1", "owner-1").Return([]datastore.Endpoint{*fresh}, nil)
+
+	repo := NewInvalidatingEndpointRepository(mockRepo, mockCache, logger)
+
+	got, err := repo.FindEndpointByID(context.Background(), "ep-123", "proj-1")
+	require.NoError(t, err)
+	require.Equal(t, fresh, got)
+
+	owned, err := repo.FindEndpointsByOwnerID(context.Background(), "proj-1", "owner-1")
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+}
+
+// Writers still evict what the delivery path cached.
+func TestInvalidatingEndpointRepo_WritesStillInvalidate(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123", OwnerID: "owner-1"}
+	mockRepo.EXPECT().UpdateEndpoint(gomock.Any(), ep, "proj-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints:proj-1:ep-123").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "endpoints_by_owner:proj-1:owner-1").Return(nil)
+
+	repo := NewInvalidatingEndpointRepository(mockRepo, mockCache, logger)
+	require.NoError(t, repo.UpdateEndpoint(context.Background(), ep, "proj-1"))
+}
+
+// A failed delete must not evict anything; the rows are still there.
+func TestCachedEndpointRepo_DeleteEndpoint_NoInvalidationOnError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockEndpointRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	ep := &datastore.Endpoint{UID: "ep-123", OwnerID: "owner-1"}
+	mockRepo.EXPECT().DeleteEndpoint(gomock.Any(), ep, "proj-1").Return(errors.New("delete failed"))
+
+	repo := NewCachedEndpointRepository(mockRepo, mockCache, DefaultEndpointTTL, logger)
+	require.Error(t, repo.DeleteEndpoint(context.Background(), ep, "proj-1"))
+}
+
+// ============================================================================
+// SubscriptionRepository Tests
+// ============================================================================
+
+func TestCachedSubRepo_FindByEndpointID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	subs := []datastore.Subscription{{UID: "sub-1"}}
+	mockCache.EXPECT().Get(gomock.Any(), "subs_by_endpoint:proj-1:ep-1", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindSubscriptionsByEndpointID(gomock.Any(), "proj-1", "ep-1").Return(subs, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "subs_by_endpoint:proj-1:ep-1", gomock.Any(), 30*time.Second).Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	result, err := repo.FindSubscriptionsByEndpointID(context.Background(), "proj-1", "ep-1")
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+}
+
+func TestCachedSubRepo_CreateSubscription_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1"}
+	mockRepo.EXPECT().CreateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-1").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.CreateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_EmptyEndpointID_SkipsInvalidation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: ""}
+	mockRepo.EXPECT().CreateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	// No Delete expected
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.CreateSubscription(context.Background(), "proj-1", sub))
+}
+
+// cachedSubs populates the unexported slice wrapper cachedrepo stores under a
+// list key, so a Get expectation can simulate a hit from this package.
+func cachedSubs(subs []datastore.Subscription) func(context.Context, string, interface{}) error {
+	return func(_ context.Context, _ string, data interface{}) error {
+		reflect.ValueOf(data).Elem().FieldByName("Items").Set(reflect.ValueOf(subs))
+		return nil
+	}
+}
+
+func TestCachedSubRepo_FindBySourceID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	subs := []datastore.Subscription{{UID: "sub-1", SourceID: "src-1"}}
+	mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindSubscriptionsBySourceID(gomock.Any(), "proj-1", "src-1").Return(subs, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any(), 30*time.Second).Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	result, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+}
+
+func TestCachedSubRepo_FindBySourceID_CacheHit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).
+		DoAndReturn(cachedSubs([]datastore.Subscription{{UID: "sub-cached"}}))
+	// No inner read and no Set on a hit.
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	result, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	require.Equal(t, "sub-cached", result[0].UID)
+}
+
+func TestCachedSubRepo_FindBySourceID_ExpiredEntryRefetches(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// An entry past its TTL presents to the wrapper as a miss, so the second read
+	// must go to the database again and re-cache under the same key and TTL.
+	first := []datastore.Subscription{{UID: "sub-1"}}
+	second := []datastore.Subscription{{UID: "sub-1"}, {UID: "sub-2"}}
+	gomock.InOrder(
+		mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).
+			DoAndReturn(cachedSubs(first)),
+		mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).Return(nil),
+	)
+	mockRepo.EXPECT().FindSubscriptionsBySourceID(gomock.Any(), "proj-1", "src-1").Return(second, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any(), 30*time.Second).Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+
+	warm, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.NoError(t, err)
+	require.Len(t, warm, 1)
+
+	afterExpiry, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.NoError(t, err)
+	require.Len(t, afterExpiry, 2)
+}
+
+func TestCachedSubRepo_FindBySourceID_DBError_NotCached(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindSubscriptionsBySourceID(gomock.Any(), "proj-1", "src-1").
+		Return(nil, errors.New("db error"))
+	// No Set: a failed read must not be cached.
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	result, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.Error(t, err)
+	require.Nil(t, result)
+}
+
+func TestCachedSubRepo_FindBySourceID_CacheUnavailable_FallsThrough(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// Same contract as the endpoint-keyed wrapper: cache errors are logged, never
+	// propagated, and the match path still gets its subscriptions.
+	subs := []datastore.Subscription{{UID: "sub-1"}}
+	mockCache.EXPECT().Get(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any()).
+		Return(errors.New("redis down"))
+	mockRepo.EXPECT().FindSubscriptionsBySourceID(gomock.Any(), "proj-1", "src-1").Return(subs, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "subs_by_source:proj-1:src-1", gomock.Any(), 30*time.Second).
+		Return(errors.New("redis down"))
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	result, err := repo.FindSubscriptionsBySourceID(context.Background(), "proj-1", "src-1")
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+}
+
+func TestCachedSubRepo_CreateSubscription_InvalidatesSourceKey(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	sub := &datastore.Subscription{UID: "sub-1", SourceID: "src-1"}
+	mockRepo.EXPECT().CreateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-1").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.CreateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_FindOrCreateDynamicSubscription_InvalidatesBothKeys(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1", SourceID: "src-1"}
+	mockRepo.EXPECT().FindOrCreateDynamicSubscription(gomock.Any(), "proj-1", sub).Return(sub, nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-1").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	_, err := repo.FindOrCreateDynamicSubscription(context.Background(), "proj-1", sub)
+	require.NoError(t, err)
+}
+
+func TestCachedSubRepo_UpdateSubscription_SourceChange_InvalidatesOldAndNew(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// Retargeting onto a new source leaves the old source's list holding a
+	// subscription that no longer matches it, so both entries must be evicted.
+	prev := &datastore.Subscription{UID: "sub-1", SourceID: "src-old"}
+	sub := &datastore.Subscription{UID: "sub-1", SourceID: "src-new"}
+	mockRepo.EXPECT().FindSubscriptionByID(gomock.Any(), "proj-1", "sub-1").Return(prev, nil)
+	mockRepo.EXPECT().UpdateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-new").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-old").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.UpdateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_UpdateSubscription_EndpointChange_InvalidatesOldAndNew(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	prev := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-old"}
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-new"}
+	mockRepo.EXPECT().FindSubscriptionByID(gomock.Any(), "proj-1", "sub-1").Return(prev, nil)
+	mockRepo.EXPECT().UpdateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-new").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-old").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.UpdateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_UpdateSubscription_UnchangedTargets_InvalidatesEachKeyOnce(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	prev := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1", SourceID: "src-1"}
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1", SourceID: "src-1"}
+	mockRepo.EXPECT().FindSubscriptionByID(gomock.Any(), "proj-1", "sub-1").Return(prev, nil)
+	mockRepo.EXPECT().UpdateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-1").Return(nil).Times(1)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-1").Return(nil).Times(1)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.UpdateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_UpdateSubscription_LookupError_StillUpdates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// Failure policy: the update is not blocked by a cache concern. Only the new
+	// key is evicted; the previous entry is left to expire by TTL.
+	sub := &datastore.Subscription{UID: "sub-1", SourceID: "src-new"}
+	mockRepo.EXPECT().FindSubscriptionByID(gomock.Any(), "proj-1", "sub-1").Return(nil, errors.New("db down"))
+	mockRepo.EXPECT().UpdateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-new").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.UpdateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_UpdateSubscription_WriteFails_SkipsInvalidation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	prev := &datastore.Subscription{UID: "sub-1", SourceID: "src-old"}
+	sub := &datastore.Subscription{UID: "sub-1", SourceID: "src-new"}
+	mockRepo.EXPECT().FindSubscriptionByID(gomock.Any(), "proj-1", "sub-1").Return(prev, nil)
+	mockRepo.EXPECT().UpdateSubscription(gomock.Any(), "proj-1", sub).Return(errors.New("update failed"))
+	// No Delete expected: nothing changed in the database.
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.Error(t, repo.UpdateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_DeleteSubscription_InvalidatesBothKeys(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1", SourceID: "src-1"}
+	mockRepo.EXPECT().DeleteSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_source:proj-1:src-1").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.DeleteSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestCachedSubRepo_EmptySourceID_SkipsSourceInvalidation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockSubscriptionRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// An outgoing subscription has no source, and "subs_by_source:proj-1:" is not
+	// an entry any read produces.
+	sub := &datastore.Subscription{UID: "sub-1", EndpointID: "ep-1", SourceID: ""}
+	mockRepo.EXPECT().CreateSubscription(gomock.Any(), "proj-1", sub).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "subs_by_endpoint:proj-1:ep-1").Return(nil)
+
+	repo := NewCachedSubscriptionRepository(mockRepo, mockCache, 30*time.Second, logger)
+	require.NoError(t, repo.CreateSubscription(context.Background(), "proj-1", sub))
+}
+
+func TestSubscriptionCacheKeys_ReadAndWriteAgree(t *testing.T) {
+	// A read/write key mismatch produces a cache that never invalidates and is
+	// invisible to tests that exercise only one side, so pin both formats.
+	require.Equal(t, "subs_by_endpoint:proj-1:ep-1", SubscriptionsByEndpointCacheKey("proj-1", "ep-1"))
+	require.Equal(t, "subs_by_source:proj-1:src-1", SubscriptionsBySourceCacheKey("proj-1", "src-1"))
+}
+
+// ============================================================================
+// FilterRepository Tests
+// ============================================================================
+
+func TestCachedFilterRepo_FindBySubAndEventType_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockFilterRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	filter := &datastore.EventTypeFilter{UID: "f-1", SubscriptionID: "sub-1", EventType: "user.created"}
+	mockCache.EXPECT().Get(gomock.Any(), "filters:sub-1:user.created", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindFilterBySubscriptionAndEventType(gomock.Any(), "sub-1", "user.created").Return(filter, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "filters:sub-1:user.created", gomock.Any(), 2*time.Minute).Return(nil)
+
+	repo := NewCachedFilterRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	result, err := repo.FindFilterBySubscriptionAndEventType(context.Background(), "sub-1", "user.created")
+	require.NoError(t, err)
+	require.Equal(t, "f-1", result.UID)
+}
+
+func TestCachedFilterRepo_CachesNotFound(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockFilterRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	mockCache.EXPECT().Get(gomock.Any(), "filters:sub-1:*", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindFilterBySubscriptionAndEventType(gomock.Any(), "sub-1", "*").
+		Return(nil, datastore.ErrFilterNotFound)
+	mockCache.EXPECT().Set(gomock.Any(), "filters:sub-1:*", gomock.Any(), 2*time.Minute).Return(nil)
+
+	repo := NewCachedFilterRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	result, err := repo.FindFilterBySubscriptionAndEventType(context.Background(), "sub-1", "*")
+	require.Error(t, err)
+	require.Nil(t, result)
+}
+
+func TestCachedFilterRepo_CreateFilter_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockFilterRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	filter := &datastore.EventTypeFilter{UID: "f-1", SubscriptionID: "sub-1", EventType: "user.created"}
+	mockRepo.EXPECT().CreateFilter(gomock.Any(), filter).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "filters:sub-1:user.created").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "filters:sub-1:*").Return(nil)
+
+	repo := NewCachedFilterRepository(mockRepo, mockCache, 2*time.Minute, logger)
+	require.NoError(t, repo.CreateFilter(context.Background(), filter))
+}
+
+// ============================================================================
+// APIKeyRepository Tests
+// ============================================================================
+
+func TestCachedAPIKeyRepo_GetByMaskID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockAPIKeyRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	apiKey := &datastore.APIKey{UID: "ak-123", MaskID: "mask-1"}
+	mockCache.EXPECT().Get(gomock.Any(), "apikeys_by_mask:mask-1", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().GetAPIKeyByMaskID(gomock.Any(), "mask-1").Return(apiKey, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "apikeys_by_mask:mask-1", apiKey, 5*time.Minute).Return(nil)
+
+	repo := NewCachedAPIKeyRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.GetAPIKeyByMaskID(context.Background(), "mask-1")
+	require.NoError(t, err)
+	require.Equal(t, "ak-123", result.UID)
+}
+
+// ============================================================================
+// PortalLinkRepository Tests
+// ============================================================================
+
+func TestCachedPortalLinkRepo_FindByMaskId_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockPortalLinkRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	pLink := &datastore.PortalLink{UID: "pl-123", TokenMaskId: "mask-1"}
+	mockCache.EXPECT().Get(gomock.Any(), "portal_links_by_mask:mask-1", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FindPortalLinkByMaskId(gomock.Any(), "mask-1").Return(pLink, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "portal_links_by_mask:mask-1", pLink, 5*time.Minute).Return(nil)
+
+	repo := NewCachedPortalLinkRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FindPortalLinkByMaskId(context.Background(), "mask-1")
+	require.NoError(t, err)
+	require.Equal(t, "pl-123", result.UID)
+}
+
+func TestCachedPortalLinkRepo_RevokePortalLink_InvalidatesMaskCache(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockPortalLinkRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// A link can accumulate several mask ids via refresh rotation; every cached
+	// entry must be invalidated so a revoked token stops authenticating.
+	mockRepo.EXPECT().FindPortalLinkTokenMaskIDs(gomock.Any(), "pl-123").Return([]string{"mask-1", "mask-2"}, nil)
+	mockRepo.EXPECT().RevokePortalLink(gomock.Any(), "proj-1", "pl-123").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "portal_links_by_mask:mask-1").Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "portal_links_by_mask:mask-2").Return(nil)
+
+	repo := NewCachedPortalLinkRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	require.NoError(t, repo.RevokePortalLink(context.Background(), "proj-1", "pl-123"))
+}
+
+func TestCachedPortalLinkRepo_RevokePortalLink_LookupError_StillRevokes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockPortalLinkRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	// Failure policy: a mask-id lookup error must not block revoke; entries are
+	// left to expire by TTL and no Delete is issued.
+	mockRepo.EXPECT().FindPortalLinkTokenMaskIDs(gomock.Any(), "pl-123").Return(nil, errors.New("db down"))
+	mockRepo.EXPECT().RevokePortalLink(gomock.Any(), "proj-1", "pl-123").Return(nil)
+
+	repo := NewCachedPortalLinkRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	require.NoError(t, repo.RevokePortalLink(context.Background(), "proj-1", "pl-123"))
+}
+
+// ============================================================================
+// OrganisationRepository Tests
+// ============================================================================
+
+func TestCachedOrgRepo_FetchByID_CacheMiss(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockOrganisationRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	org := &datastore.Organisation{UID: "org-123"}
+	mockCache.EXPECT().Get(gomock.Any(), "organisations:org-123", gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FetchOrganisationByID(gomock.Any(), "org-123").Return(org, nil)
+	mockCache.EXPECT().Set(gomock.Any(), "organisations:org-123", org, 5*time.Minute).Return(nil)
+
+	repo := NewCachedOrganisationRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FetchOrganisationByID(context.Background(), "org-123")
+	require.NoError(t, err)
+	require.Equal(t, "org-123", result.UID)
+}
+
+func TestCachedOrgRepo_UpdateOrg_Invalidates(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockOrganisationRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	org := &datastore.Organisation{UID: "org-123"}
+	mockRepo.EXPECT().UpdateOrganisation(gomock.Any(), org).Return(nil)
+	mockCache.EXPECT().Delete(gomock.Any(), "organisations:org-123").Return(nil)
+
+	repo := NewCachedOrganisationRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	require.NoError(t, repo.UpdateOrganisation(context.Background(), org))
+}
+
+// ============================================================================
+// Cache Error Graceful Degradation
+// ============================================================================
+
+func TestCachedRepo_CacheError_FallsThrough(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	project := &datastore.Project{UID: "proj-123"}
+	mockCache.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("redis down"))
+	mockRepo.EXPECT().FetchProjectByID(gomock.Any(), "proj-123").Return(project, nil)
+	mockCache.EXPECT().Set(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FetchProjectByID(context.Background(), "proj-123")
+	require.NoError(t, err)
+	require.Equal(t, "proj-123", result.UID)
+}
+
+func TestCachedRepo_DBError_NotCached(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockProjectRepository(ctrl)
+	mockCache := mocks.NewMockCache(ctrl)
+	logger := mocks.NewMockLogger(ctrl)
+	logger.EXPECT().Error(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	mockCache.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+	mockRepo.EXPECT().FetchProjectByID(gomock.Any(), "proj-123").Return(nil, errors.New("db error"))
+
+	repo := NewCachedProjectRepository(mockRepo, mockCache, 5*time.Minute, logger)
+	result, err := repo.FetchProjectByID(context.Background(), "proj-123")
+	require.Error(t, err)
+	require.Nil(t, result)
+}

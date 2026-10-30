@@ -1,0 +1,93 @@
+version: 2
+
+project_name: convoy
+
+before:
+  hooks:
+    - go mod tidy
+
+# Used only when running with --snapshot flag
+snapshot:
+  name_template: "{{ .ShortCommit }}"
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    main: ./cmd
+    id: cobin
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/frain-dev/convoy.Version=v{{ .Version }}
+
+  - id: lib
+    skip: true
+
+# https://goreleaser.com/customization/archive/
+archives:
+  - name_template: "{{ .ProjectName}}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    id: cobin-archive
+    builds:
+      - cobin
+    files:
+      - README.md
+
+# https://goreleaser.com/customization/nfpm/
+nfpms:
+  - id: deb
+    license: MPL-2.0
+    maintainer: frain-dev
+    homepage: https://getconvoy.io/
+    description: "A fast & secure open source webhooks service"
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - deb
+
+  - id: rpm
+    license: MPL-2.0
+    maintainer: frain-dev
+    homepage: https://getconvoy.io/
+    description: "A fast & secure open source webhooks service"
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - rpm
+
+# https://goreleaser.com/customization/homebrew/
+brews:
+  - name: convoy
+    ids:
+      - cobin-archive
+    homepage: https://getconvoy.io/
+    description: A fast & secure open source webhooks service
+    license: MPL-2.0
+    skip_upload: auto
+    commit_author:
+      name: frain-dev
+      email: dev@frain.dev
+    repository:
+      owner: frain-dev
+      name: homebrew-tools
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      branch: "convoy-{{ .Version }}"
+      pull_request:
+        enabled: true
+        base:
+          branch: main
+    url_template: https://github.com/frain-dev/convoy/releases/download/{{ .Tag }}/{{ .ArtifactName }}
+
+checksum:
+  name_template: "{{ .ProjectName}}_checksums.txt"
+
+release:
+  github:
+    owner: frain-dev
+    name: Convoy
+  prerelease: auto
+  draft: false
+  name_template: "v{{ .Version }}"

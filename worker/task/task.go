@@ -1,0 +1,125 @@
+package task
+
+import (
+	"time"
+
+	"github.com/hibiken/asynq"
+
+	"github.com/frain-dev/convoy/datastore"
+)
+
+type DeliveryError struct {
+	Err error
+}
+
+func (d *DeliveryError) Error() string {
+	return d.Err.Error()
+}
+
+type EndpointError struct {
+	delay time.Duration
+	Err   error
+}
+
+func (e *EndpointError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *EndpointError) Delay() time.Duration {
+	return e.delay
+}
+
+type RateLimitError struct {
+	delay time.Duration
+	Err   error
+}
+
+func (e *RateLimitError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RateLimitError) Delay() time.Duration {
+	return e.delay
+}
+
+func (e *RateLimitError) RateLimit() {
+}
+
+func GetRetryDelay(n int, err error, t *asynq.Task) time.Duration {
+	if endpointError, ok := err.(*EndpointError); ok {
+		return endpointError.Delay()
+	}
+	if rateLimitError, ok := err.(*RateLimitError); ok {
+		return rateLimitError.Delay()
+	}
+	if circuitBreakerError, ok := err.(*CircuitBreakerError); ok {
+		return circuitBreakerError.Delay()
+	}
+
+	return asynq.DefaultRetryDelayFunc(n, err, t)
+}
+
+type SignatureValues struct {
+	HMAC      string
+	Timestamp string
+}
+type EventDelivery struct {
+	EventDeliveryID string
+	ProjectID       string
+	// Snapshot carries the slim delivery row at enqueue time so the first dispatch
+	// attempt can skip FindEventDeliveryByIDSlim. Retries and legacy payloads
+	// without Snapshot still reload from DB.
+	Snapshot *datastore.EventDelivery
+}
+
+type EventDeliveryConfig struct {
+	project      *datastore.Project
+	subscription *datastore.Subscription
+	endpoint     *datastore.Endpoint
+}
+
+type RetryConfig struct {
+	Type       datastore.StrategyProvider
+	Duration   uint64
+	RetryCount uint64
+}
+
+type RateLimitConfig struct {
+	Rate       int
+	BucketSize int
+}
+
+func (ec *EventDeliveryConfig) RetryConfig() (*RetryConfig, error) {
+	rc := &RetryConfig{}
+
+	rc.Duration = ec.project.Config.Strategy.Duration
+	rc.RetryCount = ec.project.Config.Strategy.RetryCount
+	rc.Type = ec.project.Config.Strategy.Type
+
+	return rc, nil
+}
+
+func (ec *EventDeliveryConfig) RateLimitConfig() *RateLimitConfig {
+	rlc := &RateLimitConfig{}
+
+	rlc.Rate = ec.endpoint.RateLimit
+	rlc.BucketSize = int(ec.endpoint.RateLimitDuration)
+
+	return rlc
+}
+
+type CircuitBreakerError struct {
+	delay time.Duration
+	Err   error
+}
+
+func (e *CircuitBreakerError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return ""
+}
+
+func (e *CircuitBreakerError) Delay() time.Duration {
+	return e.delay
+}

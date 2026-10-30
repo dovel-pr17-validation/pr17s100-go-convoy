@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+FROM node:24 as node-env
+WORKDIR /app
+COPY ./web/ui/dashboard .
+RUN git config --global url."https://".insteadOf git://
+RUN npm install
+RUN npm run build
+
+FROM golang:1.26.2 as build-env
+WORKDIR /go/src/frain-dev/convoy
+
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+ENV GOARCH=amd64
+
+ENV GOCACHE=/root/.cache/go-build
+ENV GOMODCACHE=/go/pkg/mod
+
+COPY ./go.mod /go/src/frain-dev/convoy
+COPY ./go.sum /go/src/frain-dev/convoy
+
+COPY --from=node-env /app/dist /go/src/frain-dev/convoy/api/ui/build
+
+RUN go mod download
+RUN go mod verify
+
+COPY . .
+
+# Optional: pass --build-arg VERSION=v1.2.3 to inject version at build time
+ARG VERSION
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    if [ -n "$VERSION" ]; then \
+      go build -ldflags="-w -s -X github.com/frain-dev/convoy.Version=$VERSION" -o /go/bin/cmd ./cmd; \
+    else \
+      go build -ldflags="-w -s" -o /go/bin/cmd ./cmd; \
+    fi
+
+FROM alpine:3.23.3
+COPY --from=build-env /go/bin/cmd /
+COPY --from=build-env /go/src/frain-dev/convoy/internal/email/templates/* templates/
+COPY --from=build-env /go/src/frain-dev/convoy/api/ui/build /ui/build
+
+RUN chmod +x /cmd
+RUN apk upgrade --no-cache && apk add --no-cache gcompat
+
+COPY --from=build-env /go/src/frain-dev/convoy/sql /sql
+
+ENTRYPOINT ["/cmd"]
+EXPOSE 8080

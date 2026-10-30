@@ -1,0 +1,91 @@
+export interface PROJECT {
+	uid: string;
+	name: string;
+	logo_url: string;
+	config: {
+		ratelimit: {
+			count: number;
+			duration: string;
+		};
+		disable_endpoint: boolean;
+		add_event_id_trace_headers?: boolean;
+		verify_dynamic_events?: boolean;
+		allow_unmatched_dynamic_urls?: boolean;
+		strategy: {
+			type: string;
+			retry_count: number;
+			duration: number;
+		};
+		signature: {
+			header: string;
+			versions: VERSIONS[];
+		};
+		request_id_header?: string;
+		meta_event: {
+			event_type: string[];
+			is_enabled: boolean;
+			secret: string;
+			type: string;
+			url: string;
+		};
+		circuit_breaker?: {
+			sample_rate: number;
+			error_timeout: number;
+			failure_threshold: number;
+			success_threshold: number;
+			observability_window: number;
+			minimum_request_count: number;
+			consecutive_failure_threshold: number;
+		};
+		retention_policy: {
+			policy: string;
+			search_policy: string;
+		};
+		retention_policy_enabled: boolean;
+		DisableEndpoint: boolean;
+		replay_attacks: boolean;
+        search_policy: string;
+	};
+	statistics?: {
+		events_exist: boolean;
+		subscriptions_exist: boolean;
+		endpoints_exist: boolean;
+	};
+	created_at: Date;
+	updated_at: Date;
+	type: 'incoming' | 'outgoing';
+	selected?: boolean;
+	organisation_id: string;
+	rate_limit_duration: string;
+	rate_limit: string;
+}
+
+export interface VERSIONS {
+	created_at: Date;
+	encoding: string;
+	hash: string;
+	uid: string;
+}
+
+export interface META_EVENT {
+	attempt: {
+		request_http_header: object;
+		response_http_header: object;
+	};
+	created_at: string;
+	deleted_at: string;
+	event_type: string;
+	metadata: {
+		data: object;
+		interval_seconds: number;
+		next_send_time: string;
+		num_trials: number;
+		raw: string;
+		retry_limit: number;
+		strategy: string;
+	};
+	project_id: string;
+	status: string;
+	uid: string;
+	updated_at: string;
+}

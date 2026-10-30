@@ -1,0 +1,130 @@
+<div class="flex flex-col gap-16px">
+  <!-- Organisation info card -->
+  <div class="bg-white-100 border border-new.border rounded-16px p-24px">
+    <div class="flex justify-between items-start gap-16px mb-20px">
+      <div>
+        <h3 class="font-heading font-semibold text-[16px] leading-[24px] text-new.text-primary">Organisation info</h3>
+        <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary mt-2px">Your organisation&rsquo;s name and identifier.</p>
+      </div>
+      <button
+        type="button"
+        convoy-permission="Organisations|MANAGE"
+        class="shrink-0 px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90 disabled:opacity-50"
+        [disabled]="isEditingOrganisation || editOrganisationForm.disabled"
+        (click)="updateOrganisation()"
+        >
+        Save Changes
+      </button>
+    </div>
+
+    <form [formGroup]="editOrganisationForm" class="max-w-[480px]">
+      <convoy-input-field>
+        <label for="name" convoy-label required="true">Organisation name</label>
+        <input id="name" convoy-input autocomplete="name" formControlName="name" placeholder="Organisation name"/>
+        @if (editOrganisationForm.get('name')?.touched && editOrganisationForm.get('name')?.invalid) {
+          <convoy-input-error>Please enter a name for your organisation</convoy-input-error>
+        }
+      </convoy-input-field>
+
+      <div class="flex flex-col gap-8px">
+        <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Organisation ID</span>
+        <div class="h-40px w-full flex items-center gap-8px px-12px bg-new.surface-muted border border-new.border rounded-8px">
+          <span class="flex-1 truncate font-menlo text-[13px] text-new.text-primary">{{ organisationId }}</span>
+          <convoy-copy-button class="shrink-0" [text]="organisationId" notificationText="Organisation ID has been copied to your clipboard"></convoy-copy-button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  @if (orgHasEnterpriseSSO === true) {
+    <!-- SSO card -->
+    <div class="bg-white-100 border border-new.border rounded-16px p-24px">
+      <h3 class="font-heading font-semibold text-[16px] leading-[24px] text-new.text-primary">Configure SSO</h3>
+      <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary mt-2px mb-20px">Set up or manage Single Sign-On for your organisation.</p>
+      <button
+        type="button"
+        convoy-permission="Organisations|MANAGE"
+        class="px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-all hover:opacity-80 disabled:opacity-50"
+        [disabled]="configuringSSO"
+        (click)="configureSSO()"
+        >
+        {{ configuringSSO ? 'Opening…' : 'Configure SSO' }}
+      </button>
+      @if (isCloudBilling) {
+        <div class="mt-20px pt-20px border-t border-new.border">
+          <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary mb-8px">Workspace slug</p>
+          <div class="flex items-center gap-8px">
+            @if (currentWorkspaceSlug) {
+              <code class="font-menlo text-[13px] text-new.text-primary bg-new.surface-muted border border-new.border px-8px py-4px rounded-6px">{{ currentWorkspaceSlug }}</code>
+              <convoy-copy-button [text]="currentWorkspaceSlug" notificationText="Slug copied"></convoy-copy-button>
+            } @else {
+              <span class="font-body text-[13px] text-new.text-secondary">Not set</span>
+            }
+            <button
+              type="button"
+              convoy-permission="Organisations|MANAGE"
+              class="font-body font-medium text-[13px] text-new.primary-400 transition-opacity hover:opacity-80"
+              (click)="startEditingSlug(); slugDialog.showModal()"
+              >
+              {{ currentWorkspaceSlug ? 'Edit' : 'Set slug' }}
+            </button>
+          </div>
+        </div>
+      }
+    </div>
+    <dialog #slugDialog convoy-dialog position="center" class="!w-[480px] !max-w-[92vw] !rounded-24px !mt-[24vh] !bg-new.surface-page border border-new.border">
+      <div class="p-32px">
+        <h3 class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary mb-4px">Workspace slug</h3>
+        <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary pb-24px">Used for SSO and workspace-specific URLs.</p>
+        <convoy-input-field>
+          <label for="workspaceSlug" convoy-label required="true">What's your workspace slug?</label>
+          <input type="text" id="workspaceSlug" convoy-input autocomplete="off" [value]="workspaceSlugInput" (input)="workspaceSlugInput = $any($event.target).value" placeholder="e.g. my-team" (keydown.enter)="setWorkspaceSlug()" />
+          @if (workspaceSlugError) {
+            <convoy-input-error>{{ workspaceSlugError }}</convoy-input-error>
+          }
+        </convoy-input-field>
+        <div class="flex items-center gap-12px justify-end w-full mt-8px">
+          <button
+            type="button"
+            class="px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-all hover:opacity-80 disabled:opacity-50"
+            [disabled]="isSavingSlug"
+            (click)="closeSlugDialog()"
+            >
+            Cancel
+          </button>
+          <button
+            type="button"
+            convoy-permission="Organisations|MANAGE"
+            class="px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90 disabled:opacity-50"
+            [disabled]="isSavingSlug"
+            (click)="setWorkspaceSlug()"
+            >
+            {{ isSavingSlug ? 'Saving...' : 'Save' }}
+          </button>
+        </div>
+      </div>
+    </dialog>
+  }
+
+  <!-- Danger zone card -->
+  <div class="bg-white-100 border border-new.error-200 rounded-16px p-24px">
+    <h3 class="font-heading font-semibold text-[16px] leading-[24px] text-new.error-500 mb-4px">Danger zone</h3>
+    <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary max-w-[560px]">Deleting your organisation means you will lose all workspaces created by you and all your other organisation information.</p>
+    <button
+      type="button"
+      convoy-permission="Organisations|MANAGE"
+      class="mt-20px flex items-center gap-8px px-16px py-10px rounded-full bg-new.error-500 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90 disabled:opacity-50"
+      [disabled]="editOrganisationForm.disabled"
+      (click)="deleteDialog.showModal()"
+      >
+      <svg width="16" height="16" class="fill-white-100">
+        <use xlink:href="#delete-icon"></use>
+      </svg>
+      Delete Organisation
+    </button>
+  </div>
+</div>
+
+<dialog #deleteDialog convoy-dialog position="center" class="!w-[480px] !max-w-[92vw] !rounded-24px !mt-[24vh] !bg-new.surface-page border border-new.border">
+  <app-delete-modal [isLoading]="isDeletingOrganisation" [deleteText]="'deactivate “' + organisationName + '”'" [deleteButtonText]="'Deactivate'" (closeModal)="deleteDialog.close()" (deleteData)="deleteOrganisation()"></app-delete-modal>
+</dialog>

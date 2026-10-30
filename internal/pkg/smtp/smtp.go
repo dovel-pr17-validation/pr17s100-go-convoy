@@ -1,0 +1,115 @@
+package smtp
+
+import (
+	"bytes"
+	"fmt"
+
+	"gopkg.in/gomail.v2"
+
+	_ "embed"
+
+	"github.com/frain-dev/convoy/config"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+type SmtpClient interface {
+	SendEmail(emailAddr, subject string, body bytes.Buffer) error
+}
+
+func NewClient(cfg *config.SMTPConfiguration, logger log.Logger) (SmtpClient, error) {
+	if *cfg == (config.SMTPConfiguration{}) {
+		return NewNoopClient()
+	}
+
+	return NewSMTP(cfg, logger)
+}
+
+type SMTPClient struct {
+	url, username, password, from, replyTo string
+	port                                   uint32
+	ssl                                    bool
+}
+
+func NewSMTP(cfg *config.SMTPConfiguration, logger log.Logger) (SmtpClient, error) {
+	var err error
+
+	errMsg := "Missing SMTP Config - %s"
+	if util.IsStringEmpty(cfg.URL) {
+		err = fmt.Errorf(errMsg, "URL")
+		logger.Error("smtp error", "error", err)
+	}
+
+	if cfg.Port == 0 {
+		err = fmt.Errorf(errMsg, "Port")
+		logger.Error("smtp error", "error", err)
+	}
+
+	if util.IsStringEmpty(cfg.Username) {
+		err = fmt.Errorf(errMsg, "username")
+		logger.Error("smtp error", "error", err)
+	}
+
+	if util.IsStringEmpty(cfg.Password) {
+		err = fmt.Errorf(errMsg, "password")
+		logger.Error("smtp error", "error", err)
+	}
+
+	if util.IsStringEmpty(cfg.From) {
+		err = fmt.Errorf(errMsg, "from")
+		logger.Error("smtp error", "error", err)
+	}
+
+	return &SMTPClient{
+		ssl:      cfg.SSL,
+		url:      cfg.URL,
+		port:     cfg.Port,
+		username: cfg.Username,
+		password: cfg.Password,
+		from:     cfg.From,
+		replyTo:  cfg.ReplyTo,
+	}, err
+}
+
+func (s *SMTPClient) SendEmail(emailAddr, subject string, body bytes.Buffer) error {
+	// Compose Message
+	m := s.setHeaders(emailAddr, subject)
+
+	m.SetBody("text/html", body.String())
+
+	// Send Email
+	d := gomail.NewDialer(s.url, int(s.port), s.username, s.password)
+	if s.ssl {
+		d.SSL = true
+	}
+	if err := d.DialAndSend(m); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *SMTPClient) setHeaders(email, subject string) *gomail.Message {
+	m := gomail.NewMessage()
+
+	m.SetHeader("From", s.from)
+	m.SetHeader("To", email)
+
+	if !util.IsStringEmpty(s.replyTo) {
+		m.SetHeader("Reply-To", s.replyTo)
+	}
+
+	m.SetHeader("Subject", subject)
+
+	return m
+}
+
+type NoopClient struct{}
+
+func NewNoopClient() (*NoopClient, error) {
+	return &NoopClient{}, nil
+}
+
+func (n *NoopClient) SendEmail(em, sub string, b bytes.Buffer) error {
+	return nil
+}

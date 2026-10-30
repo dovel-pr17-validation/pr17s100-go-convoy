@@ -1,0 +1,268 @@
+package utils
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/datastore/cached"
+	"github.com/frain-dev/convoy/internal/pkg/cli"
+	"github.com/frain-dev/convoy/internal/projects"
+	cb "github.com/frain-dev/convoy/pkg/circuit_breaker"
+	"github.com/frain-dev/convoy/pkg/clock"
+	log "github.com/frain-dev/convoy/pkg/logger"
+)
+
+func circuitBreakerStore(a *cli.App) (cb.CircuitBreakerStore, error) {
+	if a.Broker == nil || a.Broker.CircuitBreakerStore == nil {
+		return nil, fmt.Errorf("circuit breaker store is required")
+	}
+	return a.Broker.CircuitBreakerStore, nil
+}
+
+func AddCircuitBreakersCommand(a *cli.App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "circuit-breakers",
+		Short: "manage circuit breakers",
+		Long:  "manage circuit breakers for endpoints",
+		Annotations: map[string]string{
+			"CheckMigration":  "true",
+			"ShouldBootstrap": "false",
+		},
+	}
+
+	cmd.AddCommand(AddCircuitBreakersGetCommand(a))
+	cmd.AddCommand(AddCircuitBreakersUpdateCommand(a))
+
+	return cmd
+}
+
+func AddCircuitBreakersGetCommand(a *cli.App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "get [endpoint-id]",
+		Short: "get circuit breaker information",
+		Long:  "get detailed information about a specific circuit breaker",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			breakerID := args[0]
+
+			// Remove the "breaker:" prefix if present
+			breakerID = strings.TrimPrefix(breakerID, "breaker:")
+
+			store, err := circuitBreakerStore(a)
+			if err != nil {
+				return fmt.Errorf("failed to create circuit breaker store: %v", err)
+			}
+
+			cbManager, err := cb.NewCircuitBreakerManager(
+				cb.ConfigProviderOption(func(projectID string) *cb.CircuitBreakerConfig {
+					// For get command, we don't have projectID yet, so use defaults
+					// The actual project config will be fetched when needed
+					return &cb.CircuitBreakerConfig{
+						SampleRate:                  datastore.DefaultCircuitBreakerConfiguration.SampleRate,
+						BreakerTimeout:              datastore.DefaultCircuitBreakerConfiguration.ErrorTimeout,
+						FailureThreshold:            datastore.DefaultCircuitBreakerConfiguration.FailureThreshold,
+						SuccessThreshold:            datastore.DefaultCircuitBreakerConfiguration.SuccessThreshold,
+						ObservabilityWindow:         datastore.DefaultCircuitBreakerConfiguration.ObservabilityWindow,
+						MinimumRequestCount:         datastore.DefaultCircuitBreakerConfiguration.MinimumRequestCount,
+						ConsecutiveFailureThreshold: datastore.DefaultCircuitBreakerConfiguration.ConsecutiveFailureThreshold,
+					}
+				}),
+				cb.StoreOption(store),
+				cb.ClockOption(clock.NewRealClock()),
+				cb.LoggerOption(log.New("convoy", log.LevelInfo)),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to create circuit breaker manager: %v", err)
+			}
+
+			// Get circuit breaker
+			breaker, err := cbManager.GetCircuitBreakerWithError(context.Background(), breakerID)
+			if err != nil {
+				return fmt.Errorf("failed to get circuit breaker: %v", err)
+			}
+
+			if breaker == nil {
+				return fmt.Errorf("circuit breaker not found")
+			}
+
+			// Format output
+			output := map[string]interface{}{
+				"key":                  fmt.Sprintf("breaker:%s", breakerID),
+				"tenant_id":            breaker.TenantId,
+				"state":                breaker.State,
+				"requests":             breaker.Requests,
+				"failure_rate":         breaker.FailureRate,
+				"success_rate":         breaker.SuccessRate,
+				"will_reset_at":        breaker.WillResetAt,
+				"total_failures":       breaker.TotalFailures,
+				"total_successes":      breaker.TotalSuccesses,
+				"consecutive_failures": breaker.ConsecutiveFailures,
+				"notifications_sent":   breaker.NotificationsSent,
+			}
+
+			// Print as JSON
+			jsonOutput, err := json.MarshalIndent(output, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to marshal output: %v", err)
+			}
+
+			fmt.Println(string(jsonOutput))
+			return nil
+		},
+	}
+
+	return cmd
+}
+
+func AddCircuitBreakersUpdateCommand(a *cli.App) *cobra.Command {
+	var (
+		failureThreshold            uint64
+		successThreshold            uint64
+		minimumRequestCount         uint64
+		observabilityWindow         uint64
+		consecutiveFailureThreshold uint64
+	)
+
+	cmd := &cobra.Command{
+		Use:   "update [project-id]",
+		Short: "update circuit breaker configuration",
+		Long:  "update circuit breaker configuration for a specific project",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			projectID := args[0]
+
+			// Validate flag ranges before any work
+			if cmd.Flags().Changed("failure_threshold") {
+				if failureThreshold > 100 {
+					return fmt.Errorf("failure_threshold must be between 0 and 100")
+				}
+			}
+			if cmd.Flags().Changed("success_threshold") {
+				if successThreshold > 100 {
+					return fmt.Errorf("success_threshold must be between 0 and 100")
+				}
+			}
+			if cmd.Flags().Changed("observability_window") {
+				if observabilityWindow == 0 {
+					return fmt.Errorf("observability_window must be greater than 0")
+				}
+			}
+
+			// Get current project configuration. The cached wrapper makes the
+			// update below invalidate "projects:<id>" so running API/worker
+			// nodes pick up the new config instead of serving the stale cache
+			// entry until the TTL expires.
+			projectRepo := datastore.ProjectRepository(projects.New(a.Logger, a.DB))
+			if a.Cache != nil {
+				projectRepo = cached.NewCachedProjectRepository(projectRepo, a.Cache, cached.DefaultProjectTTL, a.Logger)
+			}
+			project, err := projectRepo.FetchProjectByID(context.Background(), projectID)
+			if err != nil {
+				return fmt.Errorf("failed to fetch project: %v", err)
+			}
+
+			// Initialize project config if it doesn't exist
+			if project.Config == nil {
+				project.Config = &datastore.ProjectConfig{}
+			}
+
+			// Initialize circuit breaker configuration if it doesn't exist
+			if project.Config.CircuitBreaker == nil {
+				project.Config.CircuitBreaker = &datastore.DefaultCircuitBreakerConfiguration
+			}
+
+			// Update circuit breaker configuration if flags are provided
+			updated := false
+			if cmd.Flags().Changed("failure_threshold") {
+				project.Config.CircuitBreaker.FailureThreshold = failureThreshold
+				updated = true
+			}
+			if cmd.Flags().Changed("success_threshold") {
+				project.Config.CircuitBreaker.SuccessThreshold = successThreshold
+				updated = true
+			}
+			if cmd.Flags().Changed("minimum_request_count") {
+				project.Config.CircuitBreaker.MinimumRequestCount = minimumRequestCount
+				updated = true
+			}
+			if cmd.Flags().Changed("observability_window") {
+				project.Config.CircuitBreaker.ObservabilityWindow = observabilityWindow
+				updated = true
+			}
+			if cmd.Flags().Changed("consecutive_failure_threshold") {
+				project.Config.CircuitBreaker.ConsecutiveFailureThreshold = consecutiveFailureThreshold
+				updated = true
+			}
+
+			if updated {
+				// Validate updated configuration using circuit breaker validation rules
+				validateCfg := cb.CircuitBreakerConfig{
+					SampleRate:                  project.Config.CircuitBreaker.SampleRate,
+					BreakerTimeout:              project.Config.CircuitBreaker.ErrorTimeout,
+					FailureThreshold:            project.Config.CircuitBreaker.FailureThreshold,
+					SuccessThreshold:            project.Config.CircuitBreaker.SuccessThreshold,
+					ObservabilityWindow:         project.Config.CircuitBreaker.ObservabilityWindow,
+					MinimumRequestCount:         project.Config.CircuitBreaker.MinimumRequestCount,
+					ConsecutiveFailureThreshold: project.Config.CircuitBreaker.ConsecutiveFailureThreshold,
+				}
+				if err := validateCfg.Validate(); err != nil {
+					return fmt.Errorf("invalid circuit breaker configuration: %v", err)
+				}
+
+				// Update project configuration
+				err = projectRepo.UpdateProject(context.Background(), project)
+				if err != nil {
+					return fmt.Errorf("failed to update project configuration: %v", err)
+				}
+
+				// Reset breakers for this project so new config takes immediate effect.
+				store, storeErr := circuitBreakerStore(a)
+				if storeErr != nil {
+					return fmt.Errorf("failed to create circuit breaker store: %v", storeErr)
+				}
+				keys, err := store.Keys(context.Background(), "breaker:")
+				if err == nil {
+					for _, key := range keys {
+						breakerData, err := store.GetOne(context.Background(), key)
+						if err == nil {
+							breaker, err := cb.NewCircuitBreakerFromStore([]byte(breakerData), log.New("convoy", log.LevelInfo))
+							if err == nil && breaker.TenantId == projectID {
+								_ = store.Delete(context.Background(), key)
+							}
+						}
+					}
+				}
+
+				fmt.Println("Circuit breaker configuration updated successfully")
+			} else {
+				fmt.Println("No changes made to circuit breaker configuration")
+			}
+
+			// Display current configuration
+			fmt.Println("\nCurrent circuit breaker configuration:")
+			fmt.Printf("sample_rate                   | %d -- cannot be changed\n", project.Config.CircuitBreaker.SampleRate)
+			fmt.Printf("error_timeout                 | %d -- cannot be changed\n", project.Config.CircuitBreaker.ErrorTimeout)
+			fmt.Printf("failure_threshold             | %d\n", project.Config.CircuitBreaker.FailureThreshold)
+			fmt.Printf("success_threshold             | %d\n", project.Config.CircuitBreaker.SuccessThreshold)
+			fmt.Printf("observability_window          | %d\n", project.Config.CircuitBreaker.ObservabilityWindow)
+			fmt.Printf("minimum_request_count         | %d\n", project.Config.CircuitBreaker.MinimumRequestCount)
+			fmt.Printf("consecutive_failure_threshold | %d\n", project.Config.CircuitBreaker.ConsecutiveFailureThreshold)
+
+			return nil
+		},
+	}
+
+	// Add flags for configurable parameters
+	cmd.Flags().Uint64Var(&failureThreshold, "failure_threshold", 0, "failure threshold percentage")
+	cmd.Flags().Uint64Var(&successThreshold, "success_threshold", 0, "success threshold percentage")
+	cmd.Flags().Uint64Var(&minimumRequestCount, "minimum_request_count", 0, "minimum request count")
+	cmd.Flags().Uint64Var(&observabilityWindow, "observability_window", 0, "observability window in minutes")
+	cmd.Flags().Uint64Var(&consecutiveFailureThreshold, "consecutive_failure_threshold", 0, "consecutive failure threshold")
+
+	return cmd
+}

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="supported-color-schemes" content="light" />
+    <title>Verify Your Email Address</title>
+    <!--[if mso]>
+    <noscript>
+        <xml>
+            <o:OfficeDocumentSettings>
+                <o:PixelsPerInch>96</o:PixelsPerInch>
+            </o:OfficeDocumentSettings>
+        </xml>
+    </noscript>
+    <![endif]-->
+    {{template "email_styles" .}}
+</head>
+<body style="margin: 0; padding: 0; background-color: #FFFFFF;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border: none; border-spacing: 0; background-color: #FFFFFF;">
+    <tr>
+        <td align="center">
+            {{ outlookShellOpen }}
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width: 100%; max-width: 656px; border: none; border-spacing: 0; background-color: #FFFFFF;">
+                {{template "email_header" .}}
+                <tr>
+                    <td class="gutter" style="padding: 0 37px; background-color: #FFFFFF;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width: 100%; border: none; border-spacing: 0; background-color: #F7F7F7;">
+                            <tr>
+                                <td class="card-pad" style="padding: 40px 32px 20px 32px; font-family: 'Inter', Arial, sans-serif; font-weight: 600; font-size: 14px; line-height: 22px; color: #46586B;">
+                                    <p style="margin: 0 0 14px 0; font-weight: 600; font-size: 14px; line-height: 22px; color: #46586B;">
+                                        Hi {{ .recipient_name }},
+                                    </p>
+                                    <p style="margin: 0 0 14px 0; font-weight: 400; font-size: 14px; line-height: 22px; color: #46586B;">
+                                        Thank you for joining Convoy. Please verify your email address by clicking the button below:
+                                    </p>
+                                    <table role="presentation" cellpadding="0" cellspacing="0" style="border: none; border-spacing: 0; margin: 24px 0;">
+                                        <tr>
+                                            <td>
+                                                <a href="{{ .email_verification_url }}" target="_blank" style="
+                                                        display: inline-block;
+                                                        color: #ffffff;
+                                                        font-family: 'Inter', Arial, sans-serif;
+                                                        font-size: 14px;
+                                                        font-weight: 600;
+                                                        line-height: 22px;
+                                                        text-decoration: none;
+                                                        text-align: center;
+                                                        padding: 12px 24px;
+                                                        background-color: #0082F9;
+                                                        border-radius: 4px;
+                                                    ">
+                                                    Verify email address
+                                                </a>
+                                            </td>
+                                        </tr>
+                                    </table>
+                                    <p style="margin: 0 0 8px 0; font-weight: 400; font-size: 14px; line-height: 22px; color: #46586B;">
+                                        If the button doesn't work, copy and paste this link into your browser:
+                                    </p>
+                                    <p style="margin: 0; font-weight: 400; font-size: 14px; line-height: 22px; color: #46586B; word-break: break-all;">
+                                        <a href="{{ .email_verification_url }}" style="color: #0082F9; text-decoration: underline;">{{ .email_verification_url }}</a>
+                                    </p>
+                                </td>
+                            </tr>
+                            {{template "email_footer" .}}
+                        </table>
+                    </td>
+                </tr>
+            </table>
+            {{ outlookShellClose }}
+        </td>
+    </tr>
+</table>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+    "database": {
+        "scheme": "postgres",
+        "host": "inside-config-file",
+        "username": "postgres",
+        "password": "postgres",
+        "database": "convoy",
+        "options": "sslmode=disable&connect_timeout=30",
+        "port": 5432
+    },
+    "redis": {
+        "port": 8379,
+        "scheme": "redis",
+        "host": "localhost"
+    },
+    "server": {
+        "http": {
+            "port": 80
+        }
+    },
+    "auth": {
+        "jwt": {
+            "enabled": true,
+            "secret": "test-access-secret",
+            "refresh_secret": "test-refresh-secret"
+        }
+    }
+}

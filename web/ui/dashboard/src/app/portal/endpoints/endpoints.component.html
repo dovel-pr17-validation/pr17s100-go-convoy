@@ -1,0 +1,272 @@
+<div class="max-w-[1300px] w-full mx-auto px-24px pt-80px pb-100px">
+  <!-- Section header -->
+  <div class="flex items-start justify-between gap-16px pt-24px">
+    <div class="flex flex-col gap-4px">
+      <h2 class="font-heading font-medium text-[20px] leading-[28px] text-new.text-primary">Endpoints</h2>
+      <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Destinations that receive your webhook events</p>
+    </div>
+    @if (portalDetails?.can_manage_endpoint && portalDetails?.owner_id) {
+      <button
+        type="button"
+        class="flex items-center gap-4px min-w-[100px] px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90"
+        (click)="openEndpointForm('create')"
+        >
+        <img src="/assets/img/svg/plus-white.svg" class="w-14px h-14px" alt="" />
+        Add Endpoint
+      </button>
+    }
+  </div>
+
+  <div class="h-[1px] w-full bg-new.border mt-16px"></div>
+
+  <!-- Status filter -->
+  <div class="flex items-center gap-12px mt-20px">
+    <div convoy-dropdown size="sm" position="left">
+      <button dropdownTrigger type="button" class="h-44px flex items-center gap-12px pl-12px pr-8px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary">
+        <span class="capitalize" [class.!font-medium]="statusFilter !== 'all'">{{ statusFilter === 'all' ? 'Status' : statusFilter }}</span>
+        <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px shrink-0" alt="" />
+      </button>
+      <ul dropdownOptions class="py-4px">
+        @for (statusOption of statusFilterOptions; track $index) {
+          <li>
+            <button
+              convoy-dropdown-option
+              type="button"
+              class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary capitalize transition-colors hover:bg-new.surface-muted"
+              [class.!font-medium]="statusFilter === statusOption"
+              (click)="setStatusFilter(statusOption)"
+              >
+              {{ statusOption === 'all' ? 'All statuses' : statusOption }}
+            </button>
+          </li>
+        }
+      </ul>
+    </div>
+  </div>
+
+  <!-- Table card -->
+  <div class="bg-white-100 border border-new.border rounded-12px mt-16px">
+    <!-- Search -->
+    <form class="flex items-center gap-8px px-12px h-40px border-b border-new.border" (ngSubmit)="getEndpoints({ q: endpointSearchString })">
+      <img src="/assets/img/svg/search-gray.svg" class="w-16px h-16px" alt="search" />
+      <input
+        type="search"
+        placeholder="Search endpoints"
+        [(ngModel)]="endpointSearchString"
+        [ngModelOptions]="{ standalone: true }"
+        class="flex-1 font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none bg-transparent"
+        />
+    </form>
+
+    @if (isloadingSubscriptions) {
+      <!-- Loading state — show even when a previous page is still in memory so
+           status/search changes never flash stale rows under the new filter. -->
+      <div class="flex flex-col items-center justify-center gap-16px py-56px px-32px">
+        <img src="/assets/img/svg/deliveries-loading.svg" class="w-48px h-48px animate-spin" alt="" />
+        <div class="flex flex-col items-center gap-4px text-center max-w-[320px]">
+          <p class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary">Loading endpoints</p>
+          <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Fetching your endpoints. This usually takes a moment.</p>
+        </div>
+      </div>
+    } @else if (!endpoints.length) {
+      <!-- Empty state -->
+      <div class="flex flex-col items-center justify-center gap-16px py-56px px-32px">
+        <img src="/assets/img/svg/deliveries-empty.svg" class="w-48px h-48px" alt="" />
+        <div class="flex flex-col items-center gap-4px text-center max-w-[360px]">
+          <p class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary">{{ statusFilter === 'all' ? 'No endpoints yet' : 'No ' + statusFilter + ' endpoints' }}</p>
+          <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">{{ statusFilter === 'all' ? 'Endpoints are the destinations that receive your webhook events.' : 'Try another status filter to see more endpoints.' }}</p>
+        </div>
+      </div>
+    } @else {
+      <!-- pb/-mb keeps row action menus inside the scroll clip box without a visible gap before pagination. -->
+      <div class="overflow-x-auto pb-[280px] -mb-[280px]">
+      <div class="min-w-[880px]">
+      <!-- Header row -->
+      <div class="grid w-full grid-cols-[minmax(240px,1.6fr)_minmax(200px,2.4fr)_minmax(160px,1.6fr)_120px_100px_56px] bg-new.surface-subtle border-b border-new.border">
+        <div class="flex items-center px-20px h-36px">
+          <span class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Endpoint</span>
+        </div>
+        <div class="flex items-center px-12px h-36px">
+          <span class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">URL</span>
+        </div>
+        <div class="flex items-center px-12px h-36px">
+          <span class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">ID</span>
+        </div>
+        <div class="flex items-center px-12px h-36px">
+          <span class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Created on</span>
+        </div>
+        <div class="flex items-center justify-end px-12px h-36px">
+          <span class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Failure rate</span>
+        </div>
+        <div class="h-36px"></div>
+      </div>
+
+      <!-- Rows -->
+      @for (endpoint of endpoints; track endpoint.uid; let i = $index) {
+        <div class="grid w-full grid-cols-[minmax(240px,1.6fr)_minmax(200px,2.4fr)_minmax(160px,1.6fr)_120px_100px_56px] items-center border-b border-new.border last:border-b-0 transition-colors hover:bg-new.surface-subtle group">
+          <!-- Endpoint: status pill + name -->
+          <div class="flex items-center gap-8px px-20px h-40px min-w-0">
+            @if (endpoint.status) {
+              <span class="shrink-0 inline-flex items-center h-20px px-4px rounded-4px font-body font-medium text-[12px] leading-[14px] text-new.text-primary" [class]="statusPillClass(endpoint)">{{ statusPillLabel(endpoint) }}</span>
+            }
+            <span class="min-w-0 font-body font-medium text-[14px] leading-[16px] text-new.text-primary truncate">{{ endpoint.name || endpoint.title }}</span>
+          </div>
+
+          <!-- URL + copy -->
+          <div class="flex items-center gap-8px px-12px h-40px min-w-0">
+            <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary truncate">{{ endpoint.url || endpoint.target_url }}</span>
+            <convoy-copy-button size="sm" className="opacity-0 group-hover:opacity-100 transition-all" [notificationText]="(endpoint.name || endpoint.title) + ' URL has been copied to clipboard'" [text]="endpoint.url || endpoint.target_url"></convoy-copy-button>
+          </div>
+
+          <!-- ID + copy -->
+          <div class="flex items-center gap-8px px-12px h-40px min-w-0">
+            <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary truncate">{{ endpoint.uid }}</span>
+            <convoy-copy-button size="sm" className="opacity-0 group-hover:opacity-100 transition-all" [notificationText]="(endpoint.name || endpoint.title) + ' ID has been copied to clipboard'" [text]="endpoint.uid"></convoy-copy-button>
+          </div>
+
+          <!-- Created on -->
+          <div class="flex items-center px-12px h-40px">
+            <span class="font-body font-normal text-[14px] leading-normal text-new.text-secondary whitespace-nowrap">{{ endpoint.created_at | date: 'd MMM y' }}</span>
+          </div>
+
+          <!-- Failure rate -->
+          <div class="flex items-center justify-end px-12px h-40px">
+              <span class="font-body font-normal text-[14px] leading-normal whitespace-nowrap" [class]="(endpoint.period_failure_rate || 0) > 0 ? 'text-new.error-500' : 'text-new.text-secondary'">{{ failureRateLabel(endpoint) }}</span>
+          </div>
+
+          <!-- Actions -->
+          <div class="flex items-center justify-end px-12px h-40px">
+            <div convoy-dropdown #subscriptionDropdown position="right" size="md">
+              <button dropdownTrigger type="button" class="w-32px h-32px flex items-center justify-center rounded-[6px] transition-colors hover:bg-new.surface-muted">
+                <img src="assets/img/more-icon-vertical.svg" class="h-16px" alt="more actions" />
+              </button>
+              <ul dropdownOptions class="py-4px">
+                @if (portalDetails?.can_manage_endpoint) {
+                  <li>
+                    <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted" (click)="activeEndpoint = endpoint; openEndpointForm('update')">Edit</button>
+                  </li>
+                  <li>
+                    <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted" (click)="activeEndpoint = endpoint; secretDialog.showModal()">View Secret</button>
+                  </li>
+                }
+                <li>
+                  <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted" (click)="catalogDialog.showModal(); endpointUid = endpoint.uid">Send Test Event</button>
+                </li>
+                @if (portalDetails?.can_manage_endpoint) {
+                  <li>
+                    <button convoy-dropdown-option type="button" class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted disabled:opacity-50" [disabled]="isTogglingEndpoint" (click)="toggleEndpoint(i, endpoint)">
+                      {{ endpoint.status === 'active' ? 'Paus' : 'Unpaus' }}{{ isTogglingEndpoint ? 'ing endpoint...' : 'e Endpoint' }}
+                    </button>
+                  </li>
+                }
+              </ul>
+            </div>
+          </div>
+        </div>
+      }
+      </div>
+      </div>
+
+      <!-- Pagination footer -->
+      @if (fetchedEndpoints?.pagination?.has_next_page || fetchedEndpoints?.pagination?.has_prev_page) {
+        <div class="flex items-center justify-end gap-8px px-20px h-56px bg-white-100">
+          <button
+            type="button"
+            class="w-28px h-28px flex items-center justify-center rounded-[6px] border border-new.border bg-new.surface-page transition-colors hover:bg-new.surface-muted disabled:opacity-40 disabled:pointer-events-none"
+            [disabled]="!fetchedEndpoints?.pagination?.has_prev_page"
+            (click)="getEndpoints({ prev_page_cursor: fetchedEndpoints?.pagination?.prev_page_cursor || '', next_page_cursor: '', direction: 'prev' })"
+            >
+            <img src="/assets/img/svg/chevron-left-small.svg" class="w-16px h-16px" alt="previous page" />
+          </button>
+          <button
+            type="button"
+            class="w-28px h-28px flex items-center justify-center rounded-[6px] border border-new.border bg-new.surface-page transition-colors hover:bg-new.surface-muted disabled:opacity-40 disabled:pointer-events-none"
+            [disabled]="!fetchedEndpoints?.pagination?.has_next_page"
+            (click)="getEndpoints({ next_page_cursor: fetchedEndpoints?.pagination?.next_page_cursor || '', prev_page_cursor: '', direction: 'next' })"
+            >
+            <img src="/assets/img/svg/chevron-right-small.svg" class="w-16px h-16px" alt="next page" />
+          </button>
+        </div>
+      }
+    }
+  </div>
+</div>
+
+<div id="convoy-app"></div>
+
+@if (showCreateEndpoint || currentRoute === 'new' || (currentRoute !== 'endpoints' && currentRoute !== 'new')) {
+  <div class="fixed top-0 left-0 right-0 bottom-0 bg-new.surface-page z-20 pb-100px overflow-auto">
+    <div class="max-w-[900px] w-full mx-auto pt-40px px-24px">
+      <button type="button" class="flex items-center gap-8px font-body font-medium text-[14px] text-new.text-primary" (click)="goBack(true)">
+        <span class="w-28px h-28px flex items-center justify-center rounded-full bg-white-100 border border-new.border">
+          <svg width="24" height="24" class="fill-new.text-primary scale-[0.6]">
+            <use xlink:href="#arrow-left-icon"></use>
+          </svg>
+        </span>
+        Back
+      </button>
+      <convoy-create-portal-endpoint
+        type="portal"
+        showAction="true"
+        [action]="action"
+        [endpointId]="activeEndpoint?.uid || ''" (onAction)="goBack(true)">
+      </convoy-create-portal-endpoint>
+    </div>
+  </div>
+}
+
+<dialog #secretDialog convoy-dialog position="center" class="!w-[480px] !max-w-[92vw] !rounded-24px !mt-[24vh] !bg-new.surface-page border border-new.border">
+  <convoy-endpoint-secret [endpointDetails]="activeEndpoint" (closeSecretModal)="secretDialog.close()" (expireCurrentSecret)="getEndpoints(); secretDialog.close()"></convoy-endpoint-secret>
+</dialog>
+
+<convoy-event-catalog style="display: none;" (eventTypesFetched)="onEventTypesFetched($event)" [singleEventMode]="true" [selectedEventType]="selectedEventType"></convoy-event-catalog>
+
+<dialog #catalogDialog convoy-dialog position="center" class="w-[840px] max-w-[100vw] max-h-screen overflow-y-auto !rounded-16px !bg-new.surface-page border border-new.border">
+  <div class="p-24px max-h-[70vh] flex flex-col">
+    <h2 class="font-heading font-medium text-[18px] leading-[26px] text-new.text-primary mb-16px">Send test event</h2>
+
+    <div class="flex-1 overflow-y-auto min-h-0">
+      <label class="font-body font-normal text-[14px] leading-normal text-new.text-secondary mb-8px block">Event type</label>
+      <div convoy-dropdown size="full" position="center">
+        <button dropdownTrigger type="button" class="h-40px w-full flex items-center justify-between gap-8px pl-12px pr-8px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary">
+          <span>{{ selectedEventType?.name || 'None' }}</span>
+          <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px shrink-0" alt="" />
+        </button>
+
+        <ul dropdownOptions class="py-4px">
+          @for (eventType of eventTypes; track $index) {
+            <li>
+              <button
+                convoy-dropdown-option
+                type="button"
+                class="w-full text-left px-12px py-8px font-body text-[14px] text-new.text-primary transition-colors hover:bg-new.surface-muted"
+                [class.!font-medium]="selectedEventType == eventType"
+                (click)="selectEventType(eventType)"
+                >
+                {{ eventType.name }}
+              </button>
+            </li>
+          }
+        </ul>
+      </div>
+
+      @if (selectedEventType) {
+        <div>
+          <convoy-event-catalog [singleEventMode]="true" [selectedEventType]="selectedEventType"></convoy-event-catalog>
+        </div>
+      }
+    </div>
+
+    <div class="flex items-center gap-12px justify-end mt-24px pt-16px border-t border-new.border">
+      <button type="button" class="px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-all hover:opacity-80" (click)="catalogDialog.close()">Cancel</button>
+      <button
+        type="button"
+        class="px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90 disabled:opacity-50"
+        [disabled]="!selectedEventType"
+        (click)="sendEvent(); getEndpoints(); catalogDialog.close()"
+        >
+        Send Test Event
+      </button>
+    </div>
+  </div>
+</dialog>

@@ -1,0 +1,210 @@
+-- Organisation Repository SQLc Queries
+-- This file contains all SQL queries for organisation operations
+
+-- name: CreateOrganisation :exec
+INSERT INTO convoy.organisations (
+    id,
+    name,
+    owner_id,
+    custom_domain,
+    assigned_domain,
+    license_data
+) VALUES (
+    @id,
+    @name,
+    @owner_id,
+    @custom_domain,
+    @assigned_domain,
+    @license_data
+);
+
+-- name: UpdateOrganisation :execresult
+UPDATE convoy.organisations
+SET
+    name = @name,
+    custom_domain = @custom_domain,
+    assigned_domain = @assigned_domain,
+    disabled_at = @disabled_at,
+    license_data = @license_data,
+    updated_at = NOW()
+WHERE id = @id
+  AND deleted_at IS NULL;
+
+-- name: UpdateOrganisationLicenseData :execresult
+UPDATE convoy.organisations
+SET license_data = @license_data,
+    updated_at = NOW()
+WHERE id = @id
+  AND deleted_at IS NULL;
+
+-- name: DeleteOrganisation :execresult
+UPDATE convoy.organisations
+SET deleted_at = NOW()
+WHERE id = @id
+  AND deleted_at IS NULL;
+
+-- name: FetchOrganisationByID :one
+SELECT
+    id,
+    owner_id,
+    name,
+    custom_domain,
+    assigned_domain,
+    license_data,
+    created_at,
+    updated_at,
+    deleted_at,
+    disabled_at
+FROM convoy.organisations
+WHERE id = @id
+  AND deleted_at IS NULL;
+
+-- name: FetchOrganisationByCustomDomain :one
+SELECT
+    id,
+    owner_id,
+    name,
+    custom_domain,
+    assigned_domain,
+    license_data,
+    created_at,
+    updated_at,
+    deleted_at,
+    disabled_at
+FROM convoy.organisations
+WHERE custom_domain = @custom_domain
+  AND deleted_at IS NULL;
+
+-- name: FetchOrganisationByAssignedDomain :one
+SELECT
+    id,
+    owner_id,
+    name,
+    custom_domain,
+    assigned_domain,
+    license_data,
+    created_at,
+    updated_at,
+    deleted_at,
+    disabled_at
+FROM convoy.organisations
+WHERE assigned_domain = @assigned_domain
+  AND deleted_at IS NULL;
+
+-- name: CountOrganisations :one
+SELECT COUNT(*) AS count
+FROM convoy.organisations
+WHERE deleted_at IS NULL;
+
+-- name: FetchOrganisationsPaginated :many
+WITH filtered_organisations AS (
+    SELECT
+        id,
+        owner_id,
+        name,
+        custom_domain,
+        assigned_domain,
+        license_data,
+        created_at,
+        updated_at,
+        deleted_at,
+        disabled_at
+    FROM convoy.organisations
+    WHERE deleted_at IS NULL
+        -- Optional search filter (searches both name and id)
+        AND (
+            CASE
+                WHEN @has_search::boolean THEN
+                    (LOWER(name) LIKE LOWER(@search) OR LOWER(id) LIKE LOWER(@search))
+                ELSE true
+            END
+        )
+        -- Cursor-based pagination
+        AND (
+            CASE
+                WHEN @direction::text = 'next' THEN id <= @cursor
+                WHEN @direction::text = 'prev' THEN id >= @cursor
+                ELSE true
+            END
+        )
+    -- Sort order: DESC for forward, ASC for backward
+    ORDER BY
+        CASE WHEN @direction::text = 'next' THEN id END DESC,
+        CASE WHEN @direction::text = 'prev' THEN id END ASC
+    LIMIT @limit_val
+)
+-- Final select: reverse order for backward pagination
+SELECT
+    id, owner_id, name, custom_domain, assigned_domain, license_data,
+    created_at, updated_at, deleted_at, disabled_at
+FROM filtered_organisations
+ORDER BY
+    CASE WHEN @direction::text = 'prev' THEN id END DESC,
+    CASE WHEN @direction::text = 'next' THEN id END DESC;
+
+-- name: CountPrevOrganisations :one
+SELECT COALESCE(COUNT(DISTINCT id), 0) AS count
+FROM convoy.organisations
+WHERE deleted_at IS NULL
+    -- Same search filter as main query
+    AND (
+        CASE
+            WHEN @has_search::boolean THEN
+                (LOWER(name) LIKE LOWER(@search) OR LOWER(id) LIKE LOWER(@search))
+            ELSE true
+        END
+    )
+    -- Count items with ID greater than cursor (items before current page)
+    AND id > @cursor;
+
+-- Usage Calculation Queries
+
+-- name: CalculateIngressBytes :one
+-- Hybrid read: prefer the persisted byte columns and fall back to the true octet
+-- length of the payload for pre-migration rows. As the window fills with populated
+-- rows the fallback stops firing and the scan converges to index-only column reads.
+SELECT
+    COALESCE(SUM(COALESCE(e.raw_bytes, OCTET_LENGTH(e.raw))), 0)::BIGINT AS raw_bytes,
+    COALESCE(SUM(COALESCE(e.data_bytes, OCTET_LENGTH(e.data))), 0)::BIGINT AS data_bytes
+FROM convoy.events e
+JOIN convoy.projects p ON p.id = e.project_id
+WHERE p.organisation_id = @organisation_id
+  AND e.created_at >= @start_time
+  AND e.created_at <= @end_time
+  AND e.deleted_at IS NULL
+  AND p.deleted_at IS NULL;
+
+-- name: CalculateEgressBytes :one
+-- Hybrid read: prefer the denormalized event_bytes on the delivery; fall back to the
+-- parent event's true byte size for pre-migration deliveries. Once event_bytes is
+-- populated the COALESCE short-circuits and the events join never reads payloads.
+SELECT COALESCE(SUM(COALESCE(d.event_bytes, OCTET_LENGTH(e.raw) + OCTET_LENGTH(e.data))), 0)::BIGINT AS bytes
+FROM convoy.event_deliveries d
+JOIN convoy.events e ON e.id = d.event_id
+JOIN convoy.projects p ON p.id = e.project_id
+WHERE p.organisation_id = @organisation_id
+  AND d.status = 'Success'
+  AND d.created_at >= @start_time
+  AND d.created_at <= @end_time
+  AND p.deleted_at IS NULL;
+
+-- name: CountOrgEvents :one
+SELECT COUNT(*) AS count
+FROM convoy.events e
+JOIN convoy.projects p ON p.id = e.project_id
+WHERE p.organisation_id = @organisation_id
+  AND e.created_at >= @start_time
+  AND e.created_at <= @end_time
+  AND e.deleted_at IS NULL
+  AND p.deleted_at IS NULL;
+
+-- name: CountOrgDeliveries :one
+SELECT COUNT(*) AS count
+FROM convoy.event_deliveries d
+JOIN convoy.events e ON e.id = d.event_id
+JOIN convoy.projects p ON p.id = e.project_id
+WHERE p.organisation_id = @organisation_id
+  AND d.status = 'Success'
+  AND d.created_at >= @start_time
+  AND d.created_at <= @end_time
+  AND p.deleted_at IS NULL;

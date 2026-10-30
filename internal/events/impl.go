@@ -1,0 +1,837 @@
+package events
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/common"
+	"github.com/frain-dev/convoy/internal/events/repo"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+const (
+	PartitionSize = 30_000 // Batch size for event_endpoints inserts
+)
+
+func requireEventEndpointIDs(endpointIDs []string) error {
+	for _, id := range endpointIDs {
+		if util.IsStringEmpty(id) {
+			return datastore.ErrEventEndpointIDRequired
+		}
+	}
+	return nil
+}
+
+// Service implements datastore.EventRepository using sqlc-generated queries
+type Service struct {
+	logger log.Logger
+	repo   repo.Querier
+	db     *pgxpool.Pool
+}
+
+// Ensure Service implements datastore.EventRepository at compile time
+var _ datastore.EventRepository = (*Service)(nil)
+
+// New creates a new events service
+func New(logger log.Logger, db database.Database) *Service {
+	return &Service{
+		logger: logger,
+		repo:   repo.New(db.GetConn()),
+		db:     db.GetConn(),
+	}
+}
+
+// CreateEvent inserts a new event with batch endpoint processing
+func (s *Service) CreateEvent(ctx context.Context, event *datastore.Event) error {
+	// Set default status
+	event.Status = datastore.PendingStatus
+
+	// Prepare source_id
+	var sourceID *string
+	if !util.IsStringEmpty(event.SourceID) {
+		sourceID = &event.SourceID
+	}
+
+	if err := requireEventEndpointIDs(event.Endpoints); err != nil {
+		return err
+	}
+
+	// Start transaction
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := repo.New(tx)
+
+	// Idempotency claim: concurrent creates with the same key race the workers'
+	// check-then-insert, so the authoritative duplicate check lives here, inside
+	// the insert transaction. The transaction-scoped advisory lock (released on
+	// commit/rollback) serializes writers of the same project+key across all
+	// instances; the re-check under the lock sees rows committed by earlier
+	// holders, so exactly one row per key is persisted with
+	// is_duplicate_event=false. Events already flagged duplicate skip the claim,
+	// writing another duplicate row is always safe. Failure policy: fail closed,
+	// a lock or lookup error aborts the create and the caller retries.
+	if !util.IsStringEmpty(event.IdempotencyKey) && !event.IsDuplicateEvent {
+		_, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "events-idempotency:"+event.ProjectID+":"+event.IdempotencyKey)
+		if err != nil {
+			return err
+		}
+
+		exists, lookupErr := qtx.FindEventsByIdempotencyKey(ctx, repo.FindEventsByIdempotencyKeyParams{
+			IdempotencyKey: common.StringToPgTextNullable(event.IdempotencyKey),
+			ProjectID:      common.StringToPgTextNullable(event.ProjectID),
+		})
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if exists {
+			event.IsDuplicateEvent = true
+		}
+	}
+
+	// Create event params
+	params := repo.CreateEventParams{
+		ID:               common.StringToPgTextNullable(event.UID),
+		EventType:        common.StringToPgTextNullable(string(event.EventType)),
+		Endpoints:        common.StringToPgTextNullable(endpointsToString(event.Endpoints)),
+		ProjectID:        common.StringToPgTextNullable(event.ProjectID),
+		SourceID:         common.StringPtrToPgTextNullable(sourceID),
+		Headers:          headersToJSONB(event.Headers),
+		Raw:              common.StringToPgText(event.Raw),
+		Data:             event.Data,
+		UrlQueryParams:   pgtype.Text{String: event.URLQueryParams, Valid: true},
+		UrlPath:          pgtype.Text{String: event.URLPath, Valid: true},
+		IdempotencyKey:   common.StringToPgTextNullable(event.IdempotencyKey),
+		IsDuplicateEvent: common.BoolToPgBool(event.IsDuplicateEvent),
+		AcknowledgedAt:   common.NullTimeToPgTimestamptz(event.AcknowledgedAt),
+		Metadata:         common.StringToPgTextNullable(event.Metadata),
+		Status:           common.StringToPgTextNullable(string(event.Status)),
+		// True octet length of the ingested payload, persisted so usage reads sum
+		// columns instead of re-scanning raw/data.
+		RawBytes:  pgtype.Int8{Int64: int64(len(event.Raw)), Valid: true},
+		DataBytes: pgtype.Int8{Int64: int64(len(event.Data)), Valid: true},
+	}
+
+	// Insert event
+	err = qtx.CreateEvent(ctx, params)
+	if err != nil {
+		return err
+	}
+
+	// Batch insert event_endpoints using sqlc batchexec
+	endpoints := event.Endpoints
+	for i := 0; i < len(endpoints); i += PartitionSize {
+		end := i + PartitionSize
+		if end > len(endpoints) {
+			end = len(endpoints)
+		}
+
+		chunk := endpoints[i:end]
+		params := make([]repo.CreateEventEndpointParams, len(chunk))
+		for j, endpointID := range chunk {
+			params[j] = repo.CreateEventEndpointParams{
+				EventID:    common.StringToPgTextNullable(event.UID),
+				EndpointID: common.StringToPgTextNullable(endpointID),
+			}
+		}
+
+		var batchErr error
+		br := qtx.CreateEventEndpoint(ctx, params)
+		br.Exec(func(_ int, err error) {
+			if err != nil && batchErr == nil {
+				batchErr = err
+			}
+		})
+		if batchErr != nil {
+			return batchErr
+		}
+	}
+
+	// Same predicate as a delivery status update: today's UTC day is already
+	// inside the minute refresh window. An event whose created_at is older
+	// than that day has to mark the shared stale table so the job rewrites it.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO convoy.event_delivery_daily_counts_stale (day)
+		SELECT (e.created_at AT TIME ZONE 'UTC')::date
+		FROM convoy.events e
+		WHERE e.id = $1
+		  AND e.created_at < DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+		ON CONFLICT (day) DO NOTHING`, event.UID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// FindEventByID finds an event by ID
+func (s *Service) FindEventByID(ctx context.Context, projectID, id string) (*datastore.Event, error) {
+	params := repo.FindEventByIDParams{
+		ID:        common.StringToPgTextNullable(id),
+		ProjectID: common.StringToPgTextNullable(projectID),
+	}
+	row, err := s.repo.FindEventByID(ctx, params)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, datastore.ErrEventNotFound
+		}
+		return nil, err
+	}
+
+	return rowToEvent(row)
+}
+
+// FindEventsByIDs finds multiple events by IDs
+func (s *Service) FindEventsByIDs(ctx context.Context, projectID string, ids []string) ([]datastore.Event, error) {
+	params := repo.FindEventsByIDsParams{
+		EventIds:  ids,
+		ProjectID: common.StringToPgTextNullable(projectID),
+	}
+	rows, err := s.repo.FindEventsByIDs(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]datastore.Event, 0, len(rows))
+	for _, row := range rows {
+		event, err := rowToEvent(row)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, *event)
+	}
+
+	return events, nil
+}
+
+// FindEventsByIdempotencyKey checks if an event with the given idempotency key exists
+func (s *Service) FindEventsByIdempotencyKey(ctx context.Context, projectID, idempotencyKey string) (bool, error) {
+	params := repo.FindEventsByIdempotencyKeyParams{
+		IdempotencyKey: common.StringToPgTextNullable(idempotencyKey),
+		ProjectID:      common.StringToPgTextNullable(projectID),
+	}
+	return s.repo.FindEventsByIdempotencyKey(ctx, params)
+}
+
+// FindFirstEventWithIdempotencyKey finds the first non-duplicate event
+func (s *Service) FindFirstEventWithIdempotencyKey(ctx context.Context, projectID, idempotencyKey string) (*datastore.Event, error) {
+	params := repo.FindFirstEventWithIdempotencyKeyParams{
+		IdempotencyKey: common.StringToPgTextNullable(idempotencyKey),
+		ProjectID:      common.StringToPgTextNullable(projectID),
+	}
+	row, err := s.repo.FindFirstEventWithIdempotencyKey(ctx, params)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, datastore.ErrEventNotFound
+		}
+		return nil, err
+	}
+
+	return rowToEvent(row)
+}
+
+// FindEventIDsByIdempotencyKeys returns up to limit non-duplicate event IDs, oldest
+// first, whose idempotency key is any of keys.
+func (s *Service) FindEventIDsByIdempotencyKeys(ctx context.Context, projectID string, keys []string, limit int) ([]string, error) {
+	if len(keys) == 0 || limit <= 0 {
+		return nil, nil
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id FROM convoy.events
+		WHERE project_id = $1 AND idempotency_key = ANY($2::TEXT[])
+		  AND is_duplicate_event IS FALSE AND deleted_at IS NULL
+		ORDER BY created_at
+		LIMIT $3`,
+		projectID, keys, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// UpdateEventEndpoints updates event endpoints with batch processing
+func (s *Service) UpdateEventEndpoints(ctx context.Context, event *datastore.Event, endpoints []string) error {
+	if err := requireEventEndpointIDs(endpoints); err != nil {
+		return err
+	}
+
+	// Start transaction
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := repo.New(tx)
+
+	// Update endpoints array
+	updateParams := repo.UpdateEventEndpointsParams{
+		Endpoints: common.StringToPgTextNullable(endpointsToString(endpoints)),
+		ProjectID: common.StringToPgTextNullable(event.ProjectID),
+		ID:        common.StringToPgTextNullable(event.UID),
+	}
+	err = qtx.UpdateEventEndpoints(ctx, updateParams)
+	if err != nil {
+		return err
+	}
+
+	// Batch insert new event_endpoints using sqlc batchexec
+	for i := 0; i < len(endpoints); i += PartitionSize {
+		end := i + PartitionSize
+		if end > len(endpoints) {
+			end = len(endpoints)
+		}
+
+		chunk := endpoints[i:end]
+		params := make([]repo.CreateEventEndpointParams, len(chunk))
+		for j, endpointID := range chunk {
+			params[j] = repo.CreateEventEndpointParams{
+				EventID:    common.StringToPgTextNullable(event.UID),
+				EndpointID: common.StringToPgTextNullable(endpointID),
+			}
+		}
+
+		var batchErr error
+		br := qtx.CreateEventEndpoint(ctx, params)
+		br.Exec(func(_ int, err error) {
+			if err != nil && batchErr == nil {
+				batchErr = err
+			}
+		})
+		if batchErr != nil {
+			return batchErr
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// UpdateEventStatus updates event status. failureReason is operator facing text
+// shown against a Failure; pass an empty string for every other status so a
+// success or retry clears the reason from an earlier failed attempt.
+func (s *Service) UpdateEventStatus(ctx context.Context, event *datastore.Event, status datastore.EventStatus, failureReason string) error {
+	params := repo.UpdateEventStatusParams{
+		Status:        common.StringToPgTextNullable(string(status)),
+		FailureReason: common.StringToPgTextNullable(failureReason),
+		ProjectID:     common.StringToPgTextNullable(event.ProjectID),
+		ID:            common.StringToPgTextNullable(event.UID),
+	}
+
+	return s.repo.UpdateEventStatus(ctx, params)
+}
+
+// CountProjectMessages counts total events in a project
+func (s *Service) CountProjectMessages(ctx context.Context, projectID string) (int64, error) {
+	count, err := s.repo.CountProjectMessages(ctx, common.StringToPgTextNullable(projectID))
+	if err != nil {
+		return 0, err
+	}
+	return count.Int64, nil
+}
+
+// CountEvents counts events with filters
+func (s *Service) CountEvents(ctx context.Context, projectID string, filter *datastore.Filter) (int64, error) {
+	startDate, endDate := getCreatedDateFilter(filter.SearchParams.CreatedAtStart, filter.SearchParams.CreatedAtEnd)
+
+	params := repo.CountEventsParams{
+		ProjectID:      common.StringToPgTextNullable(projectID),
+		StartDate:      common.TimeToPgTimestamptz(startDate),
+		EndDate:        common.TimeToPgTimestamptz(endDate),
+		HasEndpointIds: common.BoolToPgBool(len(filter.EndpointIDs) > 0),
+		EndpointIds:    filter.EndpointIDs,
+		HasSourceID:    common.BoolToPgBool(!util.IsStringEmpty(filter.SourceID)),
+		SourceID:       common.StringToPgTextNullable(filter.SourceID),
+	}
+
+	count, err := s.repo.CountEvents(ctx, params)
+	if err != nil {
+		return 0, err
+	}
+	return count.Int64, nil
+}
+
+// LoadEventsPaged is the most complex method - handles bidirectional pagination with dual query paths
+func (s *Service) LoadEventsPaged(ctx context.Context, projectID string, filter *datastore.Filter) ([]datastore.Event, datastore.PaginationData, error) {
+	startDate, endDate := getCreatedDateFilter(filter.SearchParams.CreatedAtStart, filter.SearchParams.CreatedAtEnd)
+
+	// Add single EndpointID to EndpointIDs array if present
+	if !util.IsStringEmpty(filter.EndpointID) {
+		filter.EndpointIDs = append(filter.EndpointIDs, filter.EndpointID)
+	}
+
+	// List search runs on convoy.events within the active date window.
+	events, err := s.loadEventsPagedExists(ctx, projectID, filter, startDate, endDate)
+	if err != nil {
+		return nil, datastore.PaginationData{}, err
+	}
+
+	// Calculate PrevRowCount if not first page. Payload containment search still
+	// skips the probe so a heavy body filter is not run twice.
+	var rowCount datastore.PrevRowCount
+	isFirstPage := util.IsStringEmpty(filter.Pageable.Cursor())
+	if len(events) > 0 && !isFirstPage {
+		if NeedsSearchTimeout(filter, filter.Project) {
+			rowCount = datastore.PrevRowCount{Exists: true}
+		} else {
+			first := events[0]
+			rowCount, err = s.countPrevEvents(ctx, projectID, filter, first.UID, startDate, endDate)
+			if err != nil {
+				return nil, datastore.PaginationData{}, err
+			}
+		}
+	}
+
+	// Build event IDs for pagination metadata
+	ids := make([]string, len(events))
+	for i := range events {
+		ids[i] = events[i].UID
+	}
+
+	// Build pagination metadata with untrimmed ids (Build needs the extra item to detect hasNext)
+	pagination := &datastore.PaginationData{PrevRowCount: rowCount}
+	pagination = pagination.Build(filter.Pageable, ids)
+
+	// Trim LIMIT+1 after building pagination (hasNext detection is done, now remove the extra item)
+	if len(events) > filter.Pageable.PerPage {
+		events = events[:len(events)-1]
+	}
+
+	return events, *pagination, nil
+}
+
+// loadEventsPagedExists handles EXISTS path pagination including unified list search.
+func (s *Service) loadEventsPagedExists(ctx context.Context, projectID string, filter *datastore.Filter, startDate, endDate time.Time) ([]datastore.Event, error) {
+	cursor := filter.Pageable.Cursor()
+	direction := "next"
+	if filter.Pageable.Direction == datastore.Prev {
+		direction = "prev"
+	}
+	sortOrder := filter.Pageable.SortOrder()
+	search := ListSearchSQLFromFilter(filter, filter.Project)
+
+	base := existsPagedQueryBase{
+		HasEndpointOrOwnerFilter: common.BoolToPgBool(!util.IsStringEmpty(filter.OwnerID) || len(filter.EndpointIDs) > 0),
+		HasOwnerID:               common.BoolToPgBool(!util.IsStringEmpty(filter.OwnerID)),
+		OwnerID:                  common.StringToPgTextNullable(filter.OwnerID),
+		HasEndpointIds:           common.BoolToPgBool(len(filter.EndpointIDs) > 0),
+		EndpointIds:              filter.EndpointIDs,
+		ProjectID:                common.StringToPgTextNullable(projectID),
+		HasIdempotencyKey:        common.BoolToPgBool(!util.IsStringEmpty(filter.IdempotencyKey)),
+		IdempotencyKey:           common.StringToPgTextNullable(filter.IdempotencyKey),
+		StartDate:                common.TimeToPgTimestamptz(startDate),
+		EndDate:                  common.TimeToPgTimestamptz(endDate),
+		HasSourceIds:             common.BoolToPgBool(len(filter.SourceIDs) > 0),
+		SourceIds:                filter.SourceIDs,
+		HasBrokerMessageID:       common.BoolToPgBool(!util.IsStringEmpty(filter.BrokerMessageId)),
+		BrokerMessageID:          common.StringToPgTextNullable(filter.BrokerMessageId),
+		HasSearch:                common.BoolToPgBool(search.HasSearch),
+		HasQuery:                 common.BoolToPgBool(search.HasQuery),
+		SearchIDPrefix:           common.StringToPgTextNullable(search.SearchIDPrefix),
+		SearchContains:           common.StringToPgTextNullable(search.SearchContains),
+		HasBody:                  common.BoolToPgBool(search.HasBody),
+		Body:                     search.Body,
+		Cursor:                   common.StringToPgText(cursor),
+		Direction:                common.StringToPgText(direction),
+		SortOrder:                common.StringToPgText(sortOrder),
+		PageLimit:                pgtype.Int8{Int64: int64(filter.Pageable.Limit()), Valid: true},
+	}
+
+	rows, err := s.loadEventsPagedExistsRows(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]datastore.Event, 0, len(rows))
+	for _, row := range rows {
+		event, err := rowToEvent(row)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, *event)
+	}
+
+	return events, nil
+}
+
+type existsPagedQueryBase struct {
+	SortOrder                pgtype.Text
+	HasEndpointOrOwnerFilter pgtype.Bool
+	HasOwnerID               pgtype.Bool
+	OwnerID                  pgtype.Text
+	HasEndpointIds           pgtype.Bool
+	EndpointIds              []string
+	ProjectID                pgtype.Text
+	HasIdempotencyKey        pgtype.Bool
+	IdempotencyKey           pgtype.Text
+	StartDate                pgtype.Timestamptz
+	EndDate                  pgtype.Timestamptz
+	HasSourceIds             pgtype.Bool
+	SourceIds                []string
+	HasBrokerMessageID       pgtype.Bool
+	BrokerMessageID          pgtype.Text
+	HasSearch                pgtype.Bool
+	HasBody                  pgtype.Bool
+	Body                     []byte
+	HasQuery                 pgtype.Bool
+	SearchIDPrefix           pgtype.Text
+	SearchContains           pgtype.Text
+	Cursor                   pgtype.Text
+	Direction                pgtype.Text
+	PageLimit                pgtype.Int8
+}
+
+func (b existsPagedQueryBase) toInnerDescParams() repo.LoadEventsPagedExistsInnerDescParams {
+	return repo.LoadEventsPagedExistsInnerDescParams(b)
+}
+
+func (b existsPagedQueryBase) toInnerAscParams() repo.LoadEventsPagedExistsInnerAscParams {
+	return repo.LoadEventsPagedExistsInnerAscParams(b)
+}
+
+func eventsPagedInnerDesc(sortOrder, direction string) bool {
+	return (sortOrder == "DESC" && direction == "next") || (sortOrder == "ASC" && direction == "prev")
+}
+
+func applyListSearchCountParams(params *repo.CountPrevEventsParams, filter *datastore.Filter) {
+	search := ListSearchSQLFromFilter(filter, filter.Project)
+	params.HasSearch = common.BoolToPgBool(search.HasSearch)
+	params.HasQuery = common.BoolToPgBool(search.HasQuery)
+	params.SearchIDPrefix = common.StringToPgTextNullable(search.SearchIDPrefix)
+	params.SearchContains = common.StringToPgTextNullable(search.SearchContains)
+	params.HasBody = common.BoolToPgBool(search.HasBody)
+	params.Body = search.Body
+}
+
+func (s *Service) loadEventsPagedExistsRows(ctx context.Context, base existsPagedQueryBase) ([]any, error) {
+	sortOrder := base.SortOrder.String
+	direction := base.Direction.String
+	if eventsPagedInnerDesc(sortOrder, direction) {
+		rows, err := s.repo.LoadEventsPagedExistsInnerDesc(ctx, base.toInnerDescParams())
+		if err != nil {
+			return nil, err
+		}
+		out := make([]any, len(rows))
+		for i := range rows {
+			out[i] = rows[i]
+		}
+		return out, nil
+	}
+	rows, err := s.repo.LoadEventsPagedExistsInnerAsc(ctx, base.toInnerAscParams())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]any, len(rows))
+	for i := range rows {
+		out[i] = rows[i]
+	}
+	return out, nil
+}
+
+// countPrevEvents checks if there are events before cursor (for HasPrevPage)
+// "Previous" depends on sort order: DESC → id > cursor, ASC → id < cursor
+func (s *Service) countPrevEvents(ctx context.Context, projectID string, filter *datastore.Filter, cursor string, startDate, endDate time.Time) (datastore.PrevRowCount, error) {
+	sortOrder := filter.Pageable.SortOrder()
+
+	params := repo.CountPrevEventsParams{
+		ProjectID:                common.StringToPgTextNullable(projectID),
+		HasIdempotencyKey:        common.BoolToPgBool(!util.IsStringEmpty(filter.IdempotencyKey)),
+		IdempotencyKey:           common.StringToPgTextNullable(filter.IdempotencyKey),
+		StartDate:                common.TimeToPgTimestamptz(startDate),
+		EndDate:                  common.TimeToPgTimestamptz(endDate),
+		HasSourceIds:             common.BoolToPgBool(len(filter.SourceIDs) > 0),
+		SourceIds:                filter.SourceIDs,
+		HasOwnerID:               common.BoolToPgBool(!util.IsStringEmpty(filter.OwnerID)),
+		OwnerID:                  common.StringToPgTextNullable(filter.OwnerID),
+		HasEndpointOrOwnerFilter: common.BoolToPgBool(!util.IsStringEmpty(filter.OwnerID) || len(filter.EndpointIDs) > 0),
+		HasEndpointIds:           common.BoolToPgBool(len(filter.EndpointIDs) > 0),
+		EndpointIds:              filter.EndpointIDs,
+		HasBrokerMessageID:       common.BoolToPgBool(!util.IsStringEmpty(filter.BrokerMessageId)),
+		BrokerMessageID:          common.StringToPgTextNullable(filter.BrokerMessageId),
+		SortOrder:                common.StringToPgText(sortOrder),
+		Cursor:                   common.StringToPgTextNullable(cursor),
+	}
+	applyListSearchCountParams(&params, filter)
+
+	count, err := s.repo.CountPrevEvents(ctx, params)
+	if err != nil {
+		return datastore.PrevRowCount{}, err
+	}
+	return datastore.PrevRowCount{Exists: count.Int64 > 0}, nil
+}
+
+// CopyRows copies rows from events to events_search
+func (s *Service) CopyRows(ctx context.Context, projectID string, interval int) error {
+	// Start transaction
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := repo.New(tx)
+
+	// If interval is not default, hard delete ALL tokenized events first
+	if interval != config.DefaultSearchTokenizationInterval {
+		err = qtx.HardDeleteTokenizedEvents(ctx, repo.HardDeleteTokenizedEventsParams{
+			ProjectID: common.StringToPgTextNullable(projectID),
+			StartDate: pgtype.Timestamptz{Time: time.Unix(0, 0), Valid: true},
+			EndDate:   pgtype.Timestamptz{Time: time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC), Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Call PL/pgSQL function to copy rows
+	params := repo.CopyRowsFromEventsToEventsSearchParams{
+		ProjectID: projectID,
+		BatchSize: int32(interval),
+	}
+	err = qtx.CopyRowsFromEventsToEventsSearch(ctx, params)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// ExportRecords exports events to a writer as JSONL (one JSON object per line).
+// It uses a REPEATABLE READ transaction for snapshot consistency across batches.
+func (s *Service) ExportRecords(ctx context.Context, start, end time.Time, w io.Writer) (int64, error) {
+	// Begin REPEATABLE READ transaction for snapshot consistency
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, fmt.Errorf("begin snapshot tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Per-statement bound inside the snapshot tx (COUNT + each export batch),
+	// not the overall job deadline (backupExportDeadline). Keeps a stuck scan
+	// from holding the pool for the full export window while still allowing
+	// multi-minute batches on large payloads.
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5min'"); err != nil {
+		return 0, fmt.Errorf("set statement_timeout: %w", err)
+	}
+
+	txRepo := repo.New(tx)
+
+	// Count total exportable events in the window [start, end)
+	count, err := txRepo.CountExportedEvents(ctx, repo.CountExportedEventsParams{
+		CreatedAtEnd:   common.TimeToPgTimestamptz(end),
+		CreatedAtStart: common.TimeToPgTimestamptz(start),
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	count64 := common.PgInt8ToInt64(count)
+	if count64 == 0 {
+		return 0, nil
+	}
+
+	var (
+		batchSize  = 3000
+		numDocs    int64
+		numBatches = int(math.Ceil(float64(count64) / float64(batchSize)))
+		lastID     string
+	)
+
+	for i := 0; i < numBatches; i++ {
+		params := repo.ExportEventsParams{
+			CreatedAtEnd:   common.TimeToPgTimestamptz(end),
+			CreatedAtStart: common.TimeToPgTimestamptz(start),
+			Cursor:         common.StringToPgText(lastID),
+			PageLimit:      pgtype.Int8{Int64: int64(batchSize), Valid: true},
+		}
+
+		rows, exportErr := txRepo.ExportEvents(ctx, params)
+		if exportErr != nil {
+			return 0, fmt.Errorf("failed to query batch %d: %w", i, exportErr)
+		}
+
+		for _, row := range rows {
+			if _, writeErr := w.Write(row.JsonOutput); writeErr != nil {
+				return 0, writeErr
+			}
+			if _, writeErr := w.Write([]byte("\n")); writeErr != nil {
+				return 0, writeErr
+			}
+
+			numDocs++
+			lastID = row.ID
+		}
+	}
+
+	return numDocs, nil
+}
+
+// Helper: getCreatedDateFilter converts Unix timestamps to time.Time
+// When both are 0, defaults endDate to now so callers get all events.
+func getCreatedDateFilter(startDate, endDate int64) (time.Time, time.Time) {
+	if startDate == 0 && endDate == 0 {
+		return time.Unix(0, 0), time.Now()
+	}
+	return time.Unix(startDate, 0), time.Unix(endDate, 0)
+}
+
+const unPartitionEventsTableSQL = `
+CREATE OR REPLACE FUNCTION convoy.un_partition_events_table()
+    RETURNS VOID AS $$
+BEGIN
+    RAISE NOTICE 'Starting un-partitioning of events table...';
+
+    DROP TABLE IF EXISTS convoy.events_new;
+
+    CREATE TABLE convoy.events_new
+    (
+        id                 VARCHAR NOT NULL PRIMARY KEY,
+        event_type         TEXT NOT NULL,
+        endpoints          TEXT,
+        project_id         VARCHAR NOT NULL
+            CONSTRAINT events_new_project_id_fkey
+                REFERENCES convoy.projects,
+        source_id          VARCHAR
+            CONSTRAINT events_new_source_id_fkey
+                REFERENCES convoy.sources,
+        headers            JSONB,
+        raw                TEXT NOT NULL,
+        data               BYTEA NOT NULL,
+        created_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        updated_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        deleted_at         TIMESTAMP WITH TIME ZONE,
+        url_query_params   VARCHAR,
+        url_path           VARCHAR NOT NULL DEFAULT '',
+        idempotency_key    TEXT,
+        is_duplicate_event BOOLEAN DEFAULT FALSE,
+        acknowledged_at    TIMESTAMP WITH TIME ZONE,
+        status             TEXT,
+        metadata           TEXT,
+        failure_reason     TEXT,
+        raw_bytes          BIGINT,
+        data_bytes         BIGINT
+    );
+
+    ALTER TABLE convoy.events ADD COLUMN IF NOT EXISTS url_path VARCHAR NOT NULL DEFAULT '';
+
+    RAISE NOTICE 'Migrating data...';
+    INSERT INTO convoy.events_new (
+        id, event_type, endpoints, project_id, source_id, headers, raw, data,
+        created_at, updated_at, deleted_at, url_query_params, url_path, idempotency_key,
+        is_duplicate_event, acknowledged_at, status, metadata, failure_reason, raw_bytes, data_bytes
+    )
+    SELECT id, event_type, endpoints, project_id, source_id, headers, raw, data,
+           created_at, updated_at, deleted_at, url_query_params, COALESCE(url_path, ''), idempotency_key,
+           is_duplicate_event, acknowledged_at, status, metadata, failure_reason, raw_bytes, data_bytes
+    FROM convoy.events;
+
+    -- Drop the inbound FK so events_old can go. Do not add a real FK onto
+    -- event_deliveries here: that table may already be partitioned, and
+    -- Postgres rejects a key that omits the partition columns. Revert runs
+    -- AfterDetach (RestoreEventFKSQL) after this function returns.
+    ALTER TABLE convoy.event_deliveries DROP CONSTRAINT IF EXISTS event_deliveries_event_id_fkey;
+    ALTER TABLE IF EXISTS convoy.event_deliveries_default DROP CONSTRAINT IF EXISTS event_deliveries_event_id_fkey;
+
+    ALTER TABLE convoy.events RENAME TO events_old;
+    ALTER TABLE convoy.events_new RENAME TO events;
+    DROP TABLE IF EXISTS convoy.events_old;
+
+    RAISE NOTICE 'Recreating indexes...';
+    CREATE INDEX idx_events_created_at_key ON convoy.events (created_at);
+    CREATE INDEX idx_events_deleted_at_key ON convoy.events (deleted_at);
+    CREATE INDEX idx_events_project_id_deleted_at_key ON convoy.events (project_id, deleted_at);
+    CREATE INDEX idx_events_project_id_key ON convoy.events (project_id);
+    CREATE INDEX idx_events_project_id_source_id ON convoy.events (project_id, source_id);
+    CREATE INDEX idx_events_source_id ON convoy.events (source_id);
+    CREATE INDEX idx_idempotency_key_key ON convoy.events (idempotency_key);
+    CREATE INDEX idx_project_id_on_not_deleted ON convoy.events (project_id) WHERE deleted_at IS NULL;
+
+    RAISE NOTICE 'Successfully un-partitioned events table...';
+END;
+$$ LANGUAGE plpgsql;
+SELECT convoy.un_partition_events_table();
+`
+
+const unPartitionEventsSearchTableSQL = `
+CREATE OR REPLACE FUNCTION convoy.un_partition_events_search_table() RETURNS VOID AS $$
+BEGIN
+    RAISE NOTICE 'Starting un-partitioning of events_search table...';
+
+    DROP TABLE IF EXISTS convoy.events_search_new;
+
+    CREATE TABLE convoy.events_search_new
+    (
+        id                 VARCHAR NOT NULL PRIMARY KEY,
+        event_type         TEXT NOT NULL,
+        endpoints          TEXT,
+        project_id         VARCHAR NOT NULL REFERENCES convoy.projects,
+        source_id          VARCHAR REFERENCES convoy.sources,
+        headers            JSONB,
+        raw                TEXT NOT NULL,
+        data               BYTEA NOT NULL,
+        url_query_params   VARCHAR,
+        url_path           VARCHAR NOT NULL DEFAULT '',
+        idempotency_key    TEXT,
+        is_duplicate_event BOOLEAN DEFAULT FALSE,
+        search_token       TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', raw)) STORED,
+        created_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        deleted_at         TIMESTAMP WITH TIME ZONE,
+        acknowledged_at    TIMESTAMP WITH TIME ZONE,
+        status             TEXT,
+        metadata           TEXT,
+        failure_reason     TEXT
+    );
+
+    ALTER TABLE convoy.events_search ADD COLUMN IF NOT EXISTS url_path VARCHAR NOT NULL DEFAULT '';
+
+    RAISE NOTICE 'Migrating data...';
+    INSERT INTO convoy.events_search_new
+        (id, event_type, endpoints, project_id,
+         source_id, headers, raw, data, url_query_params, url_path,
+         idempotency_key, is_duplicate_event,
+         created_at, updated_at, deleted_at,
+         acknowledged_at, status, metadata, failure_reason)
+    SELECT id, event_type, endpoints, project_id,
+           source_id, headers, raw, data, url_query_params, COALESCE(url_path, ''),
+           idempotency_key, is_duplicate_event,
+           created_at, updated_at, deleted_at,
+           acknowledged_at, status, metadata, failure_reason
+    FROM convoy.events_search;
+
+    ALTER TABLE convoy.events_search RENAME TO events_search_old;
+    ALTER TABLE convoy.events_search_new RENAME TO events_search;
+    DROP TABLE IF EXISTS convoy.events_search_old;
+
+    RAISE NOTICE 'Recreating indexes...';
+    CREATE INDEX idx_events_search_id_key ON convoy.events_search (id);
+    CREATE INDEX idx_events_search_created_at_key ON convoy.events_search (created_at);
+    CREATE INDEX idx_events_search_deleted_at_key ON convoy.events_search (deleted_at);
+    CREATE INDEX idx_events_search_project_id_deleted_at_key ON convoy.events_search (project_id, deleted_at);
+    CREATE INDEX idx_events_search_project_id_key ON convoy.events_search (project_id);
+    CREATE INDEX idx_events_search_project_id_source_id ON convoy.events_search (project_id, source_id);
+    CREATE INDEX idx_events_search_source_id ON convoy.events_search (source_id);
+    CREATE INDEX idx_events_search_token_key ON convoy.events_search USING gin (search_token);
+
+    RAISE NOTICE 'Successfully un-partitioned events_search table...';
+END;
+$$ LANGUAGE plpgsql;
+SELECT convoy.un_partition_events_search_table();
+`

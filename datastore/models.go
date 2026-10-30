@@ -1,0 +1,2388 @@
+package datastore
+
+import (
+	"context"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/lib/pq"
+	"github.com/oklog/ulid/v2"
+	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/guregu/null.v4"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/auth"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/pkg/flatten"
+	"github.com/frain-dev/convoy/pkg/httpheader"
+)
+
+type SubscriptionUpdate struct {
+	UID       string
+	UpdatedAt time.Time
+}
+
+type Pageable struct {
+	PerPage    int           `json:"per_page"`
+	Direction  PageDirection `json:"direction"`
+	Sort       string        `json:"sort"`
+	PrevCursor string        `json:"prev_page_cursor"`
+	NextCursor string        `json:"next_page_cursor"`
+	Search     string        `json:"-"`
+}
+
+type PageDirection string
+
+const (
+	Next PageDirection = "next"
+	Prev PageDirection = "prev"
+)
+
+func (p Pageable) Cursor() string {
+	if p.Direction == Next {
+		return p.NextCursor
+	}
+
+	return p.PrevCursor
+}
+
+func (p Pageable) SortOrder() string {
+	if p.Sort == "ASC" || p.Sort == "DESC" {
+		return p.Sort
+	}
+
+	return "DESC"
+}
+
+func (p Pageable) Limit() int {
+	return p.PerPage + 1
+}
+
+func (p *Pageable) SetCursors() {
+	switch p.Sort {
+	case "ASC":
+		if isStringEmpty(p.NextCursor) {
+			p.NextCursor = "" // still set it empty, it might be filled with spaces
+		}
+	default:
+		if isStringEmpty(p.NextCursor) {
+			p.NextCursor = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+		}
+	}
+}
+func isStringEmpty(s string) bool { return len(strings.TrimSpace(s)) == 0 }
+
+type PaginationData struct {
+	PrevRowCount    PrevRowCount `json:"-"`
+	PerPage         int64        `json:"per_page"`
+	HasNextPage     bool         `json:"has_next_page"`
+	HasPreviousPage bool         `json:"has_prev_page"`
+	PrevPageCursor  string       `json:"prev_page_cursor"`
+	NextPageCursor  string       `json:"next_page_cursor"`
+	Total           int64        `json:"total,omitempty"`
+}
+
+type PrevRowCount struct {
+	Count  int
+	Exists bool
+}
+
+func (p *PaginationData) Build(pageable Pageable, items []string) *PaginationData {
+	p.PerPage = int64(pageable.PerPage)
+
+	var s, e string
+
+	if len(items) > 0 {
+		s = items[0]
+	}
+
+	if len(items) > 1 {
+		e = items[len(items)-1]
+	}
+
+	p.PrevPageCursor = s
+	p.NextPageCursor = e
+
+	// there's an extra item. We use it to find out if there is more data to be loaded
+	if len(items) > pageable.PerPage {
+		p.HasNextPage = true
+	}
+
+	if p.PrevRowCount.Count > 0 || p.PrevRowCount.Exists {
+		p.HasPreviousPage = true
+	}
+
+	return p
+}
+
+type Period int
+
+var PeriodValues = map[string]Period{
+	"daily":   Daily,
+	"weekly":  Weekly,
+	"monthly": Monthly,
+	"yearly":  Yearly,
+}
+
+var DefaultCursor = fmt.Sprintf("%d", math.MaxInt)
+
+const (
+	Daily Period = iota
+	Weekly
+	Monthly
+	Yearly
+)
+
+func IsValidPeriod(period string) bool {
+	_, ok := PeriodValues[period]
+	return ok
+}
+
+type SearchParams struct {
+	CreatedAtStart int64 `json:"created_at_start" bson:"created_at_start"`
+	CreatedAtEnd   int64 `json:"created_at_end" bson:"created_at_end"`
+	// Query is the event-deliveries table search (id, event type prefix, endpoint name).
+	Query string `json:"query,omitempty"`
+	// EventIDs keeps event deliveries of any of these events. An empty slice means no
+	// filter, so callers that resolved zero events must not run the query.
+	EventIDs []string `json:"event_ids,omitempty"`
+	// MinTrials keeps event deliveries with at least this many attempts. It is
+	// evaluated per row without an index, so the API requires a narrowing filter.
+	MinTrials int64 `json:"min_trials,omitempty"`
+}
+
+type (
+	StrategyProvider string
+	ProjectType      string
+	SourceType       string
+	SourceProvider   string
+	VerifierType     string
+	EncodingType     string
+	StorageType      string
+	KeyType          string
+	PubSubType       string
+	PubSubHandler    func(context.Context, *Source, string, []byte) error
+	MetaEventType    string
+	HookEventType    string
+	UserAuthType     string
+)
+
+type EndpointAuthenticationType string
+
+const (
+	HTTPSource     SourceType = "http"
+	RestApiSource  SourceType = "rest_api"
+	PubSubSource   SourceType = "pub_sub"
+	DBChangeStream SourceType = "db_change_stream"
+)
+
+const (
+	HTTPMetaEvent   MetaEventType = "http"
+	PubSubMetaEvent MetaEventType = "pub_sub"
+)
+
+const (
+	ProjectUpdated        HookEventType = "project.updated"
+	EndpointCreated       HookEventType = "endpoint.created"
+	EndpointUpdated       HookEventType = "endpoint.updated"
+	EndpointDeleted       HookEventType = "endpoint.deleted"
+	EventDeliveryUpdated  HookEventType = "eventdelivery.updated"
+	EventDeliverySuccess  HookEventType = "eventdelivery.success"
+	EventDeliveryFailed   HookEventType = "eventdelivery.failed"
+	EventDeliveryRetrying HookEventType = "eventdelivery.retrying"
+)
+
+const (
+	GithubSourceProvider  SourceProvider = "github"
+	TwitterSourceProvider SourceProvider = "twitter"
+	ShopifySourceProvider SourceProvider = "shopify"
+)
+
+const (
+	APIKeyAuthentication EndpointAuthenticationType = "api_key"
+	OAuth2Authentication EndpointAuthenticationType = "oauth2"
+	BasicAuthentication  EndpointAuthenticationType = "basic_auth"
+)
+
+const (
+	SqsPubSub    PubSubType = "sqs"
+	GooglePubSub PubSubType = "google"
+	KafkaPubSub  PubSubType = "kafka"
+	AmqpPubSub   PubSubType = "amqp"
+)
+
+func (s SourceProvider) IsValid() bool {
+	switch s {
+	case GithubSourceProvider, TwitterSourceProvider, ShopifySourceProvider:
+		return true
+	}
+	return false
+}
+
+func SourceProviderUsesPayloadSignature(provider SourceProvider) bool {
+	switch provider {
+	case GithubSourceProvider, ShopifySourceProvider, TwitterSourceProvider:
+		return true
+	default:
+		return false
+	}
+}
+
+func VerifierTypeUsesPayloadSignature(verifierType VerifierType) bool {
+	return verifierType == HMacVerifier
+}
+
+func (s SourceType) IsValid() bool {
+	switch s {
+	case HTTPSource, RestApiSource, PubSubSource, DBChangeStream:
+		return true
+	}
+	return false
+}
+
+const (
+	NoopVerifier      VerifierType = "noop"
+	HMacVerifier      VerifierType = "hmac"
+	BasicAuthVerifier VerifierType = "basic_auth"
+	APIKeyVerifier    VerifierType = "api_key"
+)
+
+const (
+	Base64Encoding EncodingType = "base64"
+	HexEncoding    EncodingType = "hex"
+)
+
+func (e EncodingType) String() string {
+	return string(e)
+}
+
+const (
+	OutgoingProject ProjectType = "outgoing"
+	IncomingProject ProjectType = "incoming"
+)
+
+const (
+	S3        StorageType = "s3"
+	OnPrem    StorageType = "on_prem"
+	AzureBlob StorageType = "azure_blob"
+)
+
+const (
+	ProjectKey   KeyType = "project"
+	AppPortalKey KeyType = "app_portal"
+	CLIKey       KeyType = "cli"
+	PersonalKey  KeyType = "personal_key"
+)
+
+func (k KeyType) IsValidAppKey() bool {
+	switch k {
+	case AppPortalKey, CLIKey:
+		return true
+	default:
+		return false
+	}
+}
+
+func (k KeyType) IsValid() bool {
+	switch k {
+	case AppPortalKey, CLIKey, ProjectKey, PersonalKey:
+		return true
+	}
+	return false
+}
+
+const (
+	LinearStrategyProvider      StrategyProvider = "linear"
+	ExponentialStrategyProvider StrategyProvider = "exponential"
+)
+
+const (
+	LocalUserType       UserAuthType = "local"
+	SSOUserType         UserAuthType = "sso"
+	GoogleOAuthUserType UserAuthType = "google_oauth"
+)
+
+var (
+	DefaultProjectConfig = ProjectConfig{
+		SearchPolicy:           "",
+		MaxIngestSize:          config.MaxResponseSize,
+		ReplayAttacks:          false,
+		DisableEndpoint:        false,
+		AddEventIDTraceHeaders: false,
+		RequestIDHeader:        config.DefaultRequestIDHeader,
+		SSL:                    &DefaultSSLConfig,
+		RateLimit:              &DefaultRateLimitConfig,
+		Strategy:               &DefaultStrategyConfig,
+		Signature:              GetDefaultSignatureConfig(),
+		MetaEvent:              &MetaEventConfiguration{IsEnabled: false},
+	}
+
+	DefaultSSLConfig = SSLConfiguration{EnforceSecureEndpoints: false}
+
+	DefaultStrategyConfig = StrategyConfiguration{
+		Type:       LinearStrategyProvider,
+		Duration:   100,
+		RetryCount: 10,
+	}
+
+	DefaultRateLimitConfig = RateLimitConfiguration{
+		Count:    1000,
+		Duration: 60,
+	}
+
+	DefaultRetryConfig = RetryConfiguration{
+		Type:       LinearStrategyProvider,
+		Duration:   10,
+		RetryCount: 3,
+	}
+
+	DefaultAlertConfig = AlertConfiguration{
+		Count:     4,
+		Threshold: "1h",
+	}
+	DefaultStoragePolicy = StoragePolicyConfiguration{
+		Type: OnPrem,
+		OnPrem: &OnPremStorage{
+			Path: null.NewString(convoy.DefaultOnPremDir, true),
+		},
+	}
+
+	DefaultRetentionPolicy = RetentionPolicyConfiguration{
+		Period:       "720h",
+		Enabled:      true,
+		EnabledKnown: true,
+	}
+	DefaultWebhookArchiving = WebhookArchivingConfiguration{
+		Enabled: false,
+	}
+	// DefaultCircuitBreakerConfiguration holds the non-zero defaults for
+	// project-level circuit breaker settings.
+	DefaultCircuitBreakerConfiguration = CircuitBreakerConfiguration{
+		SampleRate:                  30,
+		ErrorTimeout:                30,
+		FailureThreshold:            70,
+		SuccessThreshold:            5,
+		ObservabilityWindow:         5,
+		MinimumRequestCount:         10,
+		ConsecutiveFailureThreshold: 10,
+	}
+)
+
+func GetDefaultSignatureConfig() *SignatureConfiguration {
+	return &SignatureConfiguration{
+		Header: "X-Convoy-Signature",
+		Versions: []SignatureVersion{
+			{
+				UID:       ulid.Make().String(),
+				Hash:      "SHA256",
+				Encoding:  HexEncoding,
+				CreatedAt: time.Now(),
+			},
+		},
+	}
+}
+
+const (
+	ActiveEndpointStatus   EndpointStatus = "active"
+	InactiveEndpointStatus EndpointStatus = "inactive"
+	PausedEndpointStatus   EndpointStatus = "paused"
+)
+
+type (
+	EndpointStatus string
+	Secrets        []Secret
+)
+
+func (s *Secrets) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	var secrets []Secret
+	err := json.Unmarshal(b, &secrets)
+	if err != nil {
+		return err
+	}
+
+	// Filter the deleted secrets out, start from the
+	// last secret in the slice that hasn't been deleted
+	ix := 0
+	for i := range secrets {
+		if secrets[i].DeletedAt.IsZero() {
+			ix = i
+			break
+		}
+	}
+
+	*s = secrets[ix:]
+	return nil
+}
+
+func (s Secrets) Value() (driver.Value, error) {
+	if s == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type Endpoint struct {
+	UID                string  `json:"uid" db:"id"`
+	ProjectID          string  `json:"project_id" db:"project_id"`
+	OwnerID            string  `json:"owner_id,omitempty" db:"owner_id"`
+	Url                string  `json:"url" db:"url"`
+	Name               string  `json:"name" db:"name"`
+	Secrets            Secrets `json:"secrets" db:"secrets"`
+	AdvancedSignatures bool    `json:"advanced_signatures" db:"advanced_signatures"`
+	Description        string  `json:"description" db:"description"`
+	SlackWebhookURL    string  `json:"slack_webhook_url,omitempty" db:"slack_webhook_url"`
+	TeamsWebhookURL    string  `json:"teams_webhook_url,omitempty" db:"teams_webhook_url"`
+	SupportEmail       string  `json:"support_email,omitempty" db:"support_email"`
+	AppID              string  `json:"-" db:"app_id"` // Deprecated but necessary for backward compatibility
+
+	Status         EndpointStatus          `json:"status" db:"status"`
+	HttpTimeout    uint64                  `json:"http_timeout" db:"http_timeout"`
+	Events         int64                   `json:"events,omitempty" db:"event_count"`
+	Authentication *EndpointAuthentication `json:"authentication" db:"authentication" extensions:"x-nullable"`
+
+	RateLimit         int    `json:"rate_limit" db:"rate_limit"`
+	RateLimitDuration uint64 `json:"rate_limit_duration" db:"rate_limit_duration"`
+	ContentType       string `json:"content_type" db:"content_type"`
+	// FailureRate is the circuit breaker's rolling failure rate for this endpoint.
+	// It is a pointer so the API can return null when no rate was computed (circuit
+	// breaker feature off, or sampler not running), distinct from a genuine 0%.
+	FailureRate *float64 `json:"failure_rate" db:"-" extensions:"x-nullable"`
+	// CBState is the circuit breaker state ("open", "half-open", "closed") so the UI
+	// can reflect a tripped breaker on the endpoint status. Nil when CB is
+	// off/unlicensed or has no sample for this endpoint.
+	CBState *string `json:"cb_state" db:"-" extensions:"x-nullable"`
+
+	// PeriodFailureRate is the period failure rate from event_deliveries,
+	// (Failure+Retry)/(Success+Failure+Retry). Retry counts as failed-so-far.
+	// Nil when the range has no counted deliveries; sibling counts are transient.
+	PeriodFailureRate *float64 `json:"period_failure_rate" db:"-" extensions:"x-nullable"`
+	SuccessCount      *int64   `json:"success_count" db:"-" extensions:"x-nullable"`
+	FailureCount      *int64   `json:"failure_count" db:"-" extensions:"x-nullable"`
+	RetryCount        *int64   `json:"retry_count" db:"-" extensions:"x-nullable"`
+
+	// mTLS client certificate configuration
+	MtlsClientCert *MtlsClientCert `json:"mtls_client_cert,omitempty" db:"mtls_client_cert" extensions:"x-nullable"`
+
+	// OAuth2 configuration (scanned from oauth2_config column)
+	OAuth2Config *OAuth2 `json:"-" db:"oauth2_config" extensions:"x-nullable"`
+
+	// BasicAuth configuration (scanned from basic_auth_config column)
+	BasicAuthConfig *BasicAuth `json:"-" db:"basic_auth_config" extensions:"x-nullable"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+func (e *Endpoint) FindSecret(secretID string) *Secret {
+	for i := range e.Secrets {
+		secret := &e.Secrets[i]
+		if secret.UID == secretID {
+			return secret
+		}
+	}
+	return nil
+}
+
+type EndpointConfig struct {
+	AdvancedSignatures bool                    `json:"advanced_signatures" db:"advanced_signatures"`
+	Secrets            []Secret                `json:"secrets" db:"secrets"`
+	RateLimit          *RateLimitConfiguration `json:"ratelimit" db:"ratelimit" extensions:"x-nullable"`
+	Authentication     *EndpointAuthentication `json:"authentication" db:"authentication" extensions:"x-nullable"`
+}
+
+func (e *Endpoint) GetAuthConfig() EndpointAuthentication {
+	if e.Authentication != nil {
+		if e.Authentication.ApiKey != nil || e.Authentication.BasicAuth != nil {
+			return *e.Authentication
+		}
+	}
+
+	return EndpointAuthentication{ApiKey: &ApiKey{}}
+}
+
+func (e *Endpoint) GetActiveSecretIndex() (int, error) {
+	for idx, secret := range e.Secrets {
+		if secret.ExpiresAt.IsZero() {
+			return idx, nil
+		}
+	}
+	return 0, ErrNoActiveSecret
+}
+
+type Secret struct {
+	UID   string `json:"uid" db:"id"`
+	Value string `json:"value" db:"value"`
+
+	ExpiresAt null.Time `json:"expires_at,omitempty" db:"expires_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type EndpointAuthentication struct {
+	Type      EndpointAuthenticationType `json:"type,omitempty" db:"type" valid:"optional,in(api_key|oauth2|basic_auth)~unsupported authentication type"`
+	ApiKey    *ApiKey                    `json:"api_key,omitempty" db:"api_key" extensions:"x-nullable"`
+	OAuth2    *OAuth2                    `json:"oauth2,omitempty" db:"oauth2" extensions:"x-nullable"`
+	BasicAuth *BasicAuth                 `json:"basic_auth,omitempty" db:"basic_auth" extensions:"x-nullable"`
+}
+
+// MtlsClientCert holds the client certificate and key configuration for mTLS
+type MtlsClientCert struct {
+	// ClientCert is the client certificate PEM string
+	ClientCert string `json:"client_cert,omitempty" db:"client_cert"`
+	// ClientKey is the client private key PEM string
+	ClientKey string `json:"client_key,omitempty" db:"client_key"`
+}
+
+func (m *MtlsClientCert) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	return json.Unmarshal(b, m)
+}
+
+func (m MtlsClientCert) Value() (driver.Value, error) {
+	if m.ClientCert == "" && m.ClientKey == "" {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+var (
+	ErrOrgNotFound       = errors.New("organisation not found")
+	ErrDeviceNotFound    = errors.New("device not found")
+	ErrOrgInviteNotFound = errors.New("organisation invite not found")
+	ErrOrgMemberNotFound = errors.New("organisation member not found")
+)
+
+type Project struct {
+	UID             string             `json:"uid" db:"id"`
+	Name            string             `json:"name" db:"name"`
+	LogoURL         string             `json:"logo_url" db:"logo_url"`
+	OrganisationID  string             `json:"organisation_id" db:"organisation_id"`
+	ProjectConfigID string             `json:"-" db:"project_configuration_id"`
+	Type            ProjectType        `json:"type" db:"type"`
+	Config          *ProjectConfig     `json:"config" db:"config" extensions:"x-nullable"`
+	Statistics      *ProjectStatistics `json:"statistics" db:"statistics" extensions:"x-nullable"`
+
+	RetainedEvents int `json:"retained_events" db:"retained_events"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type ProjectMetadata struct {
+	RetainedEvents int `json:"retained_events" bson:"retained_events"`
+}
+
+type ProjectEvents struct {
+	Id          string `json:"id" db:"id"`
+	EventsCount int    `json:"events_count" db:"events_count"`
+}
+
+type SearchIndexParams struct {
+	ProjectID string `json:"project_id"`
+	Interval  int    `json:"interval"`
+}
+
+type SignatureVersions []SignatureVersion
+
+func (s *SignatureVersions) Scan(v interface{}) error {
+	b, ok := v.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", v)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	return json.Unmarshal(b, s)
+}
+
+func (s SignatureVersions) Value() (driver.Value, error) {
+	return json.Marshal(s)
+}
+
+type ProjectConfig struct {
+	MaxIngestSize                 uint64 `json:"max_payload_read_size" db:"max_payload_read_size"`
+	ReplayAttacks                 bool   `json:"replay_attacks_prevention_enabled" db:"replay_attacks_prevention_enabled"`
+	AddEventIDTraceHeaders        bool   `json:"add_event_id_trace_headers"`
+	DisableEndpoint               bool   `json:"disable_endpoint" db:"disable_endpoint"`
+	MultipleEndpointSubscriptions bool   `json:"multiple_endpoint_subscriptions" db:"multiple_endpoint_subscriptions"`
+	// VerifyDynamicEvents waits for endpoint/subscription resolve before
+	// returning 2xx from POST /events/dynamic. Default false keeps 201-on-queue.
+	VerifyDynamicEvents bool `json:"verify_dynamic_events" db:"verify_dynamic_events"`
+	// AllowUnmatchedDynamicURLs lets a dynamic event URL that matches none of the
+	// project's endpoint URL templates auto-create an endpoint. Default false
+	// rejects unmatched URLs.
+	AllowUnmatchedDynamicURLs bool `json:"allow_unmatched_dynamic_urls" db:"allow_unmatched_dynamic_urls"`
+	// SearchPolicy is an optional Go duration (e.g. "24h") shown in project settings.
+	// When set, the dashboard explains that payload/JSON search is additionally clamped
+	// to this lookback intersected with the Events log date picker. Empty means opt-out.
+	SearchPolicy    string                         `json:"search_policy" db:"search_policy"`
+	SSL             *SSLConfiguration              `json:"ssl" db:"ssl" extensions:"x-nullable"`
+	RateLimit       *RateLimitConfiguration        `json:"ratelimit" db:"ratelimit" extensions:"x-nullable"`
+	Strategy        *StrategyConfiguration         `json:"strategy" db:"strategy" extensions:"x-nullable"`
+	Signature       *SignatureConfiguration        `json:"signature" db:"signature" extensions:"x-nullable"`
+	RequestIDHeader config.RequestIDHeaderProvider `json:"request_id_header"`
+	MetaEvent       *MetaEventConfiguration        `json:"meta_event" db:"meta_event" extensions:"x-nullable"`
+	CircuitBreaker  *CircuitBreakerConfiguration   `json:"circuit_breaker" db:"circuit_breaker" extensions:"x-nullable"`
+}
+
+func (p *ProjectConfig) GetRateLimitConfig() RateLimitConfiguration {
+	if p.RateLimit != nil {
+		return *p.RateLimit
+	}
+	return RateLimitConfiguration{}
+}
+
+func (p *ProjectConfig) GetStrategyConfig() StrategyConfiguration {
+	if p.Strategy != nil {
+		return *p.Strategy
+	}
+	return StrategyConfiguration{}
+}
+
+func (p *ProjectConfig) GetSignatureConfig() SignatureConfiguration {
+	if p.Signature != nil {
+		return *p.Signature
+	}
+	return SignatureConfiguration{}
+}
+
+func (p *ProjectConfig) GetRequestIDHeader() config.RequestIDHeaderProvider {
+	if p != nil {
+		header := strings.TrimSpace(string(p.RequestIDHeader))
+		if header != "" {
+			return config.RequestIDHeaderProvider(header)
+		}
+	}
+	return config.DefaultRequestIDHeader
+}
+
+func (p *ProjectConfig) UsesCustomRequestIDHeader() bool {
+	if p == nil {
+		return false
+	}
+
+	header := strings.TrimSpace(string(p.RequestIDHeader))
+	return header != "" && config.RequestIDHeaderProvider(header) != config.DefaultRequestIDHeader
+}
+
+func (p *ProjectConfig) GetSSLConfig() SSLConfiguration {
+	if p.SSL != nil {
+		return *p.SSL
+	}
+	return SSLConfiguration{}
+}
+
+func (p *ProjectConfig) GetMetaEventConfig() MetaEventConfiguration {
+	if p.MetaEvent != nil {
+		return *p.MetaEvent
+	}
+
+	return MetaEventConfiguration{}
+}
+
+func (p *ProjectConfig) GetCircuitBreakerConfig() CircuitBreakerConfiguration {
+	if p.CircuitBreaker != nil {
+		return *p.CircuitBreaker
+	}
+
+	return DefaultCircuitBreakerConfiguration
+}
+
+type RateLimitConfiguration struct {
+	Count    int    `json:"count" db:"count"`
+	Duration uint64 `json:"duration" db:"duration"`
+}
+
+type StrategyConfiguration struct {
+	Type       StrategyProvider `json:"type" db:"type" valid:"optional~please provide a valid strategy type, in(linear|exponential)~unsupported strategy type"`
+	Duration   uint64           `json:"duration" db:"duration" valid:"optional~please provide a valid duration in seconds,int"`
+	RetryCount uint64           `json:"retry_count" db:"retry_count" valid:"optional~please provide a valid retry count,int"`
+}
+
+type SignatureConfiguration struct {
+	Hash     string                         `json:"-" db:"hash"` // Deprecated
+	Header   config.SignatureHeaderProvider `json:"header,omitempty" valid:"required~please provide a valid signature header"`
+	Versions SignatureVersions              `json:"versions" db:"versions"`
+}
+
+type SignatureVersion struct {
+	UID       string       `json:"uid" db:"id"`
+	Hash      string       `json:"hash,omitempty" db:"hash" valid:"required~please provide a valid hash,supported_hash~unsupported hash type"`
+	Encoding  EncodingType `json:"encoding" db:"encoding" valid:"required~please provide a valid signature header"`
+	CreatedAt time.Time    `json:"created_at,omitempty" db:"created_at" swaggertype:"string"`
+}
+
+type MetaEventConfiguration struct {
+	IsEnabled bool           `json:"is_enabled" db:"is_enabled"`
+	Type      MetaEventType  `json:"type" db:"type" valid:"optional, in(http|pub_sub)~unsupported meta event type"`
+	EventType pq.StringArray `json:"event_type" db:"event_type"`
+	URL       string         `json:"url" db:"url"`
+	Secret    string         `json:"secret" db:"secret"`
+	PubSub    *PubSubConfig  `json:"pub_sub" db:"pub_sub" extensions:"x-nullable"`
+}
+
+type SSLConfiguration struct {
+	EnforceSecureEndpoints bool `json:"enforce_secure_endpoints" db:"enforce_secure_endpoints"`
+}
+
+type CircuitBreakerConfiguration struct {
+	SampleRate                  uint64 `json:"sample_rate" db:"sample_rate"`
+	ErrorTimeout                uint64 `json:"error_timeout" db:"error_timeout"`
+	FailureThreshold            uint64 `json:"failure_threshold" db:"failure_threshold"`
+	SuccessThreshold            uint64 `json:"success_threshold" db:"success_threshold"`
+	MinimumRequestCount         uint64 `json:"minimum_request_count" db:"minimum_request_count"`
+	ObservabilityWindow         uint64 `json:"observability_window" db:"observability_window"`
+	ConsecutiveFailureThreshold uint64 `json:"consecutive_failure_threshold" db:"consecutive_failure_threshold"`
+}
+
+// RetentionPolicyConfiguration is partition drop only (enable + keep window).
+// Cold-storage archive enable lives on WebhookArchivingConfiguration.
+type RetentionPolicyConfiguration struct {
+	Period  string `json:"period" db:"period"`
+	Enabled bool   `json:"enabled" db:"enabled"`
+	// EnabledKnown is false when convoy.configurations.retention_enabled is NULL
+	// (pre-seed upgrade). Not serialized; boot seeds Enabled from env once.
+	EnabledKnown bool `json:"-"`
+}
+
+// WebhookArchivingConfiguration gates export of webhook data to cold storage.
+type WebhookArchivingConfiguration struct {
+	Enabled bool `json:"enabled" db:"enabled"`
+}
+
+type ProjectStatistics struct {
+	EventsExist        bool `json:"events_exist" db:"events_exist"`
+	SourcesExist       bool `json:"sources_exist" db:"sources_exist"`
+	EndpointsExist     bool `json:"endpoints_exist" db:"endpoints_exist"`
+	SubscriptionsExist bool `json:"subscriptions_exist" db:"subscriptions_exist"`
+}
+
+type ProjectFilter struct {
+	OrgID string `json:"org_id" bson:"org_id"`
+}
+
+func (o *Project) IsDeleted() bool { return o.DeletedAt.Valid }
+
+func (o *Project) IsOwner(e *Endpoint) bool { return o.UID == e.ProjectID }
+
+func (p *Project) ValidateOutgoingEventIdempotencyKey(idempotencyKey string) error {
+	if p == nil || p.Type != OutgoingProject {
+		return nil
+	}
+
+	if p.Config == nil || !p.Config.UsesCustomRequestIDHeader() {
+		return nil
+	}
+
+	if isStringEmpty(idempotencyKey) {
+		return ErrMissingIdempotencyKeyForCustomRequestIDHeader
+	}
+
+	return nil
+}
+
+var (
+	ErrSignupDisabled                                = errors.New("user registration is disabled")
+	ErrUserNotFound                                  = errors.New("user not found")
+	ErrSourceNotFound                                = errors.New("source not found")
+	ErrEventNotFound                                 = errors.New("event not found")
+	ErrEventEndpointIDRequired                       = errors.New("endpoint_id is required")
+	ErrProjectNotFound                               = errors.New("project not found")
+	ErrEndpointNotFound                              = errors.New("endpoint not found")
+	ErrSubscriptionNotFound                          = errors.New("subscription not found")
+	ErrEventDeliveryNotFound                         = errors.New("event delivery not found")
+	ErrDeliveryAttemptNotFound                       = errors.New("event delivery attempt not found")
+	ErrPortalLinkNotFound                            = errors.New("portal link not found")
+	ErrNotAuthorisedToAccessDocument                 = errors.New("your credentials cannot access or modify this resource")
+	ErrConfigNotFound                                = errors.New("config not found")
+	ErrConfigAlreadyExists                           = errors.New("configuration already exists")
+	ErrDuplicateProjectName                          = errors.New("a project with this name already exists")
+	ErrDuplicateEmail                                = errors.New("a user with this email already exists")
+	ErrNoActiveSecret                                = errors.New("no active secret found")
+	ErrSecretNotFound                                = errors.New("secret not found")
+	ErrMetaEventNotFound                             = errors.New("meta event not found")
+	ErrMissingIdempotencyKeyForCustomRequestIDHeader = errors.New("idempotency_key is required when a custom request_id_header is configured")
+	ErrJobNotFound                                   = errors.New("job not found")
+	ErrFeatureFlagNotFound                           = errors.New("feature flag not found")
+	ErrFeatureFlagOverrideNotFound                   = errors.New("feature flag override not found")
+	ErrEarlyAdopterFeatureNotFound                   = errors.New("early adopter feature not found")
+)
+
+type AppMetadata struct {
+	UID          string `json:"uid" bson:"uid"`
+	Title        string `json:"title" bson:"title"`
+	ProjectID    string `json:"project_id" bson:"project_id"`
+	SupportEmail string `json:"support_email" bson:"support_email"`
+}
+
+// EventType is used to identify a specific event.
+// This could be "user.new"
+// This will be used for data indexing
+// Makes it easy to filter by a list of events
+type EventType string
+
+type EndpointMetadata []*Endpoint
+
+func (s *EndpointMetadata) Scan(v interface{}) error {
+	b, ok := v.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", v)
+	}
+
+	if string(b) == "null" {
+		*s = nil // Set the pointer to nil
+		return nil
+	}
+
+	err := json.Unmarshal(b, s)
+	if err != nil {
+		return err
+	}
+
+	// Check if the slice only contains a nil element, and if so, set it to an empty slice
+	if len(*s) == 1 && (*s)[0] == nil {
+		*s = EndpointMetadata{}
+	}
+
+	return nil
+}
+
+// Event defines a payload to be sent to an application
+type Event struct {
+	UID       string    `json:"uid" db:"id"`
+	EventType EventType `json:"event_type" db:"event_type"`
+
+	SourceID         string                `json:"source_id,omitempty" db:"source_id"`
+	AppID            string                `json:"app_id,omitempty" db:"app_id"` // Deprecated
+	ProjectID        string                `json:"project_id,omitempty" db:"project_id"`
+	Endpoints        pq.StringArray        `json:"endpoints" db:"endpoints"`
+	Headers          httpheader.HTTPHeader `json:"headers" db:"headers"`
+	EndpointMetadata EndpointMetadata      `json:"endpoint_metadata,omitempty" db:"endpoint_metadata"`
+	Source           *Source               `json:"source_metadata,omitempty" db:"source_metadata" extensions:"x-nullable"`
+	URLQueryParams   string                `json:"url_query_params" db:"url_query_params"`
+	URLPath          string                `json:"url_path" db:"url_path"`
+	IdempotencyKey   string                `json:"idempotency_key" db:"idempotency_key"`
+	IsDuplicateEvent bool                  `json:"is_duplicate_event" db:"is_duplicate_event"`
+
+	// Data is an arbitrary JSON value that gets sent as the body of the
+	// webhook to the endpoints
+	Data json.RawMessage `json:"data,omitempty" db:"data" swaggertype:"object"`
+	Raw  string          `json:"raw,omitempty" db:"raw"`
+
+	Status EventStatus `json:"status" db:"status"`
+
+	// Metadata is internal worker routing state (channel, delay and, for dynamic
+	// events, the original payload including the endpoint secret and custom
+	// authorization headers). It is never serialized: it has no API consumer and
+	// emitting it would hand those credentials back over GET /events.
+	Metadata string `json:"-" db:"metadata"`
+
+	// FailureReason explains a Failure status to whoever is looking at the
+	// dashboard. It carries operator facing text only, never endpoint
+	// credentials, headers, or payload content.
+	FailureReason string `json:"failure_reason,omitempty" db:"failure_reason"`
+
+	AcknowledgedAt null.Time `json:"acknowledged_at,omitempty" db:"acknowledged_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt      time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt      null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+func (e *Event) GetRawHeaders() map[string]interface{} {
+	h := make(map[string]interface{}, len(e.Headers))
+
+	// re-use mem allocated for these copied variables
+	var k string
+	var v []string
+
+	for k, v = range e.Headers {
+		h[k] = v[0]
+	}
+	return h
+}
+
+func (e *Event) GetRawHeadersJSON() ([]byte, error) {
+	return json.Marshal(e.GetRawHeaders())
+}
+
+// GetRaw returns the raw event data. For backward compatibility, it returns
+// the Raw field if populated (old events), otherwise it computes it from Data
+// on-demand (new events with Raw field optimization).
+func (e *Event) GetRaw() string {
+	if e.Raw != "" {
+		return e.Raw // Return existing value (old events)
+	}
+	return string(e.Data) // Compute on-demand for new events
+}
+
+type (
+	SubscriptionType    string
+	EventStatus         string
+	EventDeliveryStatus string
+	HttpHeader          map[string]string
+	DeliveryMode        string
+)
+
+const (
+	AtLeastOnceDeliveryMode DeliveryMode = "at_least_once"
+	AtMostOnceDeliveryMode  DeliveryMode = "at_most_once"
+)
+
+func (h *HttpHeader) Scan(value interface{}) error {
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("HttpHeader: expected []byte, got %T", value)
+	}
+
+	return json.Unmarshal(bytes, h)
+}
+
+func (h HttpHeader) SetHeadersInRequest(r *http.Request) {
+	for k, v := range h {
+		r.Header.Set(k, v)
+	}
+}
+
+const (
+	ProcessingStatus EventStatus = "Processing"
+	FailureStatus    EventStatus = "Failure"
+	SuccessStatus    EventStatus = "Success"
+	RetryStatus      EventStatus = "Retry"
+	PendingStatus    EventStatus = "Pending"
+)
+
+const (
+	// ScheduledEventStatus when an Event has been scheduled for delivery
+	ScheduledEventStatus  EventDeliveryStatus = "Scheduled"
+	ProcessingEventStatus EventDeliveryStatus = "Processing"
+	DiscardedEventStatus  EventDeliveryStatus = "Discarded"
+	FailureEventStatus    EventDeliveryStatus = "Failure"
+	SuccessEventStatus    EventDeliveryStatus = "Success"
+	RetryEventStatus      EventDeliveryStatus = "Retry"
+)
+
+func (e EventDeliveryStatus) IsValid() bool {
+	switch e {
+	case ScheduledEventStatus,
+		ProcessingEventStatus,
+		DiscardedEventStatus,
+		FailureEventStatus,
+		SuccessEventStatus,
+		RetryEventStatus:
+		return true
+	default:
+		return false
+	}
+}
+
+// EndpointStatusDeliveryCount is a per-endpoint, per-status delivery count over a
+// time range. It powers the history (period) failure rate, which is distinct from
+// the circuit breaker's rolling rate.
+type EndpointStatusDeliveryCount struct {
+	EndpointID string
+	Status     EventDeliveryStatus
+	Count      int64
+}
+
+const (
+	SubscriptionTypeCLI SubscriptionType = "cli"
+	SubscriptionTypeAPI SubscriptionType = "api"
+)
+
+type Metadata struct {
+	// Data to be sent to endpoint.
+	Data     json.RawMessage  `json:"data" bson:"data" swaggertype:"object"`
+	Raw      string           `json:"raw" bson:"raw"`
+	Strategy StrategyProvider `json:"strategy" bson:"strategy"`
+
+	NextSendTime time.Time `json:"next_send_time" bson:"next_send_time"`
+
+	// NumTrials: number of times we have tried to deliver this Event to
+	// an application
+	NumTrials uint64 `json:"num_trials" bson:"num_trials"`
+
+	IntervalSeconds uint64 `json:"interval_seconds" bson:"interval_seconds"`
+
+	RetryLimit uint64 `json:"retry_limit" bson:"retry_limit"`
+
+	MaxRetrySeconds uint64 `json:"max_retry_seconds" bson:"max_retry_seconds"`
+}
+
+func (m *Metadata) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *Metadata) Value() (driver.Value, error) {
+	if m == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type EventIntervalData struct {
+	Interval  int64  `json:"index" db:"index"`
+	Time      string `json:"date" db:"total_time"`
+	GroupStub string `json:"-" db:"group_only"` // ignore
+}
+
+type EventInterval struct {
+	Data  EventIntervalData `json:"data" db:"data"`
+	Count uint64            `json:"count" db:"count"`
+}
+
+type DeliveryAttempt struct {
+	UID             string `json:"uid" db:"id"`
+	URL             string `json:"url" db:"url"`
+	Method          string `json:"method" db:"method"`
+	EndpointID      string `json:"endpoint_id" db:"endpoint_id"`
+	APIVersion      string `json:"api_version" db:"api_version"`
+	ProjectId       string `json:"project_id" db:"project_id"`
+	EventDeliveryId string `json:"msg_id" db:"event_delivery_id"`
+
+	IPAddress          string     `json:"ip_address,omitempty" db:"ip_address"`
+	RequestHeader      HttpHeader `json:"request_http_header,omitempty" db:"request_http_header"`
+	ResponseHeader     HttpHeader `json:"response_http_header,omitempty" db:"response_http_header"`
+	HttpResponseCode   string     `json:"http_status,omitempty" db:"http_status"`
+	ResponseData       []byte     `json:"-" db:"response_data"`
+	ResponseDataString string     `json:"response_data,omitempty" db:"-"`
+
+	Error  string `json:"error,omitempty" db:"error"`
+	Status bool   `json:"status,omitempty" db:"status"`
+
+	RequestedAt null.Time `json:"requested_at,omitempty" db:"requested_at" swaggertype:"string" extensions:"x-nullable"`
+	RespondedAt null.Time `json:"responded_at,omitempty" db:"responded_at" swaggertype:"string" extensions:"x-nullable"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type DeliveryAttempts []DeliveryAttempt
+
+func (h *DeliveryAttempts) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	if err := json.Unmarshal(b, &h); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (h DeliveryAttempts) Value() (driver.Value, error) {
+	if h == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(h)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+// EventDelivery defines a payload to be sent to an endpoint
+type EventDelivery struct {
+	UID            string                `json:"uid" db:"id"`
+	ProjectID      string                `json:"project_id,omitempty" db:"project_id"`
+	EventID        string                `json:"event_id,omitempty" db:"event_id"`
+	EndpointID     string                `json:"endpoint_id,omitempty" db:"endpoint_id"`
+	DeviceID       string                `json:"device_id" db:"device_id"`
+	SubscriptionID string                `json:"subscription_id,omitempty" db:"subscription_id"`
+	Headers        httpheader.HTTPHeader `json:"headers" db:"headers"`
+	TargetURL      string                `json:"target_url,omitempty" db:"target_url"`
+	URLQueryParams string                `json:"url_query_params" db:"url_query_params"`
+	IdempotencyKey string                `json:"idempotency_key" db:"idempotency_key"`
+
+	// Deprecated: Latency is deprecated.
+	Latency        string       `json:"latency" db:"latency"`
+	LatencySeconds float64      `json:"latency_seconds" db:"latency_seconds"`
+	EventType      EventType    `json:"event_type,omitempty" db:"event_type"`
+	DeliveryMode   DeliveryMode `json:"delivery_mode" db:"delivery_mode"`
+
+	Endpoint *Endpoint `json:"endpoint_metadata,omitempty" db:"endpoint_metadata" extensions:"x-nullable"`
+	Event    *Event    `json:"event_metadata,omitempty" db:"event_metadata" extensions:"x-nullable"`
+	Source   *Source   `json:"source_metadata,omitempty" db:"source_metadata" extensions:"x-nullable"`
+	Device   *Device   `json:"device_metadata,omitempty" db:"device_metadata" extensions:"x-nullable"`
+
+	DeliveryAttempts DeliveryAttempts    `json:"-" db:"attempts"`
+	Status           EventDeliveryStatus `json:"status" db:"status"`
+	Metadata         *Metadata           `json:"metadata" db:"metadata" extensions:"x-nullable"`
+	CLIMetadata      *CLIMetadata        `json:"cli_metadata" db:"cli_metadata" extensions:"x-nullable"`
+	Description      string              `json:"description,omitempty" db:"description"`
+	AcknowledgedAt   null.Time           `json:"acknowledged_at,omitempty" db:"acknowledged_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt        time.Time           `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt        time.Time           `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt        null.Time           `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+func (d *EventDelivery) GetLatencyStartTime() time.Time {
+	if d.AcknowledgedAt.IsZero() {
+		return d.CreatedAt
+	}
+	return d.AcknowledgedAt.Time
+}
+
+type CLIMetadata struct {
+	EventType string `json:"event_type" db:"event_type"`
+	SourceID  string `json:"source_id" db:"source_id"`
+}
+
+func (m *CLIMetadata) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *CLIMetadata) Value() (driver.Value, error) {
+	if m == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type APIKey struct {
+	UID       string    `json:"uid" db:"id"`
+	MaskID    string    `json:"mask_id,omitempty" db:"mask_id"`
+	Name      string    `json:"name" db:"name"`
+	Role      auth.Role `json:"role" db:"role"`
+	Hash      string    `json:"hash,omitempty" db:"hash"`
+	Salt      string    `json:"salt,omitempty" db:"salt"`
+	Type      KeyType   `json:"key_type" db:"key_type"`
+	UserID    string    `json:"user_id" db:"user_id"`
+	ExpiresAt null.Time `json:"expires_at,omitempty" db:"expires_at" extensions:"x-nullable"`
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" extensions:"x-nullable"`
+}
+
+type Subscription struct {
+	UID        string           `json:"uid" db:"id"`
+	Name       string           `json:"name" db:"name"`
+	Type       SubscriptionType `json:"type" db:"type"`
+	ProjectID  string           `json:"project_id" db:"project_id"`
+	SourceID   string           `json:"-" db:"source_id"`
+	EndpointID string           `json:"-" db:"endpoint_id"`
+	DeviceID   string           `json:"-" db:"device_id"`
+	Function   null.String      `json:"function" db:"function" swaggertype:"string" extensions:"x-nullable"`
+
+	Source   *Source   `json:"source_metadata" db:"source_metadata" extensions:"x-nullable"`
+	Endpoint *Endpoint `json:"endpoint_metadata" db:"endpoint_metadata" extensions:"x-nullable"`
+	Device   *Device   `json:"device_metadata" db:"device_metadata" extensions:"x-nullable"`
+
+	// subscription config
+	AlertConfig     *AlertConfiguration     `json:"alert_config,omitempty" db:"alert_config" extensions:"x-nullable"`
+	RetryConfig     *RetryConfiguration     `json:"retry_config,omitempty" db:"retry_config" extensions:"x-nullable"`
+	FilterConfig    *FilterConfiguration    `json:"filter_config,omitempty" db:"filter_config" extensions:"x-nullable"`
+	RateLimitConfig *RateLimitConfiguration `json:"rate_limit_config,omitempty" db:"rate_limit_config" extensions:"x-nullable"`
+
+	DeliveryMode DeliveryMode `json:"delivery_mode,omitempty" db:"delivery_mode"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+func (s *Subscription) GetAlertConfig() AlertConfiguration {
+	if s.AlertConfig != nil {
+		return *s.AlertConfig
+	}
+	return AlertConfiguration{}
+}
+
+func (s *Subscription) GetRetryConfig() RetryConfiguration {
+	if s.RetryConfig != nil {
+		return *s.RetryConfig
+	}
+	return RetryConfiguration{}
+}
+
+func (s *Subscription) GetFilterConfig() FilterConfiguration {
+	if s.FilterConfig != nil {
+		return *s.FilterConfig
+	}
+
+	return FilterConfiguration{
+		EventTypes: []string{},
+		Filter: FilterSchema{
+			Headers: M{},
+			Body:    M{},
+		},
+	}
+}
+
+func (s *Subscription) GetRateLimitConfig() RateLimitConfiguration {
+	if s.RateLimitConfig != nil {
+		return *s.RateLimitConfig
+	}
+	return RateLimitConfiguration{}
+}
+
+type CustomResponse struct {
+	Body        string `json:"body" db:"body"`
+	ContentType string `json:"content_type" db:"content_type"`
+}
+
+type Source struct {
+	UID               string          `json:"uid" db:"id"`
+	ProjectID         string          `json:"project_id" db:"project_id"`
+	MaskID            string          `json:"mask_id" db:"mask_id"`
+	Name              string          `json:"name" db:"name"`
+	URL               string          `json:"url" db:"-"`
+	Type              SourceType      `json:"type" db:"type"`
+	Provider          SourceProvider  `json:"provider" db:"provider"`
+	IsDisabled        bool            `json:"is_disabled" db:"is_disabled"`
+	VerifierID        string          `json:"-" db:"source_verifier_id"`
+	Verifier          *VerifierConfig `json:"verifier" db:"verifier" extensions:"x-nullable"`
+	CustomResponse    CustomResponse  `json:"custom_response" db:"custom_response"`
+	ProviderConfig    *ProviderConfig `json:"provider_config" db:"provider_config" extensions:"x-nullable"`
+	ForwardHeaders    pq.StringArray  `json:"forward_headers" db:"forward_headers"`
+	PubSub            *PubSubConfig   `json:"pub_sub" db:"pub_sub" extensions:"x-nullable"`
+	IdempotencyKeys   pq.StringArray  `json:"idempotency_keys" db:"idempotency_keys"`
+	EventTypeLocation string          `json:"event_type_location" db:"event_type_location"`
+	BodyFunction      *string         `json:"body_function" db:"body_function" extensions:"x-nullable"`
+	HeaderFunction    *string         `json:"header_function" db:"header_function" extensions:"x-nullable"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+func EventTypeLocationUsesRequestMetadata(location string) bool {
+	parts := strings.SplitN(location, ".", 3)
+	if len(parts) != 3 {
+		return false
+	}
+
+	switch strings.ToLower(parts[1]) {
+	case "header", "query", "queryparam":
+		return true
+	default:
+		return false
+	}
+}
+
+func SourceUsesPayloadSignature(source *Source) bool {
+	if source == nil {
+		return false
+	}
+
+	if SourceProviderUsesPayloadSignature(source.Provider) {
+		return true
+	}
+
+	return source.Verifier != nil && VerifierTypeUsesPayloadSignature(source.Verifier.Type)
+}
+
+type PubSubConfig struct {
+	Type    PubSubType          `json:"type" db:"type"`
+	Workers int                 `json:"workers" db:"workers"`
+	Sqs     *SQSPubSubConfig    `json:"sqs" db:"sqs" extensions:"x-nullable"`
+	Google  *GooglePubSubConfig `json:"google" db:"google" extensions:"x-nullable"`
+	Kafka   *KafkaPubSubConfig  `json:"kafka" db:"kafka" extensions:"x-nullable"`
+	Amqp    *AmqpPubSubConfig   `json:"amqp" db:"amqp" extensions:"x-nullable"`
+}
+
+func (p *PubSubConfig) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	var ps PubSubConfig
+	err := json.Unmarshal(b, &ps)
+	if err != nil {
+		return err
+	}
+
+	*p = ps
+	return nil
+}
+
+func (p PubSubConfig) Value() (driver.Value, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type SQSPubSubConfig struct {
+	AccessKeyID   string `json:"access_key_id" db:"access_key_id"`
+	SecretKey     string `json:"secret_key" db:"secret_key"`
+	DefaultRegion string `json:"default_region" db:"default_region"`
+	QueueName     string `json:"queue_name" db:"queue_name"`
+	Endpoint      string `json:"endpoint,omitempty" db:"endpoint"` // Optional: for LocalStack testing
+}
+
+type GooglePubSubConfig struct {
+	SubscriptionID string `json:"subscription_id" db:"subscription_id"`
+	// encoding/json marshals []byte as a base64 string on the wire.
+	ServiceAccount []byte `json:"service_account" db:"service_account" swaggertype:"string" format:"byte"`
+	ProjectID      string `json:"project_id" db:"project_id"`
+}
+
+type KafkaPubSubConfig struct {
+	Brokers         []string   `json:"brokers" db:"brokers"`
+	ConsumerGroupID string     `json:"consumer_group_id" db:"consumer_group_id"`
+	TopicName       string     `json:"topic_name" db:"topic_name"`
+	Auth            *KafkaAuth `json:"auth" db:"auth" extensions:"x-nullable"`
+}
+
+type AmqpPubSubConfig struct {
+	Schema             string           `json:"schema" db:"schema"`
+	Host               string           `json:"host" db:"host"`
+	Port               string           `json:"port" db:"port"`
+	Queue              string           `json:"queue" db:"queue"`
+	Auth               *AmqpCredentials `json:"auth" db:"auth" extensions:"x-nullable"`
+	BoundExchange      *string          `json:"bindedExchange" db:"binded_exchange" extensions:"x-nullable"`
+	Vhost              *string          `json:"vhost" db:"vhost" extensions:"x-nullable"`
+	RoutingKey         string           `json:"routingKey" db:"routing_key"`
+	DeadLetterExchange *string          `json:"deadLetterExchange" db:"dead_letter_exchange" extensions:"x-nullable"`
+}
+
+type AmqpCredentials struct {
+	User     string `json:"user" db:"user"`
+	Password string `json:"password" db:"password"`
+}
+
+type KafkaAuth struct {
+	Type     string `json:"type" db:"type"`
+	Hash     string `json:"hash" db:"hash"`
+	TLS      bool   `json:"tls" db:"tls"`
+	Username string `json:"username" db:"username"`
+	Password string `json:"password" db:"password"`
+}
+
+type User struct {
+	UID                        string    `json:"uid" db:"id"`
+	FirstName                  string    `json:"first_name" db:"first_name"`
+	LastName                   string    `json:"last_name" db:"last_name"`
+	Email                      string    `json:"email" db:"email"`
+	EmailVerified              bool      `json:"email_verified" db:"email_verified"`
+	Password                   string    `json:"-" db:"password"`
+	ResetPasswordToken         string    `json:"-" db:"reset_password_token"`
+	EmailVerificationToken     string    `json:"-" db:"email_verification_token"`
+	CreatedAt                  time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt                  time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt                  null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+	ResetPasswordExpiresAt     time.Time `json:"reset_password_expires_at,omitempty" db:"reset_password_expires_at,omitempty" swaggertype:"string"`
+	EmailVerificationExpiresAt time.Time `json:"-" db:"email_verification_expires_at,omitempty" swaggertype:"string"`
+	AuthType                   string    `json:"auth_type" db:"auth_type" swaggertype:"string"`
+}
+
+type RetryConfiguration struct {
+	Type       StrategyProvider `json:"type,omitempty" db:"type" valid:"supported_retry_strategy~please provide a valid retry strategy type"`
+	Duration   uint64           `json:"duration,omitempty" db:"duration" valid:"duration~please provide a valid time duration"`
+	RetryCount uint64           `json:"retry_count" db:"retry_count" valid:"int~please provide a valid retry count"`
+}
+
+type AlertConfiguration struct {
+	Count     int    `json:"count" db:"count"`
+	Threshold string `json:"threshold" db:"threshold" valid:"duration~please provide a valid time duration"`
+}
+
+type FilterConfiguration struct {
+	EventTypes pq.StringArray `json:"event_types" db:"event_types"`
+	Filter     FilterSchema   `json:"filter" db:"filter"`
+}
+
+// EventTypeFilter represents a filter configuration for a specific event type within a subscription
+type EventTypeFilter struct {
+	UID            string     `json:"uid" db:"id"`
+	SubscriptionID string     `json:"subscription_id" db:"subscription_id"`
+	EventType      string     `json:"event_type" db:"event_type"`
+	EnabledAt      *time.Time `json:"enabled_at" db:"enabled_at" swaggertype:"string" extensions:"x-nullable"`
+	EnabledAtSet   bool       `json:"-" db:"-"`
+	Headers        M          `json:"headers" db:"headers"`
+	Body           M          `json:"body" db:"body"`
+	Query          M          `json:"query" db:"query"`
+	Path           M          `json:"path" db:"path"`
+	RawHeaders     M          `json:"raw_headers" db:"raw_headers"`
+	RawBody        M          `json:"raw_body" db:"raw_body"`
+	RawQuery       M          `json:"raw_query" db:"raw_query"`
+	RawPath        M          `json:"raw_path" db:"raw_path"`
+	CreatedAt      time.Time  `json:"-" db:"created_at" swaggertype:"string"`
+	UpdatedAt      time.Time  `json:"-" db:"updated_at" swaggertype:"string"`
+}
+
+func (f *EventTypeFilter) IsEnabled() bool {
+	return f != nil && (f.EnabledAt != nil || !f.EnabledAtSet)
+}
+
+type M map[string]interface{}
+
+func HasArrayWildcardSelector(filter M) bool {
+	for key, value := range filter {
+		for _, part := range strings.Split(key, ".") {
+			if part == "$" {
+				return true
+			}
+		}
+
+		switch child := value.(type) {
+		case M:
+			if HasArrayWildcardSelector(child) {
+				return true
+			}
+		case map[string]interface{}:
+			if HasArrayWildcardSelector(M(child)) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// Flatten is only intended for use for filter body & headers
+// It will modify the calling M map, so use carefully.
+func (h *M) Flatten() error {
+	if h == nil {
+		return nil
+	}
+
+	// The flatten.M conversion is important here, because flatten.Flatten cannot
+	// reconcile M to map[string]interface{}, they are distinct types
+	// whereas flatten.M = map[string]interface{} they are identical. See
+	// https://go.dev/ref/spec#Type_identity for more info.
+	f, err := flatten.Flatten(flatten.M(*h))
+	if err != nil {
+		return err
+	}
+
+	*h = f
+	return nil
+}
+
+func (h *M) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	return json.Unmarshal(b, h)
+}
+
+func (h M) Value() (driver.Value, error) {
+	if h == nil {
+		return []byte("{}"), nil
+	}
+
+	b, err := json.Marshal(h)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type FilterSchema struct {
+	IsFlattened bool `json:"is_flattened" db:"is_flattened"`
+	Headers     M    `json:"headers" db:"headers"`
+	Body        M    `json:"body" db:"body"`
+	Query       M    `json:"query" db:"query"`
+	Path        M    `json:"path" db:"path"`
+
+	RawHeaders M `json:"-" db:"raw_headers"`
+	RawBody    M `json:"-" db:"raw_body"`
+	RawQuery   M `json:"-" db:"raw_query"`
+	RawPath    M `json:"-" db:"raw_path"`
+}
+
+type FilterTestRequest struct {
+	Body    interface{} `json:"body"`
+	Headers M           `json:"headers"`
+	Query   M           `json:"query"`
+	Path    M           `json:"path"`
+}
+
+type ProviderConfig struct {
+	Twitter *TwitterProviderConfig `json:"twitter" db:"twitter" extensions:"x-nullable"`
+}
+
+type TwitterProviderConfig struct {
+	CrcVerifiedAt null.Time `json:"crc_verified_at" db:"crc_verified_at" extensions:"x-nullable"`
+}
+
+type VerifierConfig struct {
+	Type      VerifierType `json:"type,omitempty" db:"type" valid:"supported_verifier~please provide a valid verifier type"`
+	HMac      *HMac        `json:"hmac" db:"hmac" extensions:"x-nullable"`
+	BasicAuth *BasicAuth   `json:"basic_auth" db:"basic_auth" extensions:"x-nullable"`
+	ApiKey    *ApiKey      `json:"api_key" db:"api_key" extensions:"x-nullable"`
+}
+
+type HMac struct {
+	Header   string       `json:"header" db:"header" valid:"required"`
+	Hash     string       `json:"hash" db:"hash" valid:"supported_hash,required"`
+	Secret   string       `json:"secret" db:"secret" valid:"required"`
+	Encoding EncodingType `json:"encoding" db:"encoding" valid:"supported_encoding~please provide a valid encoding type,required"`
+}
+
+type BasicAuth struct {
+	UserName string `json:"username" db:"username" valid:"required" `
+	Password string `json:"password" db:"password" valid:"required"`
+}
+
+func (ba *BasicAuth) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	return json.Unmarshal(b, ba)
+}
+
+func (ba BasicAuth) Value() (driver.Value, error) {
+	if ba.UserName == "" && ba.Password == "" {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(ba)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type ApiKey struct {
+	HeaderValue string `json:"header_value" db:"header_value" valid:"required"`
+	HeaderName  string `json:"header_name" db:"header_name" valid:"required"`
+}
+
+// OAuth2AuthenticationType represents the type of OAuth2 authentication
+type OAuth2AuthenticationType string
+
+const (
+	SharedSecretAuth    OAuth2AuthenticationType = "shared_secret"
+	ClientAssertionAuth OAuth2AuthenticationType = "client_assertion"
+)
+
+// OAuth2SigningKey represents a JWK-formatted signing key for client assertion
+// Supports both EC (Elliptic Curve) and RSA key types
+type OAuth2SigningKey struct {
+	Kty string `json:"kty"` // Key type: "EC" or "RSA"
+
+	// EC (Elliptic Curve) key fields
+	Crv string `json:"crv,omitempty"` // Curve: "P-256", "P-384", "P-521"
+	X   string `json:"x,omitempty"`   // X coordinate (EC only)
+	Y   string `json:"y,omitempty"`   // Y coordinate (EC only)
+	D   string `json:"d,omitempty"`   // Private key (EC only)
+
+	// RSA key fields
+	N  string `json:"n,omitempty"`  // RSA modulus (RSA only)
+	E  string `json:"e,omitempty"`  // RSA public exponent (RSA only)
+	P  string `json:"p,omitempty"`  // RSA first prime factor (RSA private key only)
+	Q  string `json:"q,omitempty"`  // RSA second prime factor (RSA private key only)
+	Dp string `json:"dp,omitempty"` // RSA first factor CRT exponent (RSA private key only)
+	Dq string `json:"dq,omitempty"` // RSA second factor CRT exponent (RSA private key only)
+	Qi string `json:"qi,omitempty"` // RSA first CRT coefficient (RSA private key only)
+
+	Kid string `json:"kid"` // Key ID
+}
+
+// OAuth2ExpiryTimeUnit represents the unit for expiry time
+type OAuth2ExpiryTimeUnit string
+
+const (
+	ExpiryTimeUnitSeconds      OAuth2ExpiryTimeUnit = "seconds"
+	ExpiryTimeUnitMilliseconds OAuth2ExpiryTimeUnit = "milliseconds"
+	ExpiryTimeUnitMinutes      OAuth2ExpiryTimeUnit = "minutes"
+	ExpiryTimeUnitHours        OAuth2ExpiryTimeUnit = "hours"
+)
+
+// OAuth2FieldMapping allows custom field name mappings for token response
+type OAuth2FieldMapping struct {
+	AccessToken string `json:"access_token,omitempty"` // Field name for access token (e.g., "accessToken", "access_token", "token")
+	TokenType   string `json:"token_type,omitempty"`   // Field name for token type (e.g., "tokenType", "token_type")
+	ExpiresIn   string `json:"expires_in,omitempty"`   // Field name for expiry time (e.g., "expiresIn", "expires_in", "expiresAt")
+}
+
+// OAuth2 holds OAuth2 authentication configuration
+type OAuth2 struct {
+	URL                string                   `json:"url" db:"url" valid:"required"`
+	ClientID           string                   `json:"client_id" db:"client_id" valid:"required"`
+	GrantType          string                   `json:"grant_type,omitempty" db:"grant_type"`
+	Scope              string                   `json:"scope,omitempty" db:"scope"`
+	Audience           string                   `json:"audience,omitempty" db:"audience"`
+	AuthenticationType OAuth2AuthenticationType `json:"authentication_type" db:"authentication_type" valid:"required,in(shared_secret|client_assertion)~unsupported authentication type"`
+	ClientSecret       string                   `json:"client_secret,omitempty" db:"client_secret"`                     // Encrypted at rest
+	SigningKey         *OAuth2SigningKey        `json:"signing_key,omitempty" db:"signing_key" extensions:"x-nullable"` // Encrypted at rest
+	SigningAlgorithm   string                   `json:"signing_algorithm,omitempty" db:"signing_algorithm"`
+	Issuer             string                   `json:"issuer,omitempty" db:"issuer"`
+	Subject            string                   `json:"subject,omitempty" db:"subject"`
+	// Field mapping for flexible token response parsing
+	FieldMapping *OAuth2FieldMapping `json:"field_mapping,omitempty" db:"field_mapping" extensions:"x-nullable"`
+	// Expiry time unit (seconds, milliseconds, minutes, hours)
+	ExpiryTimeUnit OAuth2ExpiryTimeUnit `json:"expiry_time_unit,omitempty" db:"expiry_time_unit"`
+}
+
+func (o *OAuth2) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	return json.Unmarshal(b, o)
+}
+
+func (o OAuth2) Value() (driver.Value, error) {
+	if o.URL == "" && o.ClientID == "" {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(o)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type FeatureFlag struct {
+	UID        string    `json:"uid" db:"id"`
+	FeatureKey string    `json:"feature_key" db:"feature_key"`
+	Enabled    bool      `json:"enabled" db:"enabled"`
+	CreatedAt  time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	// EnvEnabled is transient (not persisted): whether this flag is listed in
+	// CONVOY_ENABLE_FEATURE_FLAG.
+	EnvEnabled bool `json:"env_enabled" db:"-"`
+	// AdminManaged is transient and only used by the Admin feature-flags UI.
+	AdminManaged bool `json:"admin_managed" db:"-"`
+}
+
+type FeatureFlagOverride struct {
+	UID           string      `json:"uid" db:"id"`
+	FeatureFlagID string      `json:"feature_flag_id" db:"feature_flag_id"`
+	OwnerType     string      `json:"owner_type" db:"owner_type"`
+	OwnerID       string      `json:"owner_id" db:"owner_id"`
+	Enabled       bool        `json:"enabled" db:"enabled"`
+	EnabledAt     null.Time   `json:"enabled_at,omitempty" db:"enabled_at" swaggertype:"string" extensions:"x-nullable"`
+	EnabledBy     null.String `json:"enabled_by,omitempty" db:"enabled_by" extensions:"x-nullable"`
+	CreatedAt     time.Time   `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt     time.Time   `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+}
+
+type EarlyAdopterFeature struct {
+	UID            string      `json:"uid" db:"id"`
+	OrganisationID string      `json:"organisation_id" db:"organisation_id"`
+	FeatureKey     string      `json:"feature_key" db:"feature_key"`
+	Enabled        bool        `json:"enabled" db:"enabled"`
+	EnabledBy      null.String `json:"enabled_by,omitempty" db:"enabled_by" extensions:"x-nullable"`
+	EnabledAt      null.Time   `json:"enabled_at,omitempty" db:"enabled_at" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt      time.Time   `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt      time.Time   `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+}
+
+type Organisation struct {
+	UID            string      `json:"uid" db:"id"`
+	OwnerID        string      `json:"" db:"owner_id"`
+	Name           string      `json:"name" db:"name"`
+	CustomDomain   null.String `json:"custom_domain" db:"custom_domain" extensions:"x-nullable"`
+	AssignedDomain null.String `json:"assigned_domain" db:"assigned_domain" extensions:"x-nullable"`
+	LicenseData    string      `json:"license_data,omitempty" db:"license_data"`
+	DisabledAt     null.Time   `json:"disabled_at,omitempty" db:"disabled_at" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt      time.Time   `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt      time.Time   `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt      null.Time   `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type OrganisationUsage struct {
+	OrganisationID string
+	Period         string
+	Received       UsageMetrics
+	Sent           UsageMetrics
+	CreatedAt      time.Time
+}
+
+type UsageMetrics struct {
+	Volume int64
+	Bytes  int64
+}
+
+type Configuration struct {
+	UID                string `json:"uid" db:"id"`
+	IsAnalyticsEnabled bool   `json:"-" db:"is_analytics_enabled"`
+	IsSignupEnabled    bool   `json:"is_signup_enabled" db:"is_signup_enabled"`
+	AdminManaged       bool   `json:"admin_managed" db:"admin_managed"`
+	AdminManagedKnown  bool   `json:"-" db:"-"`
+
+	StoragePolicy    *StoragePolicyConfiguration    `json:"storage_policy" db:"storage_policy" extensions:"x-nullable"`
+	RetentionPolicy  *RetentionPolicyConfiguration  `json:"retention_policy" db:"retention_policy" extensions:"x-nullable"`
+	WebhookArchiving *WebhookArchivingConfiguration `json:"webhook_archiving" db:"webhook_archiving" extensions:"x-nullable"`
+
+	LicenseKey              string                               `json:"license_key,omitempty" db:"license_key"`
+	CheckoutLicenseKey      string                               `json:"checkout_license_key,omitempty" db:"checkout_license_key"`
+	LicenseKeySource        string                               `json:"license_key_source,omitempty" db:"license_key_source"`
+	CheckoutAttempts        map[string]SelfHostedCheckoutAttempt `json:"checkout_attempts,omitempty" db:"checkout_attempts"`
+	ActiveCheckoutAttemptID string                               `json:"active_checkout_attempt_id,omitempty" db:"active_checkout_attempt_id"`
+	CheckoutID              string                               `json:"checkout_id,omitempty" db:"checkout_id"`
+	ExternalID              string                               `json:"external_id,omitempty" db:"external_id"`
+	LicenseSyncedAt         null.Time                            `json:"license_synced_at,omitempty" db:"license_synced_at" swaggertype:"string" extensions:"x-nullable"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type SelfHostedCheckoutAttempt struct {
+	AttemptID            string    `json:"attempt_id"`
+	CheckoutID           string    `json:"checkout_id,omitempty"`
+	CheckoutURL          string    `json:"checkout_url,omitempty"`
+	CheckoutNonce        string    `json:"checkout_nonce,omitempty"`
+	CheckoutNonceHash    string    `json:"checkout_nonce_hash,omitempty"`
+	Email                string    `json:"email,omitempty"`
+	PlanID               string    `json:"plan_id,omitempty"`
+	Interval             string    `json:"interval,omitempty"`
+	Status               string    `json:"status"`
+	ExternalID           string    `json:"external_id,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CompletedAt          null.Time `json:"completed_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	LastCompletionStatus string    `json:"last_completion_status,omitempty"`
+}
+
+func (c *Configuration) GetRetentionPolicyConfig() RetentionPolicyConfiguration {
+	if c.RetentionPolicy != nil {
+		return *c.RetentionPolicy
+	}
+	return RetentionPolicyConfiguration{}
+}
+
+func (c *Configuration) GetWebhookArchivingConfig() WebhookArchivingConfiguration {
+	if c.WebhookArchiving != nil {
+		return *c.WebhookArchiving
+	}
+	return WebhookArchivingConfiguration{}
+}
+
+type StoragePolicyConfiguration struct {
+	Type      StorageType       `json:"type,omitempty" db:"type" valid:"supported_storage~please provide a valid storage type,required"`
+	S3        *S3Storage        `json:"s3" db:"s3" extensions:"x-nullable"`
+	OnPrem    *OnPremStorage    `json:"on_prem" db:"on_prem" extensions:"x-nullable"`
+	AzureBlob *AzureBlobStorage `json:"azure_blob" db:"azure_blob" extensions:"x-nullable"`
+}
+
+type S3Storage struct {
+	Prefix       null.String `json:"prefix" db:"prefix" extensions:"x-nullable"`
+	Bucket       null.String `json:"bucket" db:"bucket" valid:"required~please provide a bucket name" extensions:"x-nullable"`
+	AccessKey    null.String `json:"access_key,omitempty" db:"access_key" valid:"required~please provide an access key" extensions:"x-nullable"`
+	SecretKey    null.String `json:"secret_key,omitempty" db:"secret_key" valid:"required~please provide a secret key" extensions:"x-nullable"`
+	Region       null.String `json:"region,omitempty" db:"region" extensions:"x-nullable"`
+	SessionToken null.String `json:"session_token" db:"session_token" extensions:"x-nullable"`
+	Endpoint     null.String `json:"endpoint,omitempty" db:"endpoint" extensions:"x-nullable"`
+}
+
+type OnPremStorage struct {
+	Path null.String `json:"path" db:"path" extensions:"x-nullable"`
+}
+
+type AzureBlobStorage struct {
+	AccountName   null.String `json:"account_name" db:"account_name" extensions:"x-nullable"`
+	AccountKey    null.String `json:"account_key,omitempty" db:"account_key" extensions:"x-nullable"`
+	ContainerName null.String `json:"container_name" db:"container_name" extensions:"x-nullable"`
+	Endpoint      null.String `json:"endpoint,omitempty" db:"endpoint" extensions:"x-nullable"`
+	Prefix        null.String `json:"prefix,omitempty" db:"prefix" extensions:"x-nullable"`
+}
+
+type BackupJob struct {
+	ID           string           `json:"id" db:"id"`
+	HourStart    time.Time        `json:"hour_start" db:"hour_start"`
+	HourEnd      time.Time        `json:"hour_end" db:"hour_end"`
+	Status       string           `json:"status" db:"status"`
+	AgentID      string           `json:"agent_id" db:"agent_id"`
+	ClaimedAt    *time.Time       `json:"claimed_at" db:"claimed_at" extensions:"x-nullable"`
+	CompletedAt  *time.Time       `json:"completed_at" db:"completed_at" extensions:"x-nullable"`
+	Error        string           `json:"error" db:"error"`
+	RecordCounts map[string]int64 `json:"record_counts" db:"record_counts"`
+	CreatedAt    time.Time        `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time        `json:"updated_at" db:"updated_at"`
+}
+
+type OrganisationMember struct {
+	UID            string       `json:"uid" db:"id"`
+	OrganisationID string       `json:"organisation_id" db:"organisation_id"`
+	UserID         string       `json:"user_id" db:"user_id"`
+	Role           auth.Role    `json:"role" db:"role"`
+	UserMetadata   UserMetadata `json:"user_metadata" db:"user_metadata"`
+	CreatedAt      time.Time    `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt      time.Time    `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt      null.Time    `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type Device struct {
+	UID        string       `json:"uid" db:"id"`
+	ProjectID  string       `json:"project_id,omitempty" db:"project_id"`
+	EndpointID string       `json:"endpoint_id,omitempty" db:"endpoint_id"`
+	HostName   string       `json:"host_name,omitempty" db:"host_name"`
+	Status     DeviceStatus `json:"status,omitempty" db:"status"`
+	LastSeenAt time.Time    `json:"last_seen_at,omitempty" db:"last_seen_at,omitempty" swaggertype:"string"`
+	CreatedAt  time.Time    `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt  time.Time    `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt  null.Time    `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type DeviceStatus string
+
+const (
+	DeviceStatusOffline  DeviceStatus = "offline"
+	DeviceStatusOnline   DeviceStatus = "online"
+	DeviceStatusDisabled DeviceStatus = "disabled"
+)
+
+type ProjectEventType struct {
+	UID          string          `json:"uid" db:"id"`
+	Name         string          `json:"name" db:"name"`
+	ProjectId    string          `json:"-" db:"project_id"`
+	CreatedAt    time.Time       `json:"-" db:"created_at"`
+	UpdatedAt    time.Time       `json:"-" db:"updated_at"`
+	Category     string          `json:"category" db:"category"`
+	JSONSchema   json.RawMessage `json:"json_schema" db:"json_schema" swaggertype:"object"`
+	Description  string          `json:"description" db:"description"`
+	DeprecatedAt null.Time       `json:"deprecated_at" db:"deprecated_at" extensions:"x-nullable"`
+}
+
+type Job struct {
+	UID         string    `json:"uid" db:"id"`
+	Type        string    `json:"type" db:"type"`
+	Status      JobStatus `json:"status,omitempty" db:"status"`
+	ProjectID   string    `json:"project_id,omitempty" db:"project_id"`
+	FailedAt    null.Time `json:"failed_at,omitempty" db:"failed_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	StartedAt   null.Time `json:"started_at,omitempty" db:"started_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	CompletedAt null.Time `json:"completed_at,omitempty" db:"completed_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt   time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt   null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type JobStatus string
+
+const (
+	JobStatusReady     JobStatus = "ready"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCompleted JobStatus = "completed"
+)
+
+type UserMetadata struct {
+	UserID    string `json:"-" db:"user_id"`
+	FirstName string `json:"first_name" db:"first_name"`
+	LastName  string `json:"last_name" db:"last_name"`
+	Email     string `json:"email" db:"email"`
+}
+
+type InviteStatus string
+
+const (
+	InviteStatusAccepted  InviteStatus = "accepted"
+	InviteStatusDeclined  InviteStatus = "declined"
+	InviteStatusPending   InviteStatus = "pending"
+	InviteStatusCancelled InviteStatus = "cancelled"
+)
+
+func (i InviteStatus) String() string {
+	return string(i)
+}
+
+type OrganisationInvite struct {
+	UID              string       `json:"uid" db:"id"`
+	OrganisationID   string       `json:"organisation_id" db:"organisation_id"`
+	OrganisationName string       `json:"organisation_name,omitempty" db:"-"`
+	InviteeEmail     string       `json:"invitee_email" db:"invitee_email"`
+	Token            string       `json:"token" db:"token"`
+	Role             auth.Role    `json:"role" db:"role"`
+	Status           InviteStatus `json:"status" db:"status"`
+	ExpiresAt        time.Time    `json:"-" db:"expires_at"`
+	CreatedAt        time.Time    `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt        time.Time    `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt        null.Time    `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type PortalAuthType string
+
+const (
+	PortalAuthTypeRefreshToken PortalAuthType = "refresh_token"
+	PortalAuthTypeStaticToken  PortalAuthType = "static_token"
+)
+
+type PortalLink struct {
+	UID               string           `json:"uid" db:"id"`
+	Name              string           `json:"name" db:"name"`
+	ProjectID         string           `json:"project_id" db:"project_id"`
+	Token             string           `json:"-" db:"token"`
+	OwnerID           string           `json:"owner_id" db:"owner_id"`
+	Endpoints         pq.StringArray   `json:"endpoints" db:"endpoints"`
+	EndpointsMetadata EndpointMetadata `json:"endpoints_metadata" db:"endpoints_metadata"`
+	EndpointCount     int              `json:"endpoint_count" db:"endpoint_count"`
+	CanManageEndpoint bool             `json:"can_manage_endpoint" db:"can_manage_endpoint"`
+
+	// portal auth stuff
+	TokenExpiresAt null.Time      `json:"token_expires_at" db:"token_expires_at" extensions:"x-nullable"`
+	TokenMaskId    string         `json:"token_mask_id" db:"token_mask_id"`
+	TokenHash      string         `json:"token_hash" db:"token_hash"`
+	TokenSalt      string         `json:"token_salt" db:"token_salt"`
+	AuthKey        string         `json:"auth_key" db:"-"`
+	AuthType       PortalAuthType `json:"auth_type" db:"auth_type"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type PortalToken struct {
+	UID          string `json:"uid" db:"id"`
+	PortalLinkID string `json:"portal_link_id" db:"portal_link_id"`
+	MaskId       string `json:"mask_id" db:"mask_id"`
+	Hash         string `json:"hash" db:"hash"`
+	Salt         string `json:"salt" db:"salt"`
+	AuthKey      string `json:"-" db:"-"`
+
+	ExpiresAt null.Time `json:"expires_at" db:"expires_at" swaggertype:"string" extensions:"x-nullable"`
+	CreatedAt time.Time `json:"created_at" db:"created_at" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type PortalTokens []PortalToken
+
+func (p *PortalTokens) Scan(v interface{}) error {
+	if v == nil {
+		return nil
+	}
+
+	b, ok := v.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", v)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	var tokens []PortalToken
+	err := json.Unmarshal(b, &tokens)
+	if err != nil {
+		return err
+	}
+
+	*p = tokens
+	return nil
+}
+
+// Deprecated
+type Application struct {
+	UID             string `json:"uid" db:"id"`
+	ProjectID       string `json:"project_id" db:"project_id"`
+	Title           string `json:"name" db:"title"`
+	SupportEmail    string `json:"support_email,omitempty" db:"support_email"`
+	SlackWebhookURL string `json:"slack_webhook_url,omitempty" db:"slack_webhook_url"`
+	IsDisabled      bool   `json:"is_disabled,omitempty" db:"is_disabled"`
+
+	Endpoints []DeprecatedEndpoint `json:"endpoints,omitempty" db:"endpoints"`
+	CreatedAt time.Time            `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time            `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time            `json:"deleted_at,omitempty" db:"deleted_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+
+	Events int64 `json:"events,omitempty" db:"-"`
+}
+
+// Deprecated
+type DeprecatedEndpoint struct {
+	UID                string   `json:"uid" db:"uid"`
+	TargetURL          string   `json:"target_url" db:"target_url"`
+	Description        string   `json:"description" db:"description"`
+	Secret             string   `json:"-" db:"secret"`
+	Secrets            []Secret `json:"secrets" db:"secrets"`
+	AdvancedSignatures bool     `json:"advanced_signatures" db:"advanced_signatures"`
+
+	HttpTimeout       string                  `json:"http_timeout" db:"http_timeout"`
+	RateLimit         int                     `json:"rate_limit" db:"rate_limit"`
+	RateLimitDuration string                  `json:"rate_limit_duration" db:"rate_limit_duration"`
+	Authentication    *EndpointAuthentication `json:"authentication" db:"authentication,omitempty" extensions:"x-nullable"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at,omitempty" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type MetaEvent struct {
+	UID       string              `json:"uid" db:"id"`
+	ProjectID string              `json:"project_id" db:"project_id"`
+	EventType string              `json:"event_type" db:"event_type"`
+	Metadata  *Metadata           `json:"metadata" db:"metadata" extensions:"x-nullable"`
+	Attempt   *MetaEventAttempt   `json:"attempt" db:"attempt" extensions:"x-nullable"`
+	Status    EventDeliveryStatus `json:"status" db:"status"`
+
+	CreatedAt time.Time `json:"created_at,omitempty" db:"created_at,omitempty" swaggertype:"string"`
+	UpdatedAt time.Time `json:"updated_at,omitempty" db:"updated_at,omitempty" swaggertype:"string"`
+	DeletedAt null.Time `json:"deleted_at,omitempty" db:"deleted_at" swaggertype:"string" extensions:"x-nullable"`
+}
+
+type MetaEventPayload struct {
+	EventType string          `json:"event_type"`
+	Data      json.RawMessage `json:"data"`
+}
+
+type MetaEventAttempt struct {
+	RequestHeader  HttpHeader `json:"request_http_header" db:"request_http_header"`
+	ResponseHeader HttpHeader `json:"response_http_header" db:"response_http_header"`
+	ResponseData   string     `json:"response_data,omitempty" db:"response_data"`
+}
+
+func (m *MetaEventAttempt) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("unsupported value type %T", value)
+	}
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *MetaEventAttempt) Value() (driver.Value, error) {
+	if m == nil {
+		return nil, nil
+	}
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+type Password struct {
+	Plaintext string
+	Hash      []byte
+}
+
+func (p *Password) GenerateHash() error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(p.Plaintext), 12)
+	if err != nil {
+		return err
+	}
+
+	p.Hash = hash
+	return nil
+}
+
+func (p *Password) Matches() (bool, error) {
+	err := bcrypt.CompareHashAndPassword(p.Hash, []byte(p.Plaintext))
+	if err != nil {
+		switch {
+		case errors.Is(err, bcrypt.ErrMismatchedHashAndPassword):
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+
+	return true, err
+}
+
+type PortalLinkResponse struct {
+	UID               string           `json:"uid"`
+	Name              string           `json:"name"`
+	ProjectID         string           `json:"project_id"`
+	OwnerID           string           `json:"owner_id"`
+	Endpoints         []string         `json:"endpoints"`
+	EndpointCount     int              `json:"endpoint_count"`
+	CanManageEndpoint bool             `json:"can_manage_endpoint"`
+	Token             string           `json:"token"`
+	EndpointsMetadata EndpointMetadata `json:"endpoints_metadata"`
+	URL               string           `json:"url"`
+	AuthType          PortalAuthType   `json:"auth_type"`
+	AuthKey           string           `json:"auth_key"`
+	CreatedAt         time.Time        `json:"created_at,omitempty"`
+	UpdatedAt         time.Time        `json:"updated_at,omitempty"`
+	DeletedAt         null.Time        `json:"deleted_at,omitempty" extensions:"x-nullable"`
+}
+
+type UpdatePortalLinkRequest struct {
+	// Portal Link Name
+	Name string `json:"name"`
+
+	// Deprecated
+	// IDs of endpoints in this portal link
+	Endpoints []string `json:"endpoints"`
+
+	AuthType string `json:"auth_type"`
+
+	// OwnerID, the portal link will inherit all the endpoints with this owner ID
+	OwnerID string `json:"owner_id"`
+
+	// Specify whether endpoint management can be done through the Portal Link UI
+	CanManageEndpoint bool `json:"can_manage_endpoint"`
+}
+
+func (p *UpdatePortalLinkRequest) Validate() error {
+	err := validation.ValidateStruct(p,
+		validation.Field(&p.Name, validation.Required),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	validAuthTypes := []PortalAuthType{
+		PortalAuthTypeRefreshToken,
+		PortalAuthTypeStaticToken,
+	}
+
+	// Check if the auth type is valid
+	for _, validType := range validAuthTypes {
+		if validType == PortalAuthType(p.AuthType) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid auth type: %s", p.AuthType)
+}
+
+func (p *UpdatePortalLinkRequest) SetDefaultAuthType() {
+	validAuthTypes := []PortalAuthType{
+		PortalAuthTypeRefreshToken,
+		PortalAuthTypeStaticToken,
+	}
+
+	// Check if the auth type is valid
+	for _, validType := range validAuthTypes {
+		if validType == PortalAuthType(p.AuthType) {
+			return
+		}
+	}
+
+	// Default to refresh token
+	p.AuthType = string(PortalAuthTypeStaticToken)
+}
+
+type CreatePortalLinkRequest struct {
+	// Portal Link Name
+	Name string `json:"name"`
+
+	// Deprecated
+	// IDs of endpoints in this portal link
+	Endpoints []string `json:"endpoints"`
+
+	AuthType string `json:"auth_type"`
+
+	// OwnerID, the portal link will inherit all the endpoints with this owner ID
+	OwnerID string `json:"owner_id"`
+
+	// Specify whether endpoint management can be done through the Portal Link UI
+	CanManageEndpoint bool `json:"can_manage_endpoint"`
+}
+
+func (p *CreatePortalLinkRequest) Validate() error {
+	err := validation.ValidateStruct(p,
+		validation.Field(&p.Name, validation.Required),
+		validation.Field(&p.OwnerID, validation.Required),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	validAuthTypes := []PortalAuthType{
+		PortalAuthTypeRefreshToken,
+		PortalAuthTypeStaticToken,
+	}
+
+	// Check if the auth type is valid
+	for _, validType := range validAuthTypes {
+		if validType == PortalAuthType(p.AuthType) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid auth type: %s", p.AuthType)
+}
+
+func (p *CreatePortalLinkRequest) SetDefaultAuthType() {
+	validAuthTypes := []PortalAuthType{
+		PortalAuthTypeRefreshToken,
+		PortalAuthTypeStaticToken,
+	}
+
+	// Check if the auth type is valid
+	for _, validType := range validAuthTypes {
+		if validType == PortalAuthType(p.AuthType) {
+			return
+		}
+	}
+
+	// Default to static token
+	p.AuthType = string(PortalAuthTypeStaticToken)
+}
+
+// OrganisationRequest represents the request body for creating/updating an organisation
+type OrganisationRequest struct {
+	Name         string `json:"name" bson:"name"`
+	CustomDomain string `json:"custom_domain" bson:"custom_domain"`
+}
+
+// OrganisationInvite represents the request body for inviting a user to an organisation
+type OrganisationInviteRequest struct {
+	InviteeEmail string    `json:"invitee_email" valid:"required~please provide a valid invitee email,email"`
+	Role         auth.Role `json:"role" bson:"role"`
+}
+
+// UpdateOrganisationMember represents the request body for updating an organisation member's role
+type UpdateOrganisationMember struct {
+	Role auth.Role `json:"role" bson:"role"`
+}
+
+// UpdateOrganisationFeatureFlags represents the request body for updating organisation feature flags
+type UpdateOrganisationFeatureFlags struct {
+	FeatureFlags map[string]bool `json:"feature_flags" valid:"required"`
+}
+
+// UpdateOrganisationOverride represents the request body for updating a feature flag override
+type UpdateOrganisationOverride struct {
+	FeatureKey string `json:"feature_key" valid:"required"`
+	Enabled    bool   `json:"enabled"`
+}
+
+// UpdateOrganisationCircuitBreakerConfig represents the request body for updating circuit breaker configuration
+type UpdateOrganisationCircuitBreakerConfig struct {
+	SampleRate                  uint64 `json:"sample_rate" valid:"required,min(1)"`
+	ErrorTimeout                uint64 `json:"error_timeout" valid:"required,min(1)"`
+	FailureThreshold            uint64 `json:"failure_threshold" valid:"required,range(0|100)"`
+	SuccessThreshold            uint64 `json:"success_threshold" valid:"required,range(0|100)"`
+	ObservabilityWindow         uint64 `json:"observability_window" valid:"required,min(1)"`
+	MinimumRequestCount         uint64 `json:"minimum_request_count" valid:"required,min(0)"`
+	ConsecutiveFailureThreshold uint64 `json:"consecutive_failure_threshold" valid:"required,min(0)"`
+}

@@ -1,0 +1,121 @@
+name: Build and Run GooglePubSub tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      has_backend: ${{ steps.filter.outputs.has_backend }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # has_backend is true when ANY changed file is NOT under web/ui/dashboard/**
+      # or docs/**. With predicate-quantifier 'every', a file counts only if it
+      # matches '**' AND none of the negated frontend globs, so a single .go/go.mod/
+      # cmd/** change (or a change to this workflow) marks the set as backend. This
+      # suite is skipped only when has_backend is explicitly 'false', so the gate is
+      # fail-safe and a mixed UI+backend PR always runs it.
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@668c092af3649c4b664c54e4b704aa46782f6f7c # v3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            has_backend:
+              - '**'
+              - '!web/ui/dashboard/**'
+              - '!docs/**'
+
+  pubsub-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.has_backend != 'false' }}
+    runs-on: ubuntu-latest
+    env:
+      CONVOY_JWT_SECRET: test-access-secret
+      CONVOY_JWT_REFRESH_SECRET: test-refresh-secret
+    strategy:
+      matrix:
+        go-version: [1.26.2]
+        postgres-version: ["15"]
+        redis-version: ["6.2.6"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: convoy
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_MAX_CONNECTIONS: 2000
+        options: --health-cmd pg_isready --health-interval 10ms --health-timeout 500ms --health-retries 15
+      redis:
+        image: redis:${{ matrix.redis-version }}
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Cache go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+
+      # Cache the compiler/test build cache so the migrate compile and the
+      # race-instrumented e2e build are not recompiled from scratch each run.
+      - name: Cache go build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-gpubsub-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-gpubsub-${{ hashFiles('go.sum') }}-
+            ${{ runner.os }}-gobuild-gpubsub-
+            ${{ runner.os }}-gobuild-
+
+      - name: Check out code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Get and verify dependencies
+        run: go mod download && go mod verify
+
+      - name: Migrate Postgres
+        run: go run ./cmd migrate up
+        env:
+          CONVOY_DB_SCHEME: postgres
+          CONVOY_DB_HOST: localhost
+          CONVOY_DB_USERNAME: postgres
+          CONVOY_DB_PASSWORD: postgres
+          CONVOY_DB_DATABASE: convoy
+          CONVOY_DB_OPTIONS: sslmode=disable&connect_timeout=30
+          CONVOY_DB_PORT: 5432
+          CONVOY_REDIS_SCHEME: redis
+          CONVOY_REDIS_HOST: localhost
+          CONVOY_REDIS_PORT: 6379
+
+      - name: Run Google Pub/Sub E2E tests (testcontainers)
+        run: go test -race -count=1 -v ./e2e/pubsub -timeout 30m
+        env:
+          TEST_LICENSE_KEY:  ${{ secrets.CONVOY_TEST_LICENSE_KEY }}
+          CONVOY_LICENSE_KEY: ${{ secrets.CONVOY_TEST_LICENSE_KEY }}
+          CONVOY_LOCAL_ENCRYPTION_KEY: ${{ secrets.CONVOY_TEST_ENCRYPTION_KEY }}
+          CONVOY_DISPATCHER_SKIP_PING_VALIDATION: true

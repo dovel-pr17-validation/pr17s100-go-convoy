@@ -1,0 +1,383 @@
+.billing-details-display {
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin-bottom: 0;
+}
+
+.billing-section-title {
+  color: var(--Zinc-600, #52525B);
+  font-size: 14px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 20px;
+  align-self: stretch;
+  margin-bottom: 0;
+}
+
+.billing-details-display {
+  padding: 0 0 0 0;
+  margin-bottom: 32px;
+}
+
+.billing-details-display:not(:last-child) {
+  border-bottom: 1px solid #e5e7eb;
+  padding-bottom: 32px;
+}
+
+.billing-details-display .text-14,
+.billing-details-display .text-12 {
+  margin: 0;
+  padding: 0;
+}
+
+.billing-details-display .text-14.font-medium {
+  color: #030712;
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 28px;
+  margin-bottom: 8px;
+}
+
+.billing-details-display .text-14.font-medium:first-child {
+  color: #374151;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  margin-bottom: 8px;
+}
+
+.billing-details-display .font-body {
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  margin-bottom: 4px;
+}
+
+.billing-details-display .font-body:last-child {
+  margin-bottom: 0;
+}
+
+button.text-primary-600 {
+  transition: color 0.2s ease;
+  
+  &:hover {
+    color: #2563eb;
+  }
+  
+  svg {
+    transition: transform 0.2s ease;
+  }
+  
+  &:hover svg {
+    transform: scale(1.1);
+  }
+}
+
+.flex.gap-12px.justify-end {
+  button {
+    min-width: 80px;
+  }
+}
+
+.billing-location-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 12px;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  
+  .bg-neutral-8 {
+    background-color: #e5e7eb;
+  }
+  
+  .rounded {
+    border-radius: 4px;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: .5;
+  }
+}
+
+// Manage Plan Modal Styles
+.manage-plan-content {
+  width: 100%;
+  max-height: calc(100vh - 160px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.plan-card {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+  background: #FFFFFF;
+  border: 1px solid #E7E7E7; /* new.border */
+  border-radius: 12px;
+  position: relative;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+
+  &:hover:not(.plan-card-selected) {
+    border-color: #D4D4D8;
+  }
+}
+
+.plan-card-selected {
+  border-color: #2780F1; /* new.primary-400 */
+  background: #edf2f7; /* new.primary-25 */
+
+  &:hover {
+    border-color: #2780F1;
+  }
+}
+
+.plan-card-header {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.plan-card-title {
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 20px;
+  color: #010618;
+  margin: 0;
+}
+
+.plan-card-check {
+  width: 20px;
+  height: 20px;
+}
+
+.plan-card-features {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+
+  // Collapsed: clip the list to a fixed height and fade the overflow instead of
+  // hard-truncating, so it reads as "there is more" without hiding a hard cut.
+  // The chevron below expands to the full list.
+  &.plan-card-features-collapsed {
+    max-height: 148px;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+  }
+
+  li {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+    color: #010618;
+
+    svg {
+      flex-shrink: 0;
+    }
+  }
+
+  li.plan-card-features-heading {
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+}
+
+// Chevron + CTA are pinned to the bottom of the card together, so the chevron
+// sits at the same position across cards regardless of how many bullets a card
+// shows or whether any bullet wraps onto a second line.
+.plan-card-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: auto;
+}
+
+.plan-card-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: #71717A;
+
+  svg {
+    transition: transform 0.15s ease;
+  }
+
+  &:hover {
+    color: #2780F1;
+  }
+
+  &.plan-card-more-open svg {
+    transform: rotate(180deg);
+  }
+}
+
+.plan-card-button {
+  width: 100%;
+  justify-content: center;
+}
+
+.plan-unavailable-state {
+  padding: 24px;
+  border: 1px solid #E7E7E7;
+  border-radius: 12px;
+  background: #F7F7F7;
+}
+
+.compare-plans-section {
+  margin-top: 16px;
+}
+
+.compare-plans-title {
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 24px;
+  color: #010618;
+  margin: 0 0 16px 0;
+}
+
+.comparison-table {
+  border: 1px solid #E7E7E7;
+  border-radius: 12px;
+  overflow: hidden;
+  // With three cloud plans the row (384px label + N plan columns via fit-content)
+  // can exceed the modal width; scroll horizontally instead of clipping columns,
+  // matching the plan-catalog-preview table. .manage-plan-content keeps overflow-x
+  // hidden, so the scroll must live on the table itself.
+  overflow-x: auto;
+}
+
+.comparison-table-header {
+  display: grid;
+  // grid-template-columns is bound inline from the plan count; do not hardcode
+  // a two-plan track list here or a third plan wraps onto a new row.
+  background: #F3F4F6;
+  border-bottom: 1px solid #E7E7E7;
+  min-width: fit-content;
+}
+
+.comparison-table-cell {
+  padding: 8px 12px;
+  
+  &.header-category {
+    background: #F3F4F6;
+  }
+  
+  &.header-plan {
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 20px;
+    color: #495564;
+    background: #F3F4F6;
+    text-align: center;
+  }
+  
+  &.feature-name {
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+    color: #010618;
+  }
+  
+  &.feature-value {
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+    color: #495564;
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+}
+
+.comparison-section {
+  &:not(:last-child) {
+    border-bottom: 1px solid #E7E7E7;
+    margin-bottom: 16px;
+  }
+}
+
+.comparison-section-title {
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 20px;
+  color: #09090B;
+  padding: 12px;
+  background: #FFFFFF;
+  margin: 0;
+}
+
+.comparison-table-row {
+  display: grid;
+  // grid-template-columns is bound inline from the plan count (see header note).
+  border-bottom: 1px solid #E5E7EB;
+  min-width: fit-content;
+  
+  &:last-child {
+    border-bottom: none;
+  }
+  
+  .comparison-table-cell {
+    padding: 12px;
+  }
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 16px;
+  gap: 4px;
+  
+  &.status-supported {
+    background: #D4FDE5;
+    color: #00672E;
+  }
+  
+  &.status-unsupported {
+    background: #FEE2E2;
+    color: #DC2626;
+  }
+  
+  &.status-plain {
+    background: transparent;
+    color: #344153;
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+  }
+}

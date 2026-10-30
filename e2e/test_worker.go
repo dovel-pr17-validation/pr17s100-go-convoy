@@ -1,0 +1,171 @@
+package e2e
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/hibiken/asynq"
+
+	"github.com/frain-dev/convoy"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/queue"
+	"github.com/frain-dev/convoy/testenv"
+	"github.com/frain-dev/convoy/worker"
+)
+
+// JobIDValidator stores captured job IDs for validation
+type JobIDValidator struct {
+	mu     sync.RWMutex
+	jobIDs []string
+	t      *testing.T
+}
+
+// NewJobIDValidator creates a new validator
+func NewJobIDValidator(t *testing.T) *JobIDValidator {
+	t.Helper()
+	return &JobIDValidator{
+		jobIDs: make([]string, 0),
+		t:      t,
+	}
+}
+
+// RecordJobID stores a job ID
+func (v *JobIDValidator) RecordJobID(jobID string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.jobIDs = append(v.jobIDs, jobID)
+	v.t.Logf("Captured job ID: %s", jobID)
+}
+
+// GetJobIDs returns all captured job IDs
+func (v *JobIDValidator) GetJobIDs() []string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	result := make([]string, len(v.jobIDs))
+	copy(result, v.jobIDs)
+	return result
+}
+
+// GetJobIDsWithPrefix returns job IDs matching a prefix
+func (v *JobIDValidator) GetJobIDsWithPrefix(prefix string) []string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	result := make([]string, 0)
+	for _, jobID := range v.jobIDs {
+		if strings.HasPrefix(jobID, prefix) {
+			result = append(result, jobID)
+		}
+	}
+	return result
+}
+
+// Clear removes all job IDs
+func (v *JobIDValidator) Clear() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.jobIDs = make([]string, 0)
+}
+
+// TestWorker is a custom worker for job ID validation tests
+type TestWorker struct {
+	consumer  *worker.Consumer
+	validator *JobIDValidator
+	ctx       context.Context
+	cancel    context.CancelFunc
+}
+
+func consumerBackendFor(q queue.Queuer) (worker.ConsumerBackend, error) {
+	switch q.Options().Type {
+	case queue.ProviderRedis:
+		return worker.NewRedisConsumerBackend(q.Options()), nil
+	case queue.ProviderPostgres:
+		pq, ok := q.(worker.PostgresConsumerQueue)
+		if !ok {
+			return nil, fmt.Errorf("postgres queue does not implement the consumer contract")
+		}
+		return worker.NewPostgresConsumerBackend(pq), nil
+	default:
+		return nil, fmt.Errorf("unsupported queue provider %q", q.Options().Type)
+	}
+}
+
+// NewTestWorker creates a test worker that validates job IDs
+func NewTestWorker(ctx context.Context, t *testing.T, q queue.Queuer, validator *JobIDValidator) *TestWorker {
+	t.Helper()
+
+	logger := testenv.NewLogger(t)
+
+	workerCtx, cancel := context.WithCancel(ctx)
+
+	// Follow the queue's provider. These tests run on Redis today, but a backend
+	// pinned to asynq while the queue writes to convoy.queue_jobs would consume
+	// nothing and read as a silent hang rather than a wiring mistake.
+	backend, err := consumerBackendFor(q)
+	if err != nil {
+		t.Fatalf("create consumer backend: %v", err)
+	}
+
+	consumer, err := worker.NewConsumer(workerCtx, 3, q.Options().Names, backend, logger, log.LevelError)
+	if err != nil {
+		t.Fatalf("create worker consumer: %v", err)
+	}
+
+	tw := &TestWorker{
+		consumer:  consumer,
+		validator: validator,
+		ctx:       workerCtx,
+		cancel:    cancel,
+	}
+
+	// Register handlers for all event processor types
+	consumer.RegisterHandlers(convoy.CreateEventProcessor, tw.handleCreateEvent)
+	consumer.RegisterHandlers(convoy.CreateBroadcastEventProcessor, tw.handleCreateEvent)
+	consumer.RegisterHandlers(convoy.CreateDynamicEventProcessor, tw.handleCreateEvent)
+
+	return tw
+}
+
+// handleCreateEvent validates the job ID and records it
+func (tw *TestWorker) handleCreateEvent(ctx context.Context, t *asynq.Task) error {
+	// Get the job ID from the task
+	jobID := t.ResultWriter().TaskID()
+
+	// Record the job ID for validation
+	tw.validator.RecordJobID(jobID)
+
+	// Validate basic job ID format
+	if !strings.Contains(jobID, ":") {
+		return fmt.Errorf("invalid job ID format: %s (expected format with colons)", jobID)
+	}
+
+	// Success - job ID is valid
+	return nil
+}
+
+// Start starts the test worker
+func (tw *TestWorker) Start() {
+	go func() {
+		if err := tw.consumer.Start(); err != nil {
+			tw.validator.t.Errorf("Failed to start test worker: %v", err)
+		}
+	}()
+}
+
+// Stop stops the test worker
+func (tw *TestWorker) Stop() {
+	tw.cancel()
+	tw.consumer.Stop()
+}
+
+// VerifyJobIDFormat verifies that a job ID has the expected format
+func VerifyJobIDFormat(t *testing.T, jobID, expectedPrefix, projectID string) {
+	t.Helper()
+
+	expected := fmt.Sprintf("%s:%s:", expectedPrefix, projectID)
+	if !strings.HasPrefix(jobID, expected) {
+		t.Errorf("Job ID %s should start with %s", jobID, expected)
+	}
+}

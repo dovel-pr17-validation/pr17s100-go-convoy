@@ -1,0 +1,880 @@
+<form id="create-source-form" class="pb-24px" [formGroup]="sourceForm" (ngSubmit)="saveSource()">
+  <div class="relative flex flex-wrap items-start gap-16px">
+    <!-- Source / broker type selector -->
+    <div class="w-[280px] shrink-0 grow-0 mobile:w-full bg-white-100 border border-new.border rounded-12px p-8px flex flex-col gap-2px">
+      <p class="px-8px py-8px font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">{{ privateService.getProjectDetails?.type === 'incoming' ? 'Source type' : 'Broker type' }}</p>
+
+      @if (privateService.getProjectDetails?.type === 'incoming') {
+        @for (sourceType of incomingSourceTypes; track sourceType.value) {
+          <button
+            type="button"
+            class="flex items-center gap-8px px-8px h-36px rounded-8px text-left transition-colors hover:bg-new.surface-muted disabled:opacity-60"
+            [class]="activeIncomingSourceType === sourceType.value ? 'bg-new.surface-muted' : ''"
+            [disabled]="sourceForm.disabled"
+            (click)="selectIncomingSourceType(sourceType.value)"
+            >
+            <img [src]="sourceType.icon" class="w-16px h-16px object-contain" [alt]="sourceType.label" />
+            <span class="flex-1 font-body font-normal text-[14px] leading-normal text-new.text-primary">{{ sourceType.label }}</span>
+            <img src="/assets/img/svg/chevron-right-small.svg" class="w-16px h-16px" alt="" />
+          </button>
+        }
+      } @else {
+        @for (broker of brokerTypes; track broker.value) {
+          <button
+            type="button"
+            class="flex items-center gap-8px px-8px h-36px rounded-8px text-left transition-colors hover:bg-new.surface-muted disabled:opacity-60"
+            [class]="sourceForm.value.pub_sub.type === broker.value ? 'bg-new.surface-muted' : ''"
+            [disabled]="sourceForm.disabled"
+            (click)="sourceForm.get('pub_sub.type')?.patchValue(broker.value)"
+            >
+            <img [src]="broker.icon" class="w-16px h-16px object-contain" [alt]="broker.label" />
+            <span class="flex-1 font-body font-normal text-[14px] leading-normal text-new.text-primary">{{ broker.label }}</span>
+            <img src="/assets/img/svg/chevron-right-small.svg" class="w-16px h-16px" alt="" />
+          </button>
+        }
+        @if (sourceForm.get('pub_sub.type')?.touched && sourceForm.get('pub_sub.type')?.invalid) {
+          <span class="px-8px pb-8px font-body text-[12px] text-new.error-500">Select source type</span>
+        }
+      }
+    </div>
+
+    <!-- Right column -->
+    <div class="flex-1 min-w-[320px] flex flex-col gap-16px relative">
+      <!-- Name + verification / workers -->
+      <div class="bg-white-100 border border-new.border rounded-12px p-16px">
+        <div class="flex gap-16px mobile:flex-col">
+          <div class="flex-1 flex flex-col gap-8px">
+            <label for="source-name" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Source Name</label>
+            <input
+              type="text"
+              id="source-name"
+              formControlName="name"
+              autocomplete="off"
+              placeholder="Enter source name"
+              class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+              />
+            @if (sourceForm.get('name')?.touched && sourceForm.get('name')?.invalid) {
+              <span class="font-body text-[12px] text-new.error-500">Enter new source name</span>
+            }
+          </div>
+
+          @if (privateService.getProjectDetails?.type === 'incoming' && activeIncomingSourceType === 'custom') {
+            <div formGroupName="verifier" class="flex-1 flex flex-col gap-8px">
+              <label for="source-verification" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Source verification</label>
+              <div class="relative">
+                <select
+                  id="source-verification"
+                  formControlName="type"
+                  class="h-40px w-full px-12px pr-32px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary outline-none focus:border-new.primary-400 transition-colors appearance-none cursor-pointer disabled:opacity-60"
+                  >
+                  <option value="" disabled>Select verification</option>
+                  @for (verification of customVerifications; track verification.uid) {
+                    <option [value]="verification.uid">{{ verification.name }}</option>
+                  }
+                </select>
+                <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px absolute right-12px top-1/2 -translate-y-1/2 pointer-events-none" alt="" />
+              </div>
+              @if (sourceForm.get('verifier.type')?.touched && sourceForm.get('verifier.type')?.invalid) {
+                <span class="font-body text-[12px] text-new.error-500">Select source verification</span>
+              }
+            </div>
+          }
+
+          @if (privateService.getProjectDetails?.type === 'outgoing') {
+            <div formGroupName="pub_sub" class="flex-1 flex flex-col gap-8px">
+              <label for="workers" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary" title="This specifies the number of consumers you want polling messages from your queue. For Kafka sources, the number of partitions for the topic should match the number of workers">Workers</label>
+              <input
+                type="number"
+                id="workers"
+                formControlName="workers"
+                autocomplete="off"
+                placeholder="required"
+                class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                />
+              @if (sourceForm.get('pub_sub.workers')?.touched && sourceForm.get('pub_sub.workers')?.invalid) {
+                <span class="font-body text-[12px] text-new.error-500">Enter number of workers</span>
+              }
+            </div>
+          }
+        </div>
+      </div>
+
+      <!-- Incoming: verification config -->
+      @if (privateService.getProjectDetails?.type === 'incoming') {
+        <div formGroupName="verifier" class="contents">
+          @if (sourceForm.value.verifier.type === 'hmac' || isCustomSource(sourceForm.value.verifier.type)) {
+            <div formGroupName="hmac" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">
+                @if (isCustomSource(sourceForm.value.verifier.type)) {
+                  <span class="capitalize">{{ sourceForm.value.verifier.type }} Credentials</span>
+                } @else {
+                  Configure Verification
+                }
+              </h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                @if (sourceForm.value.verifier.type === 'hmac') {
+                  <div class="flex flex-col gap-8px">
+                    <label for="encoding" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Encoding</label>
+                    <div class="relative">
+                      <select
+                        id="encoding"
+                        formControlName="encoding"
+                        class="h-40px w-full px-12px pr-32px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary outline-none focus:border-new.primary-400 transition-colors appearance-none cursor-pointer disabled:opacity-60"
+                        >
+                        <option value="" disabled>Select</option>
+                        @for (encoding of encodings; track encoding) {
+                          <option [value]="encoding">{{ encoding }}</option>
+                        }
+                      </select>
+                      <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px absolute right-12px top-1/2 -translate-y-1/2 pointer-events-none" alt="" />
+                    </div>
+                    @if (sourceForm.get('verifier.hmac.encoding')?.touched && sourceForm.get('verifier.hmac.encoding')?.invalid) {
+                      <span class="font-body text-[12px] text-new.error-500">Select encoding type</span>
+                    }
+                  </div>
+                  <div class="flex flex-col gap-8px">
+                    <label for="hash" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Hash Algorithm</label>
+                    <div class="relative">
+                      <select
+                        id="hash"
+                        formControlName="hash"
+                        class="h-40px w-full px-12px pr-32px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary outline-none focus:border-new.primary-400 transition-colors appearance-none cursor-pointer disabled:opacity-60"
+                        >
+                        <option value="" disabled>Select</option>
+                        @for (algorithm of hashAlgorithms; track algorithm) {
+                          <option [value]="algorithm">{{ algorithm }}</option>
+                        }
+                      </select>
+                      <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px absolute right-12px top-1/2 -translate-y-1/2 pointer-events-none" alt="" />
+                    </div>
+                    @if (sourceForm.get('verifier.hmac.hash')?.touched && sourceForm.get('verifier.hmac.hash')?.invalid) {
+                      <span class="font-body text-[12px] text-new.error-500">Select algorithm type</span>
+                    }
+                  </div>
+                  <div class="flex flex-col gap-8px">
+                    <label for="header" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Header Value</label>
+                    <input
+                      type="text"
+                      id="header"
+                      formControlName="header"
+                      autocomplete="off"
+                      placeholder="Key goes here"
+                      class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                      />
+                    @if (sourceForm.get('verifier.hmac.header')?.touched && sourceForm.get('verifier.hmac.header')?.invalid) {
+                      <span class="font-body text-[12px] text-new.error-500">Enter header key</span>
+                    }
+                  </div>
+                }
+                <div class="flex flex-col gap-8px">
+                  <label for="secret" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Webhook Signing Secret</label>
+                  <input
+                    type="text"
+                    id="secret"
+                    formControlName="secret"
+                    autocomplete="off"
+                    placeholder="Secret goes here"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('verifier.hmac.secret')?.touched && sourceForm.get('verifier.hmac.secret')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter webhook signing secret</span>
+                  }
+                </div>
+              </div>
+            </div>
+          }
+
+          @if (sourceForm.value.verifier.type === 'basic_auth') {
+            <div formGroupName="basic_auth" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configure Verification</h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="username" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Username</label>
+                  <input
+                    type="text"
+                    id="username"
+                    formControlName="username"
+                    autocomplete="off"
+                    placeholder="Name goes here"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('verifier.basic_auth.username')?.touched && sourceForm.get('verifier.basic_auth.username')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter basic auth username</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="password" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Password</label>
+                  <input
+                    type="text"
+                    id="password"
+                    formControlName="password"
+                    autocomplete="off"
+                    placeholder="*******"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('verifier.basic_auth.password')?.touched && sourceForm.get('verifier.basic_auth.password')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter basic auth password</span>
+                  }
+                </div>
+              </div>
+            </div>
+          }
+
+          @if (sourceForm.value.verifier.type === 'api_key') {
+            <div formGroupName="api_key" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configure Verification</h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="header_name" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Header Name</label>
+                  <input
+                    type="text"
+                    id="header_name"
+                    formControlName="header_name"
+                    autocomplete="off"
+                    placeholder="Header Name"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('verifier.api_key.header_name')?.touched && sourceForm.get('verifier.api_key.header_name')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter api key header</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="header_value" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Header Value</label>
+                  <input
+                    type="text"
+                    id="header_value"
+                    formControlName="header_value"
+                    autocomplete="off"
+                    placeholder="Key goes here"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('verifier.api_key.header_value')?.touched && sourceForm.get('verifier.api_key.header_value')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter api key header value</span>
+                  }
+                </div>
+              </div>
+            </div>
+          }
+        </div>
+      }
+
+      <!-- Outgoing: broker configuration -->
+      @if (privateService.getProjectDetails?.type === 'outgoing') {
+        <div formGroupName="pub_sub" class="contents">
+          @if (sourceForm.value.pub_sub.type === 'google') {
+            <div formGroupName="google" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configuration</h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="project_id" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Project ID</label>
+                  <input
+                    type="text"
+                    id="project_id"
+                    formControlName="project_id"
+                    autocomplete="off"
+                    placeholder="Project ID"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.google.project_id')?.touched && sourceForm.get('pub_sub.google.project_id')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter your project ID</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="subscription_id" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Subscription ID</label>
+                  <input
+                    type="text"
+                    id="subscription_id"
+                    formControlName="subscription_id"
+                    autocomplete="off"
+                    placeholder="Enter Subscription ID"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.google.subscription_id')?.touched && sourceForm.get('pub_sub.google.subscription_id')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter your subscription ID</span>
+                  }
+                </div>
+              </div>
+              <div class="flex flex-col gap-8px">
+                <label class="font-body font-normal text-[14px] leading-normal text-new.text-secondary" title="Service accounts provide a way to manage authentication into your Google Pub/Sub.">Service Account Key</label>
+                <convoy-file-input (selectedFile)="parseJsonFile($event)" (deleteFile)="deleteJsonFile()">
+                  <p class="text-center font-body text-[12px] text-new.text-secondary max-w-[186px] mx-auto">
+                    <span class="text-new.primary-400 font-medium">Click to {{ action === 'update' ? 'update' : 'upload' }}</span>
+                    or drag and drop JSON (max 5kb)
+                  </p>
+                </convoy-file-input>
+                @if (sourceForm.get('pub_sub.google.service_account')?.touched && sourceForm.get('pub_sub.google.service_account')?.invalid) {
+                  <span class="font-body text-[12px] text-new.error-500">Enter service account</span>
+                }
+              </div>
+            </div>
+          }
+
+          @if (sourceForm.value.pub_sub.type === 'sqs') {
+            <div formGroupName="sqs" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configuration</h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="access_key_id" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">AWS Access Key ID</label>
+                  <input
+                    type="text"
+                    id="access_key_id"
+                    formControlName="access_key_id"
+                    autocomplete="off"
+                    placeholder="Access Key ID"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.sqs.access_key_id')?.touched && sourceForm.get('pub_sub.sqs.access_key_id')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter access key ID</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="secret_key" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">AWS Secret Access Key</label>
+                  <input
+                    type="text"
+                    id="secret_key"
+                    formControlName="secret_key"
+                    autocomplete="off"
+                    placeholder="Secret Access Key"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.sqs.secret_key')?.touched && sourceForm.get('pub_sub.sqs.secret_key')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter secret access key</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="default_region" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">AWS Region</label>
+                  <div class="relative">
+                    <select
+                      id="default_region"
+                      formControlName="default_region"
+                      class="h-40px w-full px-12px pr-32px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary outline-none focus:border-new.primary-400 transition-colors appearance-none cursor-pointer disabled:opacity-60"
+                      >
+                      <option value="" disabled>Region</option>
+                      @for (region of AWSregions; track region.uid) {
+                        <option [value]="region.uid">{{ region.name }}</option>
+                      }
+                    </select>
+                    <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px absolute right-12px top-1/2 -translate-y-1/2 pointer-events-none" alt="" />
+                  </div>
+                  @if (sourceForm.get('pub_sub.sqs.default_region')?.touched && sourceForm.get('pub_sub.sqs.default_region')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Please select a default AWS region</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="queue_name" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Queue Name</label>
+                  <input
+                    type="text"
+                    id="queue_name"
+                    formControlName="queue_name"
+                    autocomplete="off"
+                    placeholder="Queue name"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.sqs.queue_name')?.touched && sourceForm.get('pub_sub.sqs.queue_name')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter queue name</span>
+                  }
+                </div>
+              </div>
+            </div>
+          }
+
+          @if (sourceForm.value.pub_sub.type === 'kafka') {
+            <div formGroupName="kafka" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <div class="flex items-center justify-between">
+                <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configuration</h3>
+                <a target="_blank" href="https://docs.getconvoy.io/product-manual/sources#kafka" rel="noreferrer" class="flex items-center gap-4px font-body font-medium text-[12px] text-new.primary-400 hover:opacity-80">
+                  <img src="/assets/img/doc-icon-primary.svg" alt="doc icon" class="h-14px w-14px" />
+                  Docs
+                </a>
+              </div>
+              <div>
+                <convoy-multi-input label="Broker Addresses" required="true" [prefilledKeys]="brokerAddresses" (inputValues)="addBrokers($event)"></convoy-multi-input>
+                @if (sourceForm.get('pub_sub.kafka.brokers')?.touched && sourceForm.get('pub_sub.kafka.brokers')?.invalid) {
+                  <span class="font-body text-[12px] text-new.error-500">Please add at least one broker address</span>
+                }
+                <span class="block font-body text-[12px] text-new.text-placeholder italic mt-4px">Set the value of each input with a comma or space (,)</span>
+              </div>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="topic_name" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Topic Name</label>
+                  <input
+                    type="text"
+                    id="topic_name"
+                    formControlName="topic_name"
+                    autocomplete="off"
+                    placeholder="Topic name"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.kafka.topic_name')?.touched && sourceForm.get('pub_sub.kafka.topic_name')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter topic name</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="consumer_group_id" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Consumer ID</label>
+                  <input
+                    type="text"
+                    id="consumer_group_id"
+                    formControlName="consumer_group_id"
+                    autocomplete="off"
+                    placeholder="Consumer Group Id"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.kafka.consumer_group_id')?.touched && sourceForm.get('pub_sub.kafka.consumer_group_id')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter consumer group ID</span>
+                  }
+                </div>
+              </div>
+
+              <div class="border-t border-new.border pt-16px">
+                <div class="flex justify-between items-center">
+                  <p class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Authentication</p>
+                  <convoy-toggle [className]="'!mb-0'" [isChecked]="addKafkaAuthentication" (onChange)="checkAuthConfig()"></convoy-toggle>
+                </div>
+                @if (addKafkaAuthentication) {
+                  <ng-container formGroupName="auth">
+                    <label class="block font-body font-normal text-[14px] leading-normal text-new.text-secondary mt-16px mb-8px">Authentication Type</label>
+                    <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                      @for (authType of authTypes; track $index) {
+                        <convoy-radio formControlName="type" [label]="authType" [_name]="authType" [value]="authType" [_id]="authType" [checked]="sourceForm.value.pub_sub.kafka.auth.type === authType"></convoy-radio>
+                      }
+                    </div>
+                    @if (sourceForm.get('pub_sub.kafka.auth.type')?.touched && sourceForm.get('pub_sub.kafka.auth.type')?.invalid) {
+                      <span class="font-body text-[12px] text-new.error-500">Please select an authentication type</span>
+                    }
+                    <label class="block font-body font-normal text-[14px] leading-normal text-new.text-secondary mt-16px mb-8px">TLS</label>
+                    <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                      <convoy-radio formControlName="tls" label="Enabled" _name="tls" [value]="true" _id="enable"></convoy-radio>
+                      <convoy-radio formControlName="tls" label="Disabled" _name="tls" [value]="false" _id="disable"></convoy-radio>
+                    </div>
+                    @if (sourceForm.get('pub_sub.kafka.auth.tls')?.touched && sourceForm.get('pub_sub.kafka.auth.tls')?.invalid) {
+                      <span class="font-body text-[12px] text-new.error-500">Disable/enable tls encryption</span>
+                    }
+                    <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1 mt-16px">
+                      <div class="flex flex-col gap-8px">
+                        <label for="kafka-username" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Username</label>
+                        <input
+                          type="text"
+                          id="kafka-username"
+                          formControlName="username"
+                          autocomplete="off"
+                          placeholder="Username"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.kafka.auth.username')?.touched && sourceForm.get('pub_sub.kafka.auth.username')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter user</span>
+                        }
+                      </div>
+                      <div class="flex flex-col gap-8px">
+                        <label for="kafka-password" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Password</label>
+                        <input
+                          type="text"
+                          id="kafka-password"
+                          formControlName="password"
+                          autocomplete="off"
+                          placeholder="********"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.kafka.auth.password')?.touched && sourceForm.get('pub_sub.kafka.auth.password')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter password</span>
+                        }
+                      </div>
+                      @if (sourceForm.value.pub_sub.kafka.auth.type == 'scram') {
+                        <div class="flex flex-col gap-8px">
+                          <label for="kafka-hash" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Hash</label>
+                          <div class="relative">
+                            <select
+                              id="kafka-hash"
+                              formControlName="hash"
+                              class="h-40px w-full px-12px pr-32px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary outline-none focus:border-new.primary-400 transition-colors appearance-none cursor-pointer disabled:opacity-60"
+                              >
+                              <option [ngValue]="null" disabled>Select hash</option>
+                              @for (algorithm of hashAlgorithms; track algorithm) {
+                                <option [value]="algorithm">{{ algorithm }}</option>
+                              }
+                            </select>
+                            <img src="/assets/img/svg/chevron-down-small.svg" class="w-16px h-16px absolute right-12px top-1/2 -translate-y-1/2 pointer-events-none" alt="" />
+                          </div>
+                          @if (sourceForm.get('pub_sub.kafka.auth.hash')?.touched && sourceForm.get('pub_sub.kafka.auth.hash')?.invalid) {
+                            <span class="font-body text-[12px] text-new.error-500">Please select hash</span>
+                          }
+                        </div>
+                      }
+                    </div>
+                  </ng-container>
+                }
+              </div>
+            </div>
+          }
+
+          @if (sourceForm.value.pub_sub.type === 'amqp') {
+            <div formGroupName="amqp" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configuration</h3>
+              <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1">
+                <div class="flex flex-col gap-8px">
+                  <label for="schema" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Schema</label>
+                  <input
+                    type="text"
+                    id="schema"
+                    formControlName="schema"
+                    autocomplete="off"
+                    placeholder="amqp"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.schema')?.touched && sourceForm.get('pub_sub.amqp.schema')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter Schema</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="host" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Host</label>
+                  <input
+                    type="text"
+                    id="host"
+                    formControlName="host"
+                    autocomplete="off"
+                    placeholder="Host"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.host')?.touched && sourceForm.get('pub_sub.amqp.host')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter Host</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="port" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Port</label>
+                  <input
+                    type="text"
+                    id="port"
+                    formControlName="port"
+                    autocomplete="off"
+                    placeholder="5672"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.port')?.touched && sourceForm.get('pub_sub.amqp.port')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter Port</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="queue" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Queue</label>
+                  <input
+                    type="text"
+                    id="queue"
+                    formControlName="queue"
+                    autocomplete="off"
+                    placeholder="Queue Name"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.queue')?.touched && sourceForm.get('pub_sub.amqp.queue')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter queue name</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="deadLetterExchange" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary" title="In case of failure, the message will be published to the dlx, please note that this will not declare the dlx.">Dead Letter Exchange</label>
+                  <input
+                    type="text"
+                    id="deadLetterExchange"
+                    formControlName="deadLetterExchange"
+                    autocomplete="off"
+                    placeholder="Dead Letter Exchange"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.deadLetterExchange')?.touched && sourceForm.get('pub_sub.amqp.deadLetterExchange')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter dead letter exhange name</span>
+                  }
+                </div>
+                <div class="flex flex-col gap-8px">
+                  <label for="vhost" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Virtual Host</label>
+                  <input
+                    type="text"
+                    id="vhost"
+                    formControlName="vhost"
+                    autocomplete="off"
+                    placeholder="Virtual Host"
+                    class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                    />
+                  @if (sourceForm.get('pub_sub.amqp.vhost')?.touched && sourceForm.get('pub_sub.amqp.vhost')?.invalid) {
+                    <span class="font-body text-[12px] text-new.error-500">Enter virtual host</span>
+                  }
+                </div>
+              </div>
+
+              <div class="border-t border-new.border pt-16px">
+                <div class="flex justify-between items-center">
+                  <p class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Authentication</p>
+                  <convoy-toggle name="amqpAuth" [className]="'!mb-0'" (onChange)="addAmqpAuthentication = !addAmqpAuthentication"></convoy-toggle>
+                </div>
+                @if (addAmqpAuthentication) {
+                  <ng-container formGroupName="auth">
+                    <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1 mt-16px">
+                      <div class="flex flex-col gap-8px">
+                        <label for="amqp-user" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">User</label>
+                        <input
+                          type="text"
+                          id="amqp-user"
+                          formControlName="user"
+                          autocomplete="off"
+                          placeholder="User"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.amqp.auth.user')?.touched && sourceForm.get('pub_sub.amqp.auth.user')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter User</span>
+                        }
+                      </div>
+                      <div class="flex flex-col gap-8px">
+                        <label for="amqp-password" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Password</label>
+                        <input
+                          type="password"
+                          id="amqp-password"
+                          formControlName="password"
+                          autocomplete="off"
+                          placeholder="Password"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.amqp.auth.password')?.touched && sourceForm.get('pub_sub.amqp.auth.password')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter Password</span>
+                        }
+                      </div>
+                    </div>
+                  </ng-container>
+                }
+              </div>
+
+              <div class="border-t border-new.border pt-16px">
+                <div class="flex justify-between items-center">
+                  <p class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Bind Exchange</p>
+                  <convoy-toggle name="amqpBindExchange" [className]="'!mb-0'" (onChange)="addAmqpQueueBinding = !addAmqpQueueBinding"></convoy-toggle>
+                </div>
+                @if (addAmqpQueueBinding) {
+                  <ng-container formGroupName="bindExchange">
+                    <div class="grid grid-cols-2 gap-16px mobile:grid-cols-1 mt-16px">
+                      <div class="flex flex-col gap-8px">
+                        <label for="exchange" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Exchange</label>
+                        <input
+                          type="text"
+                          id="exchange"
+                          formControlName="exchange"
+                          autocomplete="off"
+                          placeholder="Exchange name"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.amqp.exchange.exchange')?.touched && sourceForm.get('pub_sub.amqp.exchange.exchange')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter exchange name</span>
+                        }
+                      </div>
+                      <div class="flex flex-col gap-8px">
+                        <label for="routingKey" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Routing Key</label>
+                        <input
+                          type="text"
+                          id="routingKey"
+                          formControlName="routingKey"
+                          autocomplete="off"
+                          placeholder="Routing Key"
+                          class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+                          />
+                        @if (sourceForm.get('pub_sub.amqp.routingKey')?.touched && sourceForm.get('pub_sub.amqp.routingKey')?.invalid) {
+                          <span class="font-body text-[12px] text-new.error-500">Enter routing key</span>
+                        }
+                      </div>
+                    </div>
+                  </ng-container>
+                }
+              </div>
+            </div>
+          }
+        </div>
+      }
+
+      <!-- Optional: event type location -->
+      @if (showConfig('event_type_location')) {
+        <div class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+          <div class="flex items-center justify-between">
+            <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Event Type Location</h3>
+            <button
+              type="button"
+              convoy-permission="Sources|MANAGE"
+              class="px-12px py-6px rounded-full bg-new.surface-muted font-body font-medium text-[12px] leading-[16px] text-new.text-primary transition-all hover:opacity-80"
+              (click)="sourceForm.get('event_type_location')?.patchValue(''); toggleConfigForm('event_type_location')"
+              >
+              Remove
+            </button>
+          </div>
+          <div class="flex flex-col gap-8px">
+            <label for="event-type-location" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary" title="Where Convoy should read the event type from the inbound request. For Stripe-style payloads, use request.body.type. Other examples: request.header.X-Gitlab-Event, request.query.event_type">Location</label>
+            <input
+              type="text"
+              id="event-type-location"
+              formControlName="event_type_location"
+              autocomplete="off"
+              placeholder="request.body.type"
+              class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+              />
+          </div>
+        </div>
+      }
+
+      <!-- Optional: idempotency -->
+      @if (showConfig('idempotency')) {
+        <div class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+          <div class="flex items-center justify-between">
+            <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Configure Idempotency</h3>
+            <button
+              type="button"
+              convoy-permission="Sources|MANAGE"
+              class="px-12px py-6px rounded-full bg-new.surface-muted font-body font-medium text-[12px] leading-[16px] text-new.text-primary transition-all hover:opacity-80"
+              (click)="toggleConfigForm('idempotency')"
+              >
+              Remove
+            </button>
+          </div>
+          <div>
+            <convoy-multi-input
+              label="Key locations"
+              tooltip="JSON location of idempotency key, add multiple locations for different locations"
+              [prefilledKeys]="sourceDetails && sourceDetails.idempotency_keys ? sourceDetails.idempotency_keys : []"
+              (inputValues)="sourceForm.get('idempotency_keys')?.patchValue($event)"
+            ></convoy-multi-input>
+            <span class="block font-body text-[12px] text-new.text-placeholder italic mt-4px">The order matters. Set the value of each input with a comma (,)</span>
+          </div>
+        </div>
+      }
+
+      <!-- Optional: custom response -->
+      @if (showConfig('custom_response')) {
+        <div formGroupName="custom_response" class="bg-white-100 border border-new.border rounded-12px p-16px flex flex-col gap-16px">
+          <div class="flex items-center justify-between">
+            <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Custom Response</h3>
+            <button
+              type="button"
+              class="px-12px py-6px rounded-full bg-new.surface-muted font-body font-medium text-[12px] leading-[16px] text-new.text-primary transition-all hover:opacity-80"
+              (click)="sourceForm.patchValue({ custom_response: { content_type: '', body: '' } }); toggleConfigForm('custom_response')"
+              >
+              Remove
+            </button>
+          </div>
+          <div class="flex flex-col gap-8px">
+            <label for="content_type" class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Response content type</label>
+            <input
+              type="text"
+              id="content_type"
+              formControlName="content_type"
+              autocomplete="off"
+              placeholder="e.g application/json, text/plain"
+              class="h-40px w-full px-12px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+              />
+            @if (sourceForm.get('custom_response.content_type')?.touched && sourceForm.get('custom_response.content_type')?.invalid) {
+              <span class="font-body text-[12px] text-new.error-500">Enter content type</span>
+            }
+          </div>
+          <div class="flex flex-col gap-8px">
+            <textarea
+              id="body"
+              name="body"
+              formControlName="body"
+              placeholder="enter response content"
+              class="min-h-[120px] w-full px-12px py-10px bg-white-100 border border-new.border rounded-8px shadow-[0px_2px_2px_-1px_rgba(0,0,0,0.04)] font-body font-normal text-[14px] text-new.text-primary placeholder:text-new.text-placeholder outline-none focus:border-new.primary-400 transition-colors disabled:opacity-60"
+            ></textarea>
+            @if (sourceForm.get('custom_response.body')?.touched && sourceForm.get('custom_response.body')?.invalid) {
+              <span class="font-body text-[12px] text-new.error-500">Enter response content</span>
+            }
+          </div>
+        </div>
+      }
+
+      <!-- Optional: transform (outgoing) -->
+      @if (showConfig('tranform_config')) {
+        <div class="bg-white-100 border border-new.border rounded-12px p-16px flex items-center justify-between gap-16px">
+          <div class="flex flex-col gap-4px">
+            <div class="flex items-center gap-8px">
+              <h3 class="font-heading font-medium text-[14px] leading-[20px] text-new.text-primary">Transform</h3>
+              @if (!licenseService.hasLicense('Transformations')) {
+                <span class="inline-flex items-center gap-4px h-20px px-6px rounded-4px bg-new.primary-25 font-body font-medium text-[12px] leading-[14px] text-new.primary-400">
+                  <svg width="10" height="10" class="fill-new.primary-400">
+                    <use xlink:href="#lock-icon"></use>
+                  </svg>
+                  Business
+                </span>
+              }
+            </div>
+            <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Transform request body of events with a javascript function.</p>
+          </div>
+          <div class="flex items-center gap-8px shrink-0">
+            <button
+              type="button"
+              class="px-12px py-6px rounded-full border border-new.border bg-white-100 font-body font-medium text-[12px] leading-[16px] text-new.text-primary transition-all hover:bg-new.surface-muted disabled:opacity-50"
+              (click)="setupTransformDialog()"
+              [disabled]="!licenseService.hasLicense('Transformations')"
+              >
+              Open Editor
+            </button>
+            <button type="button" class="px-12px py-6px rounded-full bg-new.surface-muted font-body font-medium text-[12px] leading-[16px] text-new.text-primary transition-all hover:opacity-80" (click)="toggleConfigForm('tranform_config')">Remove</button>
+          </div>
+        </div>
+      }
+
+      <!-- Add-config pills -->
+      <div class="flex flex-wrap items-center gap-12px empty:hidden">
+        @for (config of configurations; track $index) {
+          @if (!config.show) {
+            <button type="button" class="flex items-center gap-6px px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[13px] leading-[16px] text-new.text-primary transition-all hover:opacity-80" (click)="toggleConfigForm(config.uid)">
+              <span class="text-[15px] leading-none">+</span>
+              Add {{ config.name }}
+            </button>
+          }
+        }
+      </div>
+
+      <div class="empty:hidden">
+        <ng-content></ng-content>
+      </div>
+
+      @if (isloading) {
+        <div convoy-form-loader [loading]="!sourceCreated"></div>
+      }
+    </div>
+  </div>
+
+  <div class="flex justify-end mt-32px" [ngClass]="{ hidden: showAction === 'false' }">
+    <button
+      convoy-permission="Sources|MANAGE"
+      class="min-w-[100px] px-16px py-12px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 text-center transition-all hover:opacity-90 disabled:opacity-50"
+      [disabled]="isloading || sourceForm.disabled"
+      >
+      {{ action === 'update' ? 'Update Source' : 'Create Source' }}
+    </button>
+  </div>
+</form>
+
+<!-- disable endpoints confirmation prompt -->
+<dialog #disableAuthModal convoy-dialog position="center" class="!w-[480px] !max-w-[92vw] !rounded-24px !mt-[24vh] !bg-new.surface-page border border-new.border">
+  <div class="flex items-start justify-between gap-16px p-24px pb-0">
+    <div>
+      <h3 class="font-heading font-medium text-[16px] leading-[24px] text-new.text-primary">Confirm Action</h3>
+      <p class="font-body font-normal text-[13px] leading-normal text-new.text-secondary mt-8px">You are about to disable authentication for this Kafka source. This will delete your current configurations.</p>
+    </div>
+    <button type="button" class="w-28px h-28px flex items-center justify-center rounded-full bg-new.surface-muted transition-opacity hover:opacity-80 shrink-0" (click)="disableAuthModal.close(); addKafkaAuthentication = true" aria-label="Close">
+      <img src="/assets/img/close-icon.svg" class="w-12px h-12px" alt="" />
+    </button>
+  </div>
+  <div class="flex gap-12px justify-end p-24px">
+    <button type="button" class="px-16px py-10px rounded-full bg-new.surface-muted font-body font-medium text-[14px] leading-[16px] text-new.text-primary transition-all hover:opacity-80" (click)="disableAuthModal.close(); addKafkaAuthentication = true">Close</button>
+    <button type="button" class="px-16px py-10px rounded-full bg-new.primary-400 font-body font-medium text-[14px] leading-[16px] text-white-100 transition-all hover:opacity-90" (click)="addKafkaAuthentication = false; disableAuthModal.close()">Confirm</button>
+  </div>
+</dialog>
+
+<!-- source url modal  -->
+<dialog #sourceURLDialog convoy-dialog position="center">
+  <convoy-source-url [url]="sourceURL" (close)="sourceURLDialog.close(); onAction.emit({ action, data: sourceData })"></convoy-source-url>
+</dialog>
+
+<!-- source tranform form   -->
+@if (showTransformDialog) {
+  <dialog open convoy-dialog position="full">
+    <div class="w-full h-full overflow-y-auto">
+      <convoy-create-transform-function
+        (close)="showTransformDialog = false"
+        (updatedTransformFunction)="getFunction($event)"
+        [transformFunction]="sourceForm.get('body_function')?.value"
+        [headerTransformFunction]="sourceForm.get('header_function')?.value"
+        transformType="source"
+      ></convoy-create-transform-function>
+    </div>
+  </dialog>
+}

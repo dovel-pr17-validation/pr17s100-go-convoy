@@ -1,0 +1,1305 @@
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"reflect"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/pkg/configmigrate"
+)
+
+const (
+	MaxResponseSizeKb                 = 50    // in kilobytes
+	MaxResponseSize                   = 51200 // in bytes
+	DefaultHost                       = "localhost:5005"
+	DefaultSearchTokenizationInterval = 1
+	DefaultCacheTTL                   = time.Minute * 10
+	DefaultAPIVersion                 = "2025-11-24"
+)
+
+type BillingMode string
+
+const (
+	BillingModeOSS                BillingMode = "oss"
+	BillingModeCloud              BillingMode = "cloud"
+	BillingModeLicensedSelfHosted BillingMode = "licensed_self_hosted"
+)
+
+// DefaultOverwatchHost is the production billing/license service used when an
+// OSS or self-hosted instance has not configured an explicit billing URL.
+const DefaultOverwatchHost = "https://overwatch.getconvoy.cloud"
+
+var cfgSingleton atomic.Value
+
+var DefaultConfiguration = Configuration{
+	APIVersion:      DefaultAPIVersion,
+	Host:            DefaultHost,
+	Environment:     OSSEnvironment,
+	MaxResponseSize: MaxResponseSizeKb,
+
+	RootPath: "",
+
+	Server: ServerConfiguration{
+		HTTP: HTTPServerConfiguration{
+			SSL:        false,
+			Port:       5005,
+			WorkerPort: 5006,
+			AgentPort:  5008,
+			IngestPort: 5009,
+		},
+	},
+	Database: DatabaseConfiguration{
+		Type:               PostgresDatabaseProvider,
+		Scheme:             "postgres",
+		Host:               "localhost",
+		Username:           "postgres",
+		Password:           "postgres",
+		Database:           "convoy",
+		Options:            "sslmode=disable&connect_timeout=30",
+		Port:               5432,
+		SetConnMaxLifetime: 3600,
+	},
+	Redis: RedisConfiguration{
+		Scheme: RedisScheme,
+		Host:   "localhost",
+		Port:   6379,
+	},
+	Queue: QueueConfiguration{
+		Postgres: PostgresQueueConfiguration{
+			BatchSize:           DefaultPostgresQueueBatchSize,
+			BatchWaitMs:         DefaultPostgresQueueBatchWaitMs,
+			WriteConcurrency:    DefaultPostgresQueueWriteConcurrency,
+			LeaseTimeoutSeconds: DefaultPostgresQueueLeaseTimeoutSecs,
+			ClaimBatchSize:      DefaultPostgresQueueClaimBatchSize,
+			PollIdleMs:          DefaultPostgresQueuePollIdleMs,
+		},
+	},
+	Cache: CacheConfiguration{
+		Postgres: PostgresCacheConfiguration{
+			LocalReadTTLMs: DefaultPostgresCacheLocalReadTTLMs,
+			LocalReadSize:  DefaultPostgresCacheLocalReadSize,
+		},
+	},
+	Logger: LoggerConfiguration{
+		Level: "error",
+	},
+	StoragePolicy: StoragePolicyConfiguration{
+		Type: "on-prem",
+		OnPrem: OnPremStorage{
+			Path: convoy.DefaultOnPremDir,
+		},
+	},
+	Retention: RetentionConfiguration{
+		Enabled: true,
+		Period:  "720h",
+	},
+	WebhookArchiving: WebhookArchivingConfiguration{
+		Enabled:  false,
+		Interval: "1h",
+	},
+	CircuitBreaker: CircuitBreakerConfiguration{
+		SampleRate:                  30,
+		ErrorTimeout:                30,
+		FailureThreshold:            70,
+		SuccessThreshold:            5,
+		ObservabilityWindow:         5,
+		MinimumRequestCount:         10,
+		ConsecutiveFailureThreshold: 10,
+	},
+	Auth: AuthConfiguration{
+		IsSignupEnabled: true,
+		Native: NativeRealmOptions{
+			Enabled: true,
+		},
+		Jwt: JwtRealmOptions{
+			Enabled: true,
+		},
+		Portal: PortalRealmOptions{
+			Enabled: true,
+		},
+		GoogleOAuth: GoogleOAuthOptions{
+			Enabled: false,
+		},
+		SSO: SSOOptions{
+			Enabled: false,
+		},
+	},
+	ConsumerPoolSize: 100,
+	QueueProvider:    RedisQueueProvider,
+	Tracer: TracerConfiguration{
+		OTel: OTelConfiguration{
+			SampleRate:         1.0,
+			InsecureSkipVerify: true,
+		},
+	},
+	EnableProfiling: false,
+	Metrics: MetricsConfiguration{
+		IsEnabled: false,
+		Backend:   PrometheusMetricsProvider,
+		Prometheus: PrometheusMetricsConfiguration{
+			SampleTime:                      5,
+			QueryTimeout:                    30,
+			MaterializedViewRefreshInterval: 2, // Default: refresh every 2 minutes
+		},
+	},
+	Dispatcher: DispatcherConfiguration{
+		InsecureSkipVerify: false,
+		AllowList:          []string{"0.0.0.0/0", "::/0"},
+		BlockList:          []string{"127.0.0.0/8", "::1/128"},
+		PingMethods:        []string{"HEAD", "GET", "POST"},
+		SkipPingValidation: false,
+	},
+	InstanceIngestRate:         1000,
+	ApiRateLimit:               1000,
+	VerifyDynamicEventsTimeout: 30,
+	WorkerExecutionMode:        DefaultExecutionMode,
+	Billing: BillingConfiguration{
+		URL:         "",
+		APIKey:      "",
+		UsageSource: BillingUsageSourcePostgres,
+	},
+	SSOService: SSOServiceConfiguration{
+		Host:            "https://overwatch.getconvoy.cloud",
+		RedirectPath:    "/sso/redirect",
+		TokenPath:       "/sso/token",
+		AdminPortalPath: "/sso/admin-portal",
+		Timeout:         10 * time.Second,
+		RetryCount:      3,
+	},
+}
+
+type DatabaseConfiguration struct {
+	Type DatabaseProvider `json:"type" envconfig:"CONVOY_DB_TYPE"`
+
+	Scheme   string `json:"scheme" envconfig:"CONVOY_DB_SCHEME"`
+	Host     string `json:"host" envconfig:"CONVOY_DB_HOST"`
+	Username string `json:"username" envconfig:"CONVOY_DB_USERNAME"`
+	Password string `json:"password" envconfig:"CONVOY_DB_PASSWORD"`
+	Database string `json:"database" envconfig:"CONVOY_DB_DATABASE"`
+	Options  string `json:"options" envconfig:"CONVOY_DB_OPTIONS"`
+	Port     int    `json:"port" envconfig:"CONVOY_DB_PORT"`
+
+	DSN string `json:"dsn" envconfig:"CONVOY_DB_DSN"`
+
+	SetMaxOpenConnections int `json:"max_open_conn" envconfig:"CONVOY_DB_MAX_OPEN_CONN"`
+	SetMaxIdleConnections int `json:"max_idle_conn" envconfig:"CONVOY_DB_MAX_IDLE_CONN"`
+	SetConnMaxLifetime    int `json:"conn_max_lifetime" envconfig:"CONVOY_DB_CONN_MAX_LIFETIME"`
+
+	ReadReplicas ReadReplicaConfiguration `json:"read_replicas" envconfig:"CONVOY_DB_READ_REPLICAS"`
+}
+
+// DefaultMaxOpenConnections is the pool size an unset database.max_open_conn
+// resolves to. The pool builder substitutes it rather than leaving the pool
+// unbounded, so sizing checks must reason about it too.
+const DefaultMaxOpenConnections = 100
+
+// EffectiveMaxOpenConnections is the pool size a replica will actually run with.
+// Every check that compares concurrency against the pool must go through this
+// rather than reading SetMaxOpenConnections, which is 0 when unset and would
+// silently skip the comparison on the deployments most likely to need it.
+func (dc DatabaseConfiguration) EffectiveMaxOpenConnections() int {
+	if dc.SetMaxOpenConnections <= 0 {
+		return DefaultMaxOpenConnections
+	}
+	return dc.SetMaxOpenConnections
+}
+
+type QueueConfiguration struct {
+	Postgres PostgresQueueConfiguration `json:"postgres"`
+}
+
+// PostgresQueueConfiguration tunes the Postgres queue provider's write path.
+// The defaults are the measured values and suit a single mid-sized instance;
+// they are configurable because the right settings depend on the database
+// connection pool and the number of replicas, which vary per deployment.
+type PostgresQueueConfiguration struct {
+	// BatchSize is the maximum number of jobs coalesced into one insert.
+	BatchSize int `json:"batch_size" envconfig:"CONVOY_POSTGRES_QUEUE_BATCH_SIZE"`
+	// BatchWaitMs is how long a flush window waits to fill before writing.
+	// Lower trades throughput for latency; unset takes the default rather than
+	// meaning zero, so set 1 for the shortest supported wait.
+	BatchWaitMs int `json:"batch_wait_ms" envconfig:"CONVOY_POSTGRES_QUEUE_BATCH_WAIT_MS"`
+	// WriteConcurrency is how many flush windows may be in flight at once.
+	// Each one holds a pool connection for the duration of its insert.
+	WriteConcurrency int `json:"write_concurrency" envconfig:"CONVOY_POSTGRES_QUEUE_WRITE_CONCURRENCY"`
+	// LeaseTimeoutSeconds is how long a claimed job stays owned without a
+	// renewal before another consumer may take it. Raise it if handlers can run
+	// longer than the default between renewals; it bounds how quickly work is
+	// recovered from a worker that died. The renewal interval is derived from
+	// this value rather than configured separately, so the two cannot drift
+	// into a setting where a live worker loses its own job.
+	LeaseTimeoutSeconds int `json:"lease_timeout_seconds" envconfig:"CONVOY_POSTGRES_QUEUE_LEASE_TIMEOUT_SECONDS"`
+	// ClaimBatchSize is how many jobs one dequeue claim may take per round trip.
+	ClaimBatchSize int `json:"claim_batch_size" envconfig:"CONVOY_POSTGRES_QUEUE_CLAIM_BATCH_SIZE"`
+	// PollIdleMs is how long the consumer sleeps when a claim finds no work.
+	PollIdleMs int `json:"poll_idle_ms" envconfig:"CONVOY_POSTGRES_QUEUE_POLL_IDLE_MS"`
+}
+
+const (
+	DefaultPostgresQueueBatchSize        = 64
+	DefaultPostgresQueueBatchWaitMs      = 2
+	DefaultPostgresQueueWriteConcurrency = 8
+	DefaultPostgresQueueLeaseTimeoutSecs = 90
+	DefaultPostgresQueueClaimBatchSize   = 64
+	DefaultPostgresQueuePollIdleMs       = 5
+
+	maxPostgresQueueClaimBatchSize = 1000
+
+	// maxPostgresQueueBatchSize bounds the arrays bound into a single insert.
+	maxPostgresQueueBatchSize = 10000
+
+	// minPostgresQueueLeaseTimeoutSecs keeps the derived renewal interval far
+	// enough above zero that a handful of slow renewals cannot expire the lease
+	// of a worker that is still alive.
+	minPostgresQueueLeaseTimeoutSecs = 30
+)
+
+// applyDefaults fills unset fields. Bounds are checked in validatePostgresQueue.
+func (q *PostgresQueueConfiguration) applyDefaults() {
+	if q.BatchSize == 0 {
+		q.BatchSize = DefaultPostgresQueueBatchSize
+	}
+	if q.BatchWaitMs == 0 {
+		q.BatchWaitMs = DefaultPostgresQueueBatchWaitMs
+	}
+	if q.WriteConcurrency == 0 {
+		q.WriteConcurrency = DefaultPostgresQueueWriteConcurrency
+	}
+	if q.LeaseTimeoutSeconds == 0 {
+		q.LeaseTimeoutSeconds = DefaultPostgresQueueLeaseTimeoutSecs
+	}
+	if q.ClaimBatchSize == 0 {
+		q.ClaimBatchSize = DefaultPostgresQueueClaimBatchSize
+	}
+	if q.PollIdleMs == 0 {
+		q.PollIdleMs = DefaultPostgresQueuePollIdleMs
+	}
+}
+
+// BatchWait is BatchWaitMs as a duration.
+func (q PostgresQueueConfiguration) BatchWait() time.Duration {
+	return time.Duration(q.BatchWaitMs) * time.Millisecond
+}
+
+// LeaseTimeout is LeaseTimeoutSeconds as a duration.
+func (q PostgresQueueConfiguration) LeaseTimeout() time.Duration {
+	return time.Duration(q.LeaseTimeoutSeconds) * time.Second
+}
+
+// PollIdle is PollIdleMs as a duration.
+func (q PostgresQueueConfiguration) PollIdle() time.Duration {
+	return time.Duration(q.PollIdleMs) * time.Millisecond
+}
+
+// validatePostgresQueue checks the queue tuning against the pool it draws from.
+// Flushers hold a connection for the length of their insert, so a concurrency
+// at or above the pool size starves reads on the same pool, which is the
+// failure this guard exists to prevent.
+func validatePostgresQueue(c *Configuration) error {
+	q := &c.Queue.Postgres
+	q.applyDefaults()
+
+	if q.BatchSize < 1 || q.BatchSize > maxPostgresQueueBatchSize {
+		return fmt.Errorf("queue.postgres.batch_size must be between 1 and %d, got %d", maxPostgresQueueBatchSize, q.BatchSize)
+	}
+	if q.BatchWaitMs < 1 {
+		return fmt.Errorf("queue.postgres.batch_wait_ms must be at least 1, got %d", q.BatchWaitMs)
+	}
+	if q.WriteConcurrency < 1 {
+		return fmt.Errorf("queue.postgres.write_concurrency must be at least 1, got %d", q.WriteConcurrency)
+	}
+	if q.LeaseTimeoutSeconds < minPostgresQueueLeaseTimeoutSecs {
+		return fmt.Errorf(
+			"queue.postgres.lease_timeout_seconds must be at least %d, got %d",
+			minPostgresQueueLeaseTimeoutSecs, q.LeaseTimeoutSeconds,
+		)
+	}
+	if q.ClaimBatchSize < 1 || q.ClaimBatchSize > maxPostgresQueueClaimBatchSize {
+		return fmt.Errorf(
+			"queue.postgres.claim_batch_size must be between 1 and %d, got %d",
+			maxPostgresQueueClaimBatchSize, q.ClaimBatchSize,
+		)
+	}
+	if q.PollIdleMs < 1 {
+		return fmt.Errorf("queue.postgres.poll_idle_ms must be at least 1, got %d", q.PollIdleMs)
+	}
+
+	if pool := c.Database.EffectiveMaxOpenConnections(); q.WriteConcurrency >= pool {
+		return fmt.Errorf(
+			"queue.postgres.write_concurrency (%d) must be below database.max_open_conn (%d) so queue writes cannot starve reads on the same pool",
+			q.WriteConcurrency, pool,
+		)
+	}
+	return nil
+}
+
+type CacheConfiguration struct {
+	Postgres PostgresCacheConfiguration `json:"postgres"`
+}
+
+// PostgresCacheConfiguration tunes how much of the cache a replica may answer
+// from its own memory. This exists only for Postgres: in Redis mode the cache
+// already lives outside the database, while here every read competes with the
+// queue and the application for the same connection pool.
+type PostgresCacheConfiguration struct {
+	// LocalReadTTLMs bounds how long a replica may serve a value from memory
+	// before reading the table again. An invalidation takes effect immediately
+	// on the replica that performed it and within this window on the others, so
+	// keep it well below the minutes-long TTLs the cached entities already use.
+	// Unset takes the default; a negative value disables local reads entirely
+	// and sends every read to the table.
+	LocalReadTTLMs int `json:"local_read_ttl_ms" envconfig:"CONVOY_POSTGRES_CACHE_LOCAL_READ_TTL_MS"`
+	// LocalReadSize is how many keys a replica may hold in memory. The oldest
+	// are evicted first, so this caps memory rather than correctness.
+	LocalReadSize int `json:"local_read_size" envconfig:"CONVOY_POSTGRES_CACHE_LOCAL_READ_SIZE"`
+}
+
+const (
+	DefaultPostgresCacheLocalReadTTLMs = 1000
+	DefaultPostgresCacheLocalReadSize  = 10000
+
+	// maxPostgresCacheLocalReadTTLMs bounds how far an invalidation on one
+	// replica may lag on another. Past a few seconds this stops being an
+	// optimisation and becomes behaviour an operator would not predict.
+	maxPostgresCacheLocalReadTTLMs = 30000
+)
+
+// applyDefaults fills unset fields. Bounds are checked in validatePostgresCache.
+func (c *PostgresCacheConfiguration) applyDefaults() {
+	if c.LocalReadTTLMs == 0 {
+		c.LocalReadTTLMs = DefaultPostgresCacheLocalReadTTLMs
+	}
+	if c.LocalReadSize == 0 {
+		c.LocalReadSize = DefaultPostgresCacheLocalReadSize
+	}
+}
+
+// LocalReadTTL is LocalReadTTLMs as a duration. It is zero when local reads are
+// disabled, which is the form the cache constructor expects.
+func (c PostgresCacheConfiguration) LocalReadTTL() time.Duration {
+	if c.LocalReadTTLMs < 0 {
+		return 0
+	}
+	return time.Duration(c.LocalReadTTLMs) * time.Millisecond
+}
+
+func validatePostgresCache(c *Configuration) error {
+	pc := &c.Cache.Postgres
+	pc.applyDefaults()
+
+	if pc.LocalReadTTLMs > maxPostgresCacheLocalReadTTLMs {
+		return fmt.Errorf(
+			"cache.postgres.local_read_ttl_ms must be at most %d, got %d",
+			maxPostgresCacheLocalReadTTLMs, pc.LocalReadTTLMs,
+		)
+	}
+	if pc.LocalReadSize < 1 {
+		return fmt.Errorf("cache.postgres.local_read_size must be at least 1, got %d", pc.LocalReadSize)
+	}
+	return nil
+}
+
+func (dc DatabaseConfiguration) BuildDsn() string {
+	if len(dc.DSN) > 0 {
+		return dc.DSN
+	}
+	if dc.Scheme == "" {
+		return ""
+	}
+
+	authPart := ""
+	if dc.Username != "" || dc.Password != "" {
+		authPrefix := url.UserPassword(dc.Username, dc.Password)
+		authPart = fmt.Sprintf("%s@", authPrefix)
+	}
+
+	dbPart := ""
+	if dc.Database != "" {
+		dbPart = fmt.Sprintf("/%s", dc.Database)
+	}
+
+	optPart := ""
+	if dc.Options != "" {
+		optPart = fmt.Sprintf("?%s", dc.Options)
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d%s%s", dc.Scheme, authPart, dc.Host, dc.Port, dbPart, optPart)
+}
+
+type ReadReplicaConfiguration []DatabaseConfiguration
+
+func (sd *ReadReplicaConfiguration) Decode(value string) error {
+	var readReplicas []DatabaseConfiguration
+
+	// Unmarshal the JSON string directly into a slice of DatabaseConfiguration
+	err := json.Unmarshal([]byte(value), &readReplicas)
+	if err != nil {
+		return err
+	}
+
+	*sd = readReplicas
+	return nil
+}
+
+type ServerConfiguration struct {
+	HTTP HTTPServerConfiguration `json:"http"`
+}
+
+type HTTPServerConfiguration struct {
+	SSL         bool   `json:"ssl" envconfig:"SSL"`
+	SSLCertFile string `json:"ssl_cert_file" envconfig:"CONVOY_SSL_CERT_FILE"`
+	SSLKeyFile  string `json:"ssl_key_file" envconfig:"CONVOY_SSL_KEY_FILE"`
+	Port        uint32 `json:"port" envconfig:"PORT"`
+	AgentPort   uint32 `json:"agent_port" envconfig:"AGENT_PORT"`
+	IngestPort  uint32 `json:"ingest_port" envconfig:"INGEST_PORT"`
+	WorkerPort  uint32 `json:"worker_port" envconfig:"WORKER_PORT"`
+	SocketPort  uint32 `json:"socket_port" envconfig:"SOCKET_PORT"`
+	DomainPort  uint32 `json:"domain_port" envconfig:"DOMAIN_PORT"`
+	HttpProxy   string `json:"proxy" envconfig:"HTTP_PROXY"`
+	NoProxy     string `json:"no_proxy" envconfig:"NO_PROXY"`
+}
+
+type PrometheusConfiguration struct {
+	Dsn string `json:"dsn" envconfig:"CONVOY_PROM_DSN"`
+}
+
+type RedisConfiguration struct {
+	Scheme           string `json:"scheme" envconfig:"CONVOY_REDIS_SCHEME"`
+	Host             string `json:"host" envconfig:"CONVOY_REDIS_HOST"`
+	Username         string `json:"username" envconfig:"CONVOY_REDIS_USERNAME"`
+	Password         string `json:"password" envconfig:"CONVOY_REDIS_PASSWORD"`
+	Database         string `json:"database" envconfig:"CONVOY_REDIS_DATABASE"`
+	Port             int    `json:"port" envconfig:"CONVOY_REDIS_PORT"`
+	Addresses        string `json:"addresses" envconfig:"CONVOY_REDIS_CLUSTER_ADDRESSES"`
+	MasterName       string `json:"master_name" envconfig:"CONVOY_REDIS_SENTINEL_MASTER_NAME"`
+	SentinelUsername string `json:"sentinel_username" envconfig:"CONVOY_REDIS_SENTINEL_USERNAME"`
+	SentinelPassword string `json:"sentinel_password" envconfig:"CONVOY_REDIS_SENTINEL_PASSWORD"`
+	TLSSkipVerify    bool   `json:"tls_skip_verify" envconfig:"CONVOY_REDIS_TLS_SKIP_VERIFY"`
+	TLSCertFile      string `json:"tls_cert_file" envconfig:"CONVOY_REDIS_TLS_CERT_FILE"`
+	TLSKeyFile       string `json:"tls_key_file" envconfig:"CONVOY_REDIS_TLS_KEY_FILE"`
+	TLSCACertFile    string `json:"tls_ca_cert_file" envconfig:"CONVOY_REDIS_TLS_CA_CERT_FILE"`
+}
+
+func (rc RedisConfiguration) IsSentinel() bool {
+	return rc.Scheme == RedisSentinelScheme
+}
+
+func (rc RedisConfiguration) SentinelAddresses() []string {
+	if len(strings.TrimSpace(rc.Addresses)) != 0 {
+		addrs := strings.Split(rc.Addresses, ",")
+		result := make([]string, 0, len(addrs))
+		for _, a := range addrs {
+			if trimmed := strings.TrimSpace(a); trimmed != "" {
+				result = append(result, trimmed)
+			}
+		}
+		return result
+	}
+	if rc.Host != "" && rc.Port > 0 {
+		return []string{fmt.Sprintf("%s:%d", rc.Host, rc.Port)}
+	}
+	return nil
+}
+
+func (rc RedisConfiguration) BuildDsn() []string {
+	if rc.IsSentinel() {
+		return rc.SentinelAddresses()
+	}
+
+	if len(strings.TrimSpace(rc.Addresses)) != 0 {
+		return strings.Split(rc.Addresses, ",")
+	}
+
+	if rc.Scheme == "" {
+		return []string{}
+	}
+
+	authPart := ""
+	if rc.Username != "" || rc.Password != "" {
+		authPart = fmt.Sprintf("%s:%s@", rc.Username, rc.Password)
+	}
+
+	dbPart := ""
+	if rc.Database != "" {
+		dbPart = fmt.Sprintf("/%s", rc.Database)
+	}
+
+	return []string{fmt.Sprintf("%s://%s%s:%d%s", rc.Scheme, authPart, rc.Host, rc.Port, dbPart)}
+}
+
+func (rc RedisConfiguration) HasTLSConfig() bool {
+	return rc.TLSSkipVerify || rc.TLSCACertFile != "" || (rc.TLSCertFile != "" && rc.TLSKeyFile != "")
+}
+
+type FileRealmOption struct {
+	Basic  BasicAuthConfig  `json:"basic" bson:"basic" envconfig:"CONVOY_BASIC_AUTH_CONFIG"`
+	APIKey APIKeyAuthConfig `json:"api_key" envconfig:"CONVOY_API_KEY_CONFIG"`
+}
+
+type AuthConfiguration struct {
+	File            FileRealmOption    `json:"file"`
+	Native          NativeRealmOptions `json:"native"`
+	Jwt             JwtRealmOptions    `json:"jwt"`
+	Portal          PortalRealmOptions `json:"portal"`
+	GoogleOAuth     GoogleOAuthOptions `json:"google_oauth"`
+	SSO             SSOOptions         `json:"sso"`
+	IsSignupEnabled bool               `json:"is_signup_enabled" envconfig:"CONVOY_SIGNUP_ENABLED"`
+}
+
+type NativeRealmOptions struct {
+	Enabled bool `json:"enabled" envconfig:"CONVOY_NATIVE_REALM_ENABLED"`
+}
+
+type PortalRealmOptions struct {
+	Enabled bool `json:"enabled" envconfig:"CONVOY_PORTAL_REALM_ENABLED"`
+}
+
+type JwtRealmOptions struct {
+	Enabled       bool   `json:"enabled" envconfig:"CONVOY_JWT_REALM_ENABLED"`
+	Secret        string `json:"secret" envconfig:"CONVOY_JWT_SECRET"`
+	Expiry        int    `json:"expiry" envconfig:"CONVOY_JWT_EXPIRY"`
+	RefreshSecret string `json:"refresh_secret" envconfig:"CONVOY_JWT_REFRESH_SECRET"`
+	RefreshExpiry int    `json:"refresh_expiry" envconfig:"CONVOY_JWT_REFRESH_EXPIRY"`
+}
+
+type SMTPConfiguration struct {
+	SSL      bool   `json:"ssl" envconfig:"CONVOY_SMTP_SSL"`
+	Provider string `json:"provider" envconfig:"CONVOY_SMTP_PROVIDER"`
+	URL      string `json:"url" envconfig:"CONVOY_SMTP_URL"`
+	Port     uint32 `json:"port" envconfig:"CONVOY_SMTP_PORT"`
+	Username string `json:"username" envconfig:"CONVOY_SMTP_USERNAME"`
+	Password string `json:"password" envconfig:"CONVOY_SMTP_PASSWORD"`
+	From     string `json:"from" envconfig:"CONVOY_SMTP_FROM"`
+	ReplyTo  string `json:"reply-to" envconfig:"CONVOY_SMTP_REPLY_TO"`
+}
+
+type LoggerConfiguration struct {
+	Level string `json:"level" envconfig:"CONVOY_LOGGER_LEVEL"`
+}
+
+type TracerConfiguration struct {
+	Type    TracerProvider       `json:"type" envconfig:"CONVOY_TRACER_PROVIDER"`
+	OTel    OTelConfiguration    `json:"otel"`
+	Sentry  SentryConfiguration  `json:"sentry"`
+	Datadog DatadogConfiguration `json:"datadog"`
+}
+
+type OTelConfiguration struct {
+	OTelAuth           OTelAuthConfiguration `json:"otel_auth"`
+	SampleRate         float64               `json:"sample_rate" envconfig:"CONVOY_OTEL_SAMPLE_RATE"`
+	CollectorURL       string                `json:"collector_url" envconfig:"CONVOY_OTEL_COLLECTOR_URL"`
+	InsecureSkipVerify bool                  `json:"insecure_skip_verify" envconfig:"CONVOY_OTEL_INSECURE_SKIP_VERIFY"`
+}
+
+type OTelAuthConfiguration struct {
+	HeaderName  string `json:"header_name" envconfig:"CONVOY_OTEL_AUTH_HEADER_NAME"`
+	HeaderValue string `json:"header_value" envconfig:"CONVOY_OTEL_AUTH_HEADER_VALUE"`
+}
+
+type SentryConfiguration struct {
+	DSN         string  `json:"dsn" envconfig:"CONVOY_SENTRY_DSN"`
+	SampleRate  float64 `json:"sample_rate" envconfig:"CONVOY_SENTRY_SAMPLE_RATE"`
+	Debug       bool    `json:"debug" envconfig:"CONVOY_SENTRY_DEBUG"`
+	Environment string  `json:"environment" envconfig:"CONVOY_SENTRY_ENVIRONMENT"`
+}
+
+type DatadogConfiguration struct {
+	AgentURL string `json:"agent_url" envconfig:"CONVOY_DATADOG_AGENT_URL"`
+}
+
+// RetentionConfiguration is partition drop only (enable + keep window).
+type RetentionConfiguration struct {
+	// Enabled gates the licensed 01:00 partition drop. Default true.
+	// Env: CONVOY_RETENTION_ENABLED.
+	Enabled bool `json:"enabled" envconfig:"CONVOY_RETENTION_ENABLED"`
+	// Period is the keep window. Env: CONVOY_RETENTION_PERIOD.
+	// Legacy CONVOY_RETENTION_POLICY migrates here at load.
+	Period string `json:"period" envconfig:"CONVOY_RETENTION_PERIOD"`
+}
+
+// WebhookArchivingConfiguration gates cold-storage export of webhook data.
+// Distinct from RetentionConfiguration — not nested under retention_policy.
+type WebhookArchivingConfiguration struct {
+	// Enabled turns on archive/export jobs. Env: CONVOY_WEBHOOK_ARCHIVING_ENABLED.
+	// Legacy CONVOY_RETENTION_POLICY_ENABLED migrates here at load.
+	Enabled        bool   `json:"enabled" envconfig:"CONVOY_WEBHOOK_ARCHIVING_ENABLED"`
+	Interval       string `json:"interval" envconfig:"CONVOY_BACKUP_INTERVAL"`
+	CDCEnabled     bool   `json:"cdc_enabled" envconfig:"CONVOY_CDC_BACKUP_ENABLED"`
+	ReplicationDSN string `json:"replication_dsn" envconfig:"CONVOY_REPLICATION_DSN"`
+}
+
+type CircuitBreakerConfiguration struct {
+	SampleRate                  uint64 `json:"sample_rate" envconfig:"CONVOY_CIRCUIT_BREAKER_SAMPLE_RATE"`
+	ErrorTimeout                uint64 `json:"error_timeout" envconfig:"CONVOY_CIRCUIT_BREAKER_ERROR_TIMEOUT"`
+	FailureThreshold            uint64 `json:"failure_threshold" envconfig:"CONVOY_CIRCUIT_BREAKER_FAILURE_THRESHOLD"`
+	SuccessThreshold            uint64 `json:"success_threshold" envconfig:"CONVOY_CIRCUIT_BREAKER_SUCCESS_THRESHOLD"`
+	MinimumRequestCount         uint64 `json:"minimum_request_count" envconfig:"CONVOY_CIRCUIT_BREAKER_MINIMUM_REQUEST_COUNT"`
+	ObservabilityWindow         uint64 `json:"observability_window" envconfig:"CONVOY_CIRCUIT_BREAKER_OBSERVABILITY_WINDOW"`
+	ConsecutiveFailureThreshold uint64 `json:"consecutive_failure_threshold" envconfig:"CONVOY_CIRCUIT_BREAKER_CONSECUTIVE_FAILURE_THRESHOLD"`
+	SkipSleep                   bool   `json:"skip_sleep" envconfig:"CONVOY_CIRCUIT_BREAKER_SKIP_SLEEP"`
+}
+
+type StoragePolicyConfiguration struct {
+	Type      string           `json:"type" envconfig:"CONVOY_STORAGE_POLICY_TYPE"`
+	S3        S3Storage        `json:"s3"`
+	OnPrem    OnPremStorage    `json:"on_prem"`
+	AzureBlob AzureBlobStorage `json:"azure_blob"`
+}
+
+type S3Storage struct {
+	Prefix       string `json:"prefix" envconfig:"CONVOY_STORAGE_AWS_PREFIX"`
+	Bucket       string `json:"bucket" envconfig:"CONVOY_STORAGE_AWS_BUCKET"`
+	AccessKey    string `json:"access_key" envconfig:"CONVOY_STORAGE_AWS_ACCESS_KEY"`
+	SecretKey    string `json:"secret_key" envconfig:"CONVOY_STORAGE_AWS_SECRET_KEY"`
+	Region       string `json:"region" envconfig:"CONVOY_STORAGE_AWS_REGION"`
+	SessionToken string `json:"session_token" envconfig:"CONVOY_STORAGE_AWS_SESSION_TOKEN"`
+	Endpoint     string `json:"endpoint" envconfig:"CONVOY_STORAGE_AWS_ENDPOINT"`
+}
+
+type OnPremStorage struct {
+	Path string `json:"path" envconfig:"CONVOY_STORAGE_PREM_PATH"`
+}
+
+type AzureBlobStorage struct {
+	AccountName   string `json:"account_name" envconfig:"CONVOY_STORAGE_AZURE_ACCOUNT_NAME"`
+	AccountKey    string `json:"account_key" envconfig:"CONVOY_STORAGE_AZURE_ACCOUNT_KEY"`
+	ContainerName string `json:"container_name" envconfig:"CONVOY_STORAGE_AZURE_CONTAINER_NAME"`
+	Endpoint      string `json:"endpoint" envconfig:"CONVOY_STORAGE_AZURE_ENDPOINT"`
+	Prefix        string `json:"prefix" envconfig:"CONVOY_STORAGE_AZURE_PREFIX"`
+}
+
+type MetricsConfiguration struct {
+	IsEnabled  bool                           `json:"enabled" envconfig:"CONVOY_METRICS_ENABLED"`
+	Backend    MetricsBackend                 `json:"metrics_backend" envconfig:"CONVOY_METRICS_BACKEND"`
+	Prometheus PrometheusMetricsConfiguration `json:"prometheus_metrics"`
+}
+
+type PrometheusMetricsConfiguration struct {
+	SampleTime                      uint64 `json:"sample_time" envconfig:"CONVOY_METRICS_SAMPLE_TIME"`
+	QueryTimeout                    uint64 `json:"query_timeout" envconfig:"CONVOY_METRICS_QUERY_TIMEOUT"` // Timeout in seconds for metrics collection queries
+	MaterializedViewRefreshInterval uint64 `json:"materialized_view_refresh_interval" envconfig:"CONVOY_METRICS_MATERIALIZED_VIEW_REFRESH_INTERVAL"`
+}
+
+const (
+	OSSEnvironment string = "oss"
+)
+
+const (
+	OTelTracerProvider    TracerProvider = "otel"
+	SentryTracerProvider  TracerProvider = "sentry"
+	DatadogTracerProvider TracerProvider = "datadog"
+)
+
+const (
+	RedisQueueProvider       QueueProvider           = "redis"
+	PostgresQueueProvider    QueueProvider           = "postgres"
+	DefaultSignatureHeader   SignatureHeaderProvider = "X-Convoy-Signature"
+	DefaultRequestIDHeader   RequestIDHeaderProvider = "X-Convoy-Idempotency-Key"
+	PostgresDatabaseProvider DatabaseProvider        = "postgres"
+)
+
+const (
+	PrometheusMetricsProvider MetricsBackend = "prometheus"
+)
+
+const (
+	RedisScheme         = "redis"
+	RedisSentinelScheme = "redis-sentinel"
+	RedisSecureScheme   = "rediss"
+)
+
+func IsValidRedisScheme(scheme string) bool {
+	return scheme == RedisScheme || scheme == RedisSentinelScheme || scheme == RedisSecureScheme
+}
+
+type (
+	AuthProvider            string
+	QueueProvider           string
+	SignatureHeaderProvider string
+	RequestIDHeaderProvider string
+	TracerProvider          string
+	CacheProvider           string
+	LimiterProvider         string
+	DatabaseProvider        string
+	SearchProvider          string
+	MetricsBackend          string
+)
+
+func (s SignatureHeaderProvider) String() string {
+	return string(s)
+}
+
+func (r RequestIDHeaderProvider) String() string {
+	return string(r)
+}
+
+type ExecutionMode string
+
+const (
+	EventsExecutionMode  ExecutionMode = "events"
+	RetryExecutionMode   ExecutionMode = "retry"
+	DefaultExecutionMode ExecutionMode = "default"
+)
+
+type Configuration struct {
+	// PreviousQueueProvider opts into inspecting the other configured queue store.
+	PreviousQueueProvider QueueProvider `json:"previous_queue_provider,omitempty" envconfig:"CONVOY_PREVIOUS_QUEUE_PROVIDER"`
+	QueueStoreScope       string        `json:"queue_store_scope,omitempty" envconfig:"CONVOY_QUEUE_STORE_SCOPE"`
+
+	InstanceId         string                        `json:"instance_id"`
+	APIVersion         string                        `json:"api_version" envconfig:"CONVOY_API_VERSION"`
+	Auth               AuthConfiguration             `json:"auth,omitempty"`
+	Database           DatabaseConfiguration         `json:"database"`
+	Redis              RedisConfiguration            `json:"redis"`
+	Prometheus         PrometheusConfiguration       `json:"prometheus"`
+	Server             ServerConfiguration           `json:"server"`
+	MaxResponseSize    uint64                        `json:"max_response_size" envconfig:"CONVOY_MAX_RESPONSE_SIZE"`
+	SMTP               SMTPConfiguration             `json:"smtp"`
+	Environment        string                        `json:"env" envconfig:"CONVOY_ENV"`
+	Logger             LoggerConfiguration           `json:"logger"`
+	Tracer             TracerConfiguration           `json:"tracer"`
+	Host               string                        `json:"host" envconfig:"CONVOY_HOST"`
+	RootPath           string                        `json:"root_path" envconfig:"CONVOY_ROOT_PATH"`
+	Pyroscope          PyroscopeConfiguration        `json:"pyroscope"`
+	CustomDomainSuffix string                        `json:"custom_domain_suffix" envconfig:"CONVOY_CUSTOM_DOMAIN_SUFFIX"`
+	EnableFeatureFlag  []string                      `json:"enable_feature_flag" envconfig:"CONVOY_ENABLE_FEATURE_FLAG"`
+	Retention          RetentionConfiguration        `json:"retention"`
+	WebhookArchiving   WebhookArchivingConfiguration `json:"webhook_archiving"`
+	CircuitBreaker     CircuitBreakerConfiguration   `json:"circuit_breaker"`
+	StoragePolicy      StoragePolicyConfiguration    `json:"storage_policy"`
+	ConsumerPoolSize   int                           `json:"consumer_pool_size" envconfig:"CONVOY_CONSUMER_POOL_SIZE"`
+	QueueProvider      QueueProvider                 `json:"queue_provider" envconfig:"CONVOY_QUEUE_PROVIDER"`
+	Queue              QueueConfiguration            `json:"queue"`
+	Cache              CacheConfiguration            `json:"cache"`
+	EnableProfiling    bool                          `json:"enable_profiling" envconfig:"CONVOY_ENABLE_PROFILING"`
+	Metrics            MetricsConfiguration          `json:"metrics" envconfig:"CONVOY_METRICS"`
+	InstanceIngestRate int                           `json:"instance_ingest_rate" envconfig:"CONVOY_INSTANCE_INGEST_RATE"`
+	ApiRateLimit       int                           `json:"api_rate_limit" envconfig:"CONVOY_API_RATE_LIMIT"`
+	// VerifyDynamicEventsTimeout is the max seconds POST /events/dynamic waits for
+	// endpoint/subscription resolve when project config verify_dynamic_events is true.
+	VerifyDynamicEventsTimeout uint64                      `json:"verify_dynamic_events_timeout" envconfig:"CONVOY_VERIFY_DYNAMIC_EVENTS_TIMEOUT"`
+	WorkerExecutionMode        ExecutionMode               `json:"worker_execution_mode" envconfig:"CONVOY_WORKER_EXECUTION_MODE"`
+	MaxRetrySeconds            uint64                      `json:"max_retry_seconds,omitempty" envconfig:"CONVOY_MAX_RETRY_SECONDS"`
+	LicenseKey                 string                      `json:"license_key" envconfig:"CONVOY_LICENSE_KEY"`
+	LicenseService             LicenseServiceConfiguration `json:"license_service" envconfig:"CONVOY_LICENSE_SERVICE"`
+	SSOService                 SSOServiceConfiguration     `json:"sso_service" envconfig:"CONVOY_SSO_SERVICE"`
+	Dispatcher                 DispatcherConfiguration     `json:"dispatcher"`
+	HCPVault                   HCPVaultConfig              `json:"hcp_vault"`
+	Billing                    BillingConfiguration        `json:"billing"`
+}
+
+// WorkerPoolUndersized reports whether a worker will run more consumers than
+// the connection pool can serve. In Postgres mode every consumer needs a
+// connection to claim and complete work, so below that ratio consumers block in
+// pgxpool.Acquire rather than on the database: 100 consumers against 50
+// connections halved drain rate in the lab.
+//
+// Failure policy: warn, do not reject. An undersized pool costs throughput but
+// stays correct, and the sizing rule pulls against the server's max_connections
+// on a small deployment, so an operator may have to make that trade
+// deliberately.
+func (c Configuration) WorkerPoolUndersized() bool {
+	if c.QueueProvider != PostgresQueueProvider {
+		return false
+	}
+	return c.Database.EffectiveMaxOpenConnections() < c.ConsumerPoolSize
+}
+
+func (c Configuration) BillingMode(instanceLicenseKey string) BillingMode {
+	if strings.TrimSpace(c.Billing.APIKey) != "" {
+		return BillingModeCloud
+	}
+	if strings.TrimSpace(instanceLicenseKey) != "" {
+		return BillingModeLicensedSelfHosted
+	}
+	return BillingModeOSS
+}
+
+func (c Configuration) UsesOrgBilling() bool {
+	return c.BillingMode("") == BillingModeCloud
+}
+
+// BillingServiceURL returns the billing service base URL to use. OSS and
+// self-hosted instances (no billing API key) default to prod billing so the
+// plan catalog, guest checkout, and license management work without operator
+// config, mirroring the SSO/license service defaults. Cloud (API key set) keeps
+// requiring an explicit URL: an empty URL there is a misconfiguration that
+// Billing.Validate already fails closed on, so this never invents a cloud host.
+func (c Configuration) BillingServiceURL() string {
+	if url := strings.TrimSpace(c.Billing.URL); url != "" {
+		return url
+	}
+	if strings.TrimSpace(c.Billing.APIKey) == "" {
+		return DefaultOverwatchHost
+	}
+	return ""
+}
+
+type DispatcherConfiguration struct {
+	InsecureSkipVerify bool     `json:"insecure_skip_verify" envconfig:"CONVOY_DISPATCHER_INSECURE_SKIP_VERIFY"`
+	AllowList          []string `json:"allow_list" envconfig:"CONVOY_DISPATCHER_ALLOW_LIST"`
+	BlockList          []string `json:"block_list" envconfig:"CONVOY_DISPATCHER_BLOCK_LIST"`
+	CACertPath         string   `json:"ca_cert_path" envconfig:"CONVOY_DISPATCHER_CACERT_PATH"`
+	CACertString       string   `json:"ca_cert_string" envconfig:"CONVOY_DISPATCHER_CACERT_STRING"`
+	PingMethods        []string `json:"ping_methods" envconfig:"CONVOY_DISPATCHER_PING_METHODS"`
+	// SkipPingValidation disables the outbound probe on endpoint creation and update.
+	SkipPingValidation bool `json:"skip_ping_validation" envconfig:"CONVOY_DISPATCHER_SKIP_PING_VALIDATION"`
+}
+
+type PyroscopeConfiguration struct {
+	EnableProfiling bool   `json:"enabled" envconfig:"CONVOY_ENABLE_PYROSCOPE_PROFILING"`
+	URL             string `json:"url" envconfig:"CONVOY_PYROSCOPE_URL"`
+	Username        string `json:"username" envconfig:"CONVOY_PYROSCOPE_USERNAME"`
+	Password        string `json:"password" envconfig:"CONVOY_PYROSCOPE_PASSWORD"`
+	ProfileID       string `json:"profile_id" envconfig:"CONVOY_PYROSCOPE_PROFILE_ID"`
+}
+
+type HCPVaultConfig struct {
+	ClientID     string `json:"client_id" envconfig:"CONVOY_HCP_CLIENT_ID"`
+	ClientSecret string `json:"client_secret" envconfig:"CONVOY_HCP_CLIENT_SECRET"`
+	OrgID        string `json:"org_id" envconfig:"CONVOY_HCP_ORG_ID"`
+	ProjectID    string `json:"project_id" envconfig:"CONVOY_HCP_PROJECT_ID"`
+	AppName      string `json:"app_name" envconfig:"CONVOY_HCP_APP_NAME"`
+	SecretName   string `json:"secret_name" envconfig:"CONVOY_HCP_SECRET_NAME"`
+}
+
+// BillingPlanConfig is a plan entry in billing config (e.g. for merging with API plans).
+type BillingPlanConfig struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	ProductType string `json:"product_type,omitempty"`
+}
+
+// Billing usage sources select where cloud usage figures are read from. They only
+// apply in cloud mode; self-hosted always computes usage from local event data.
+const (
+	// BillingUsageSourcePostgres computes usage from this instance's own Postgres
+	// event data (the persisted byte columns). This is the cloud default.
+	BillingUsageSourcePostgres = "postgres"
+	// BillingUsageSourceBillingService delegates usage to the external billing
+	// service instead of computing it locally.
+	BillingUsageSourceBillingService = "billing_service"
+)
+
+type BillingConfiguration struct {
+	URL              string                       `json:"url" envconfig:"CONVOY_BILLING_URL"`
+	APIKey           string                       `json:"api_key" envconfig:"CONVOY_BILLING_API_KEY"`
+	OrganisationHost string                       `json:"organisation_host" envconfig:"CONVOY_BILLING_ORGANISATION_HOST"`
+	PaymentProvider  PaymentProviderConfiguration `json:"payment_provider"`
+	Plans            []BillingPlanConfig          `json:"plans,omitempty"`
+	// UsageSource selects the cloud usage source: "postgres" (default, local byte
+	// columns) or "billing_service". Empty is treated as "postgres".
+	UsageSource string `json:"usage_source" envconfig:"CONVOY_BILLING_USAGE_SOURCE"`
+}
+
+type PaymentProviderConfiguration struct {
+	Type           string `json:"type" envconfig:"CONVOY_PAYMENT_PROVIDER_TYPE"`
+	PublishableKey string `json:"publishable_key" envconfig:"CONVOY_PAYMENT_PROVIDER_PUBLISHABLE_KEY"`
+}
+
+type LicenseServiceConfiguration struct {
+	Host         string        `json:"host" envconfig:"CONVOY_LICENSE_SERVICE_HOST"`
+	ValidatePath string        `json:"validate_path" envconfig:"CONVOY_LICENSE_SERVICE_VALIDATE_ENDPOINT"`
+	Timeout      time.Duration `json:"timeout" envconfig:"CONVOY_LICENSE_SERVICE_TIMEOUT"`
+	RetryCount   int           `json:"retry_count" envconfig:"CONVOY_LICENSE_SERVICE_RETRY_COUNT"`
+}
+
+type SSOServiceConfiguration struct {
+	Host            string        `json:"host" envconfig:"CONVOY_SSO_SERVICE_HOST"`
+	RedirectPath    string        `json:"redirect_path" envconfig:"CONVOY_SSO_SERVICE_REDIRECT_PATH"`
+	TokenPath       string        `json:"token_path" envconfig:"CONVOY_SSO_SERVICE_TOKEN_PATH"`
+	AdminPortalPath string        `json:"admin_portal_path" envconfig:"CONVOY_SSO_SERVICE_ADMIN_PORTAL_PATH"`
+	Timeout         time.Duration `json:"-" envconfig:"CONVOY_SSO_SERVICE_TIMEOUT"`
+	TimeoutStr      string        `json:"timeout" envconfig:"-"`
+	RetryCount      int           `json:"retry_count" envconfig:"CONVOY_SSO_SERVICE_RETRY_COUNT"`
+}
+
+func (s *SSOServiceConfiguration) UnmarshalJSON(data []byte) error {
+	aux := &struct {
+		Host            string `json:"host"`
+		RedirectPath    string `json:"redirect_path"`
+		TokenPath       string `json:"token_path"`
+		AdminPortalPath string `json:"admin_portal_path"`
+		TimeoutStr      string `json:"timeout"`
+		RetryCount      int    `json:"retry_count"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	s.Host = aux.Host
+	s.RedirectPath = aux.RedirectPath
+	s.TokenPath = aux.TokenPath
+	s.AdminPortalPath = aux.AdminPortalPath
+	s.RetryCount = aux.RetryCount
+
+	if aux.TimeoutStr != "" {
+		duration, err := time.ParseDuration(aux.TimeoutStr)
+		if err != nil {
+			return fmt.Errorf("invalid timeout duration %q: %w", aux.TimeoutStr, err)
+		}
+		s.Timeout = duration
+	}
+	return nil
+}
+
+func (b *BillingConfiguration) Validate() error {
+	if strings.TrimSpace(b.APIKey) != "" && strings.TrimSpace(b.URL) == "" {
+		return fmt.Errorf("billing URL is required when billing API key is configured")
+	}
+
+	// Normalize in place so every reader comparing UsageSource with == sees the
+	// canonical value. Without this, a config like " billing_service" passes
+	// validation here but silently fails the exact-match check in the handler.
+	b.UsageSource = strings.TrimSpace(b.UsageSource)
+	switch b.UsageSource {
+	case "", BillingUsageSourcePostgres, BillingUsageSourceBillingService:
+	default:
+		return fmt.Errorf("invalid billing usage source %q: must be %q or %q", b.UsageSource, BillingUsageSourcePostgres, BillingUsageSourceBillingService)
+	}
+
+	return nil
+}
+
+type GoogleOAuthOptions struct {
+	Enabled     bool   `json:"enabled" envconfig:"CONVOY_GOOGLE_OAUTH_ENABLED"`
+	ClientID    string `json:"client_id" envconfig:"CONVOY_GOOGLE_OAUTH_CLIENT_ID"`
+	RedirectURL string `json:"redirect_url" envconfig:"CONVOY_GOOGLE_OAUTH_REDIRECT_URL"`
+}
+
+type SSOOptions struct {
+	Enabled     bool   `json:"enabled" envconfig:"CONVOY_SSO_ENABLED"`
+	RedirectURL string `json:"redirect_url" envconfig:"CONVOY_SSO_REDIRECT_URL"`
+}
+
+// Get fetches the application configuration. LoadConfig must have been called
+// previously for this to work.
+// Use this when you need to get access to the config object at runtime
+func Get() (Configuration, error) {
+	c, ok := cfgSingleton.Load().(*Configuration)
+	if !ok {
+		return Configuration{}, errors.New("call Load before this function")
+	}
+
+	return *c, nil
+}
+
+// IsStringEmpty checks if the given string s is empty or not
+func IsStringEmpty(s string) bool { return len(strings.TrimSpace(s)) == 0 }
+
+func Override(newCfg *Configuration) error {
+	c, err := Get()
+	if err != nil {
+		return err
+	}
+
+	ov := reflect.ValueOf(&c).Elem()
+	nv := reflect.ValueOf(newCfg).Elem()
+
+	overrideFields(ov, nv)
+
+	cfgSingleton.Store(&c)
+	return nil
+}
+
+// ForceBools applies bool fields that Override skips when false (reflect zero).
+// Call only for values the operator explicitly set (cobra Flags().Changed, etc.).
+func ForceBools(mutate func(*Configuration)) error {
+	c, err := Get()
+	if err != nil {
+		return err
+	}
+	mutate(&c)
+	cfgSingleton.Store(&c)
+	return nil
+}
+
+func overrideFields(ov, nv reflect.Value) {
+	for i := 0; i < ov.NumField(); i++ {
+		ovField := ov.Field(i)
+		if !ovField.CanInterface() {
+			continue
+		}
+
+		nvField := nv.Field(i)
+
+		if nvField.Kind() == reflect.Struct {
+			overrideFields(ovField, nvField)
+		} else {
+			fv := nvField.Interface()
+			isZero := reflect.ValueOf(fv).IsZero()
+
+			if isZero {
+				continue
+			}
+
+			ovField.Set(reflect.ValueOf(fv))
+		}
+	}
+}
+
+type ConfigFunc func(c *Configuration) error
+
+func applyServiceDefaults(c *Configuration) {
+	def := DefaultConfiguration.SSOService
+	if c.SSOService.Host == "" {
+		c.SSOService.Host = def.Host
+	}
+	if c.SSOService.RedirectPath == "" {
+		c.SSOService.RedirectPath = def.RedirectPath
+	}
+	if c.SSOService.TokenPath == "" {
+		c.SSOService.TokenPath = def.TokenPath
+	}
+	if c.SSOService.AdminPortalPath == "" {
+		c.SSOService.AdminPortalPath = def.AdminPortalPath
+	}
+	if c.SSOService.Timeout == 0 {
+		c.SSOService.Timeout = def.Timeout
+	}
+	if c.SSOService.RetryCount == 0 {
+		c.SSOService.RetryCount = def.RetryCount
+	}
+}
+
+// LoadConfig is used to load the configuration from either the json config file
+// or the environment variables.
+func LoadConfig(p string, opts ...ConfigFunc) error {
+	c := DefaultConfiguration
+
+	if _, err := os.Stat(p); err == nil {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		var jsonRoot map[string]any
+		if err := json.NewDecoder(f).Decode(&jsonRoot); err != nil {
+			return err
+		}
+
+		deps, err := jsonRetentionArchivingMigrations().Apply(configmigrate.OSEnv{}, jsonRoot)
+		if err != nil {
+			return err
+		}
+		configmigrate.Warn(deps)
+
+		raw, err := json.Marshal(jsonRoot)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return err
+		}
+		applyServiceDefaults(&c)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to check if config file exists: %w", err)
+	}
+
+	for _, opt := range opts {
+		if err := opt(&c); err != nil {
+			return err
+		}
+	}
+
+	deps, err := envRetentionArchivingMigrations(&c).Apply(configmigrate.OSEnv{}, nil)
+	if err != nil {
+		return err
+	}
+	configmigrate.Warn(deps)
+
+	warnRenamedEnvVars()
+
+	if err := validate(&c); err != nil {
+		return err
+	}
+
+	cfgSingleton.Store(&c)
+	return nil
+}
+
+// The old name is deliberately not read, so an operator whose deployment still
+// sets it would otherwise get the 30s default with no indication why their
+// configured wait stopped applying. Warn rather than fail: a stale timeout
+// variable is not worth refusing to boot over.
+func warnRenamedEnvVars() {
+	renamed := map[string]string{
+		"CONVOY_SYNC_DYNAMIC_EVENT_ACK_TIMEOUT": "CONVOY_VERIFY_DYNAMIC_EVENTS_TIMEOUT",
+	}
+	for old, current := range renamed {
+		if _, ok := os.LookupEnv(old); ok {
+			fmt.Fprintf(os.Stderr, "warning: %s is no longer read, use %s instead\n", old, current)
+		}
+	}
+}
+
+func ensureSSL(s ServerConfiguration) error {
+	if s.HTTP.SSL {
+		if s.HTTP.SSLCertFile == "" || s.HTTP.SSLKeyFile == "" {
+			return errors.New("both cert_file and key_file are required for ssl")
+		}
+	}
+	return nil
+}
+
+func ensureQueueConfig(queueCfg RedisConfiguration) error {
+	if queueCfg.IsSentinel() {
+		if strings.TrimSpace(queueCfg.MasterName) == "" {
+			return errors.New("redis sentinel master_name is required when scheme is redis-sentinel")
+		}
+		if len(queueCfg.SentinelAddresses()) == 0 {
+			return errors.New("redis sentinel addresses are required when scheme is redis-sentinel")
+		}
+		return nil
+	}
+
+	if len(queueCfg.BuildDsn()) == 0 {
+		return errors.New("redis queue dsn is empty")
+	}
+
+	return nil
+}
+
+func ensureMaxResponseSize(c *Configuration) {
+	bytes := c.MaxResponseSize * 1024
+
+	if bytes == 0 {
+		c.MaxResponseSize = MaxResponseSize
+	} else {
+		c.MaxResponseSize = bytes
+	}
+}
+
+func validate(c *Configuration) error {
+	if err := c.ValidateQueueInventory(); err != nil {
+		return err
+	}
+	ensureMaxResponseSize(c)
+
+	switch c.QueueProvider {
+	case "", RedisQueueProvider:
+		c.QueueProvider = RedisQueueProvider
+		if err := ensureQueueConfig(c.Redis); err != nil {
+			return err
+		}
+	case PostgresQueueProvider:
+		// Postgres owns queue, cache, limiter, circuit breaker, locks, and
+		// queue monitoring. Redis DSN is not required.
+		if err := validatePostgresQueue(c); err != nil {
+			return err
+		}
+		if err := validatePostgresCache(c); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown queue_provider %q (want redis or postgres)", c.QueueProvider)
+	}
+
+	if err := ensureSSL(c.Server); err != nil {
+		return err
+	}
+
+	if err := ensureRootPath(c); err != nil {
+		return err
+	}
+
+	if err := ensureJwtConfig(&c.Auth.Jwt); err != nil {
+		return err
+	}
+
+	// Validate billing configuration
+	if err := c.Billing.Validate(); err != nil {
+		return err
+	}
+
+	if c.Metrics.IsEnabled {
+		backend := c.Metrics.Backend
+		switch backend {
+		case PrometheusMetricsProvider:
+			break
+		default:
+			c.Metrics.IsEnabled = false
+		}
+	}
+
+	return nil
+}
+
+func ensureJwtConfig(jwt *JwtRealmOptions) error {
+	if !jwt.Enabled {
+		return nil
+	}
+	if IsStringEmpty(jwt.Secret) {
+		jwt.Secret = os.Getenv("CONVOY_JWT_SECRET")
+	}
+	if IsStringEmpty(jwt.RefreshSecret) {
+		jwt.RefreshSecret = os.Getenv("CONVOY_JWT_REFRESH_SECRET")
+	}
+	if IsStringEmpty(jwt.Secret) {
+		return errors.New("jwt secret is required when jwt realm is enabled")
+	}
+	if IsStringEmpty(jwt.RefreshSecret) {
+		return errors.New("jwt refresh secret is required when jwt realm is enabled")
+	}
+	return nil
+}
+
+var rootPathRegex = regexp.MustCompile(`^[a-zA-Z0-9/_-]+$`)
+
+func ensureRootPath(c *Configuration) error {
+	if c.RootPath == "" {
+		return nil
+	}
+
+	if !strings.HasPrefix(c.RootPath, "/") {
+		return errors.New("root path must start with '/' (e.g., '/convoy')")
+	}
+
+	if strings.HasSuffix(c.RootPath, "/") {
+		return errors.New("root path should not end with '/' (e.g., use '/convoy' not '/convoy/')")
+	}
+
+	if c.RootPath == "/" {
+		return errors.New("root path cannot be '/', use empty string for no prefix")
+	}
+
+	if !rootPathRegex.MatchString(c.RootPath) {
+		return errors.New("root path contains invalid characters, only alphanumeric, hyphens, underscores, and slashes are allowed")
+	}
+
+	return nil
+}
+
+// ValidateQueueInventory does not connect to either store. Inspection failure is
+// reported in the admin UI instead of preventing the active provider booting.
+func (c Configuration) ValidateQueueInventory() error {
+	if c.PreviousQueueProvider == "" {
+		return nil
+	}
+	if c.PreviousQueueProvider != RedisQueueProvider && c.PreviousQueueProvider != PostgresQueueProvider {
+		return errors.New("previous_queue_provider must be redis or postgres")
+	}
+	active := c.QueueProvider
+	if active == "" {
+		active = RedisQueueProvider
+	}
+	if c.PreviousQueueProvider == active {
+		return errors.New("previous_queue_provider must differ from queue_provider")
+	}
+	if strings.TrimSpace(c.QueueStoreScope) == "" {
+		return errors.New("queue_store_scope is required when a previous queue is configured")
+	}
+	if c.PreviousQueueProvider == RedisQueueProvider {
+		return ensureQueueConfig(c.Redis)
+	}
+	return nil
+}

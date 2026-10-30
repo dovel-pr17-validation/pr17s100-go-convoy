@@ -1,0 +1,1316 @@
+package api
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/subomi/requestmigrations/v2"
+
+	authz "github.com/Subomi/go-authz"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/api/handlers"
+	"github.com/frain-dev/convoy/api/policies"
+	"github.com/frain-dev/convoy/api/types"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/internal/organisation_members"
+	"github.com/frain-dev/convoy/internal/organisations"
+	"github.com/frain-dev/convoy/internal/pkg/billing"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/metrics"
+	"github.com/frain-dev/convoy/internal/pkg/middleware"
+	"github.com/frain-dev/convoy/queue/inventory"
+	"github.com/frain-dev/convoy/util"
+)
+
+//go:embed ui/build
+var reactFS embed.FS
+
+const (
+	VersionHeader = "X-Convoy-Version"
+	serverName    = "apiserver"
+)
+
+type ApplicationHandler struct {
+	Router     http.Handler
+	versioning *requestmigrations.RequestMigration
+	A          *types.APIOptions
+	cfg        config.Configuration
+}
+
+func (a *ApplicationHandler) reactRootHandler(rw http.ResponseWriter, req *http.Request) {
+	p := req.URL.Path
+
+	if a.cfg.RootPath != "" && strings.HasPrefix(p, a.cfg.RootPath) {
+		p = strings.TrimPrefix(p, a.cfg.RootPath)
+		if p == "" {
+			p = "/"
+		}
+	}
+
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = path.Clean(p)
+
+	req.URL.Path = p
+
+	f := fs.FS(reactFS)
+	static, err := fs.Sub(f, "ui/build")
+	if err != nil {
+		return
+	}
+
+	if _, err := static.Open(strings.TrimLeft(p, "/")); err == nil {
+		setUICacheHeaders(rw, p)
+		http.FileServer(http.FS(static)).ServeHTTP(rw, req)
+		return
+	}
+
+	req.URL.Path = "/"
+	if a.cfg.RootPath != "" {
+		a.serveIndexWithRootPath(rw)
+	} else {
+		// SPA fallback serves the index.html shell; keep it revalidated so a
+		// deploy is never masked by a stale shell pointing at old bundles.
+		setUICacheHeaders(rw, "/")
+		http.FileServer(http.FS(static)).ServeHTTP(rw, req)
+	}
+}
+
+// setUICacheHeaders keeps the dashboard HTML shell revalidated so a deploy is
+// never masked by a stale shell that still references old content-hashed
+// bundles. Only the shell (index.html and the SPA fallback "/") is forced to
+// revalidate; the hashed JS/CSS bundles are fingerprinted, so their URLs change
+// on every deploy and the browser's default caching can never serve stale code.
+// We deliberately do not blanket-cache by extension: not all embedded .js/.css
+// are fingerprinted (e.g. Monaco ships stable-named loader.js/editor.main.js
+// under assets/), so an immutable header there would pin old code after a
+// release.
+func setUICacheHeaders(rw http.ResponseWriter, p string) {
+	if p == "/" || strings.HasSuffix(p, ".html") {
+		rw.Header().Set("Cache-Control", "no-cache")
+	}
+}
+
+func (a *ApplicationHandler) serveIndexWithRootPath(rw http.ResponseWriter) {
+	const indexFileName = "index.html"
+	indexPath := path.Join("ui/build", indexFileName)
+	indexFile, err := reactFS.Open(indexPath)
+	if err != nil {
+		http.Error(rw, fmt.Sprintf("%s not found", indexFileName), http.StatusNotFound)
+		return
+	}
+	defer indexFile.Close()
+
+	content, err := io.ReadAll(indexFile)
+	if err != nil {
+		http.Error(rw, fmt.Sprintf("Failed to read %s", indexFileName), http.StatusInternalServerError)
+		return
+	}
+
+	root := strings.TrimSuffix(a.cfg.RootPath, "/")
+	contentStr := string(content)
+
+	contentStr = strings.Replace(contentStr, `<base href="/">`, fmt.Sprintf(`<base href="%s/">`, root), 1)
+	contentStr = strings.Replace(contentStr, `href="favicon.ico"`, fmt.Sprintf(`href="%s/favicon.ico"`, root), 1)
+
+	// Inject a lightweight JS shim to fix Angular asset URLs dynamically
+	clientScript := fmt.Sprintf(`
+<script type="text/javascript" defer>
+document.addEventListener('DOMContentLoaded', function() {
+  const rootPath = '%s';
+
+  function fixAsset(el, attr) {
+    const val = el.getAttribute(attr);
+    if (val && val.startsWith('/assets/')) {
+      el.setAttribute(attr, rootPath + val);
+    }
+  }
+
+  function fixAllAssets() {
+    document.querySelectorAll('[src^="/assets/"], [href^="/assets/"]').forEach(el => {
+      if (el.hasAttribute('src')) fixAsset(el, 'src');
+      if (el.hasAttribute('href')) fixAsset(el, 'href');
+    });
+  }
+
+  // Initial fix
+  fixAllAssets();
+
+  // Observe dynamic DOM changes
+  const observer = new MutationObserver(mutations => {
+    for (const m of mutations) {
+      if (m.type === 'attributes' && (m.attributeName === 'src' || m.attributeName === 'href')) {
+        fixAsset(m.target, m.attributeName);
+      } else if (m.type === 'childList') {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType === 1) {
+            if (node.hasAttribute?.('src')) fixAsset(node, 'src');
+            if (node.hasAttribute?.('href')) fixAsset(node, 'href');
+            node.querySelectorAll?.('[src^="/assets/"], [href^="/assets/"]').forEach(inner => {
+              if (inner.hasAttribute('src')) fixAsset(inner, 'src');
+              if (inner.hasAttribute('href')) fixAsset(inner, 'href');
+            });
+          }
+        });
+      }
+    }
+  });
+
+  observer.observe(document.body, {
+    childList: true,
+    attributes: true,
+    subtree: true
+  });
+});
+</script>`, root)
+
+	contentStr = strings.Replace(contentStr, `</body>`, clientScript+`</body>`, 1)
+
+	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The HTML shell must revalidate so a deploy is not masked by a stale shell
+	// that still references old content-hashed bundles.
+	rw.Header().Set("Cache-Control", "no-cache")
+	if _, err := rw.Write([]byte(contentStr)); err != nil {
+		http.Error(rw, "Failed to write response", http.StatusInternalServerError)
+		return
+	}
+}
+
+func NewApplicationHandler(a *types.APIOptions) (*ApplicationHandler, error) {
+	if a == nil {
+		return nil, fmt.Errorf("api options is required")
+	}
+	ensureAPIRepositories(a)
+	if a.QueueInventory == nil && a.DB != nil {
+		var err error
+		a.QueueInventory, err = inventory.Configured(a.Cfg, a.DB.GetDB())
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	appHandler := &ApplicationHandler{A: a}
+
+	cfg, err := config.Get()
+	if err != nil {
+		return nil, err
+	}
+
+	appHandler.cfg = cfg
+
+	// Resolve the billing service URL: OSS/self-hosted default to prod billing
+	// so catalog/checkout/license management work out of the box, while cloud
+	// (API key set) keeps requiring an explicit URL (Billing.Validate fails closed
+	// otherwise). The API key, not the URL, remains the cloud/org-billing signal
+	// used when mounting org-scoped routes.
+	billingCfg := cfg.Billing
+	billingCfg.URL = cfg.BillingServiceURL()
+	if strings.TrimSpace(billingCfg.URL) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		billingClient := billing.NewClient(billingCfg)
+		if err := billingClient.HealthCheck(ctx); err != nil {
+			// Do not log the billing URL: it can carry credentials in userinfo or
+			// tokens in the query string. The operator already knows the configured URL.
+			a.Logger.Warnf("billing service health check failed: %v", err)
+		}
+		a.BillingClient = billingClient
+	}
+
+	az, err := authz.NewAuthz(&authz.AuthzOpts{
+		AuthCtxKey: authz.AuthCtxType(convoy.AuthUserCtx),
+	})
+	if err != nil {
+		return nil, err
+	}
+	appHandler.A.Authz = az
+
+	opts := &requestmigrations.RequestMigrationOptions{
+		VersionHeader:  VersionHeader,
+		CurrentVersion: config.DefaultAPIVersion,
+		GetUserVersionFunc: func(req *http.Request) (string, error) {
+			cfg, err := config.Get()
+			if err != nil {
+				return "", err
+			}
+
+			return cfg.APIVersion, nil
+		},
+		VersionFormat: requestmigrations.DateFormat,
+	}
+	rm, err := requestmigrations.NewRequestMigration(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	err = RegisterMigrations(rm)
+	if err != nil {
+		return nil, err
+	}
+
+	appHandler.versioning = rm
+
+	return appHandler, nil
+}
+
+func (a *ApplicationHandler) buildRouter() *chi.Mux {
+	router := chi.NewMux()
+
+	router.Use(chiMiddleware.RequestID)
+	router.Use(chiMiddleware.Recoverer)
+	router.Use(middleware.WriteRequestIDHeader)
+	router.Use(middleware.WriteVersionHeader(VersionHeader, a.cfg.APIVersion))
+	router.Use(middleware.InstrumentRequests(serverName, router, a.A.TracerProvider()))
+	router.Use(middleware.EnrichSpanFromRoute)
+	router.Use(middleware.LogHttpRequest(a.A))
+	router.Use(chiMiddleware.Maybe(middleware.SetupCORS(a.A.Logger), shouldApplyCORS))
+
+	return router
+}
+
+func (a *ApplicationHandler) BuildControlPlaneRoutes() *chi.Mux {
+	router := a.buildRouter()
+
+	handler := &handlers.Handler{A: a.A, Versioning: a.versioning}
+
+	if a.cfg.RootPath != "" {
+		subRouter := chi.NewMux()
+		a.mountControlPlaneRoutes(subRouter, handler)
+		subRouter.HandleFunc("/*", a.reactRootHandler)
+		router.Mount(a.cfg.RootPath, subRouter)
+
+		// Also mount API routes at root level so they work with or without root path prefix
+		// This allows the frontend to work regardless of how URLs are constructed
+		a.mountControlPlaneRoutes(router, handler)
+	} else {
+		a.mountControlPlaneRoutes(router, handler)
+	}
+
+	router.HandleFunc("/*", a.reactRootHandler)
+
+	a.Router = router
+
+	return router
+}
+
+// mountEventIntakeRoutes registers the event creation routes on the /api/v1
+// router rather than inside the /projects subtree, so they are metered by the
+// ingest bucket alone. Registering them under /projects would also subject them
+// to that router's fail closed API limiter, and a fail open policy on the ingest
+// bucket buys nothing while a sibling limiter on the same path fails closed.
+//
+// Failure policy: fail open. A rejected event is a destroyed customer event, and
+// senders usually cannot replay it, so a limiter backend outage must not become
+// an ingest outage. This mirrors /ingest, which is the same surface.
+func (a *ApplicationHandler) mountEventIntakeRoutes(router chi.Router, handler *handlers.Handler) {
+	router.Group(func(intakeRouter chi.Router) {
+		// Project and org gates run before the shared ingest bucket so callers
+		// cannot burn /ingest capacity with unauthorized project IDs. Matches
+		// the ordering on main's /projects/{projectID}/events write group.
+		// InstrumentPath stays outermost so it keeps counting every request that
+		// reaches intake, rejected ones included.
+		intakeRouter.Use(
+			middleware.InstrumentPath(a.A.Licenser),
+			handler.RequireEnabledProject(),
+			handler.RequireEnabledOrganisation(),
+			middleware.RateLimiterHandler(a.A, middleware.RateLimitBucketIngest, a.cfg.InstanceIngestRate, middleware.FailOpen),
+		)
+
+		intakeRouter.Post("/projects/{projectID}/events", handler.CreateEndpointEvent)
+		intakeRouter.Post("/projects/{projectID}/events/fanout", handler.CreateEndpointFanoutEvent)
+		intakeRouter.Post("/projects/{projectID}/events/broadcast", handler.CreateBroadcastEvent)
+		intakeRouter.Post("/projects/{projectID}/events/dynamic", handler.CreateDynamicEvent)
+	})
+}
+
+func (a *ApplicationHandler) mountControlPlaneRoutes(router chi.Router, handler *handlers.Handler) {
+	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		_ = render.Render(w, r, util.NewServerResponse(fmt.Sprintf("Convoy %v", convoy.GetVersion()), nil, http.StatusOK))
+	})
+
+	router.Route("/sso", func(ssoRouter chi.Router) {
+		ssoRouter.Use(middleware.JsonResponse)
+		ssoRouter.Use(middleware.RequireValidEnterpriseSSOLicense(handler.A.Licenser, handler.A.Logger))
+		ssoRouter.Get("/callback", handler.RedeemSSOCallback)
+		// Admin portal mints an SSO config link that can rewrite SAML IdP metadata.
+		// RequireAuth here; handler also enforces organisation/instance admin.
+		ssoRouter.With(middleware.RequireAuth(handler.A.Logger)).Post("/admin-portal", handler.GetSSOAdminPortal)
+	})
+
+	// Ingestion API.
+	// Failure policy: fail open. Event intake is the one surface where a
+	// rejected request destroys a customer event instead of costing a retry, so
+	// a limiter backend outage must not become an ingest outage.
+	router.Route("/ingest", func(ingestRouter chi.Router) {
+		ingestRouter.Use(middleware.RateLimiterHandler(a.A, middleware.RateLimitBucketIngest, a.cfg.InstanceIngestRate, middleware.FailOpen))
+		ingestRouter.Get("/{maskID}", a.HandleCrcCheck)
+		ingestRouter.Post("/{maskID}", a.IngestEvent)
+	})
+
+	// Public API.
+	router.Route("/api", func(v1Router chi.Router) {
+		v1Router.Route("/v1", func(r chi.Router) {
+			r.Use(allowContentType)
+			r.Use(middleware.JsonResponse)
+			r.Use(middleware.RequireAuth(handler.A.Logger))
+
+			a.mountEventIntakeRoutes(r, handler)
+
+			r.Route("/projects", func(projectRouter chi.Router) {
+				// Failure policy: fail closed. Rejecting a project API call
+				// costs the caller a retry, so a limiter backend outage must
+				// not admit unmetered API traffic. Event intake is deliberately
+				// not under this mount; see mountEventIntakeRoutes.
+				projectRouter.Use(middleware.RateLimiterHandler(a.A, middleware.RateLimitBucketAPI, a.cfg.ApiRateLimit, middleware.FailClosed))
+				projectRouter.Get("/", handler.GetProjects)
+				projectRouter.With(handler.RequireEnabledOrganisation()).Post("/", handler.CreateProject)
+
+				projectRouter.Route("/{projectID}", func(projectSubRouter chi.Router) {
+					projectSubRouter.Get("/", handler.GetProject)
+					projectSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/", handler.UpdateProject)
+					projectSubRouter.Delete("/", handler.DeleteProject)
+
+					projectSubRouter.Route("/endpoints", func(endpointSubRouter chi.Router) {
+						endpointSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEndpoint)
+						endpointSubRouter.With(middleware.Pagination).Get("/", handler.GetEndpoints)
+						endpointSubRouter.Get("/period-failure-rates", handler.GetEndpointPeriodFailureRates)
+						endpointSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/oauth2/test", handler.TestOAuth2Connection)
+
+						endpointSubRouter.Route("/{endpointID}", func(e chi.Router) {
+							e.Get("/", handler.GetEndpoint)
+
+							e.With(handler.RequireEnabledProject()).Use(handler.RequireEnabledProject())
+
+							e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/", handler.UpdateEndpoint)
+							e.With(handler.RequireEnabledProject()).Delete("/", handler.DeleteEndpoint)
+							e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/expire_secret", handler.ExpireSecret)
+							e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/pause", handler.PauseEndpoint)
+							e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/activate", handler.ActivateEndpoint)
+						})
+					})
+
+					// TODO(subomi): left this here temporarily till the data plane is stable.
+					projectSubRouter.Route("/events", func(eventRouter chi.Router) {
+						// Read-only routes
+						eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+						eventRouter.Get("/countbatchreplayevents", handler.CountAffectedEvents)
+
+						// The event creation routes are registered in
+						// mountEventIntakeRoutes, outside this API rate limited
+						// subtree, so they carry the fail open ingest policy.
+
+						// Batch replay route (different middleware - no rate limiting)
+						eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).
+							Post("/batchreplay", handler.BatchReplayEvents)
+
+						// Event ID subroutes
+						eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+							eventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).
+								Put("/replay", handler.ReplayEndpointEvent)
+							eventSubRouter.Get("/", handler.GetEndpointEvent)
+						})
+					})
+
+					projectSubRouter.Route("/event-types", func(eventTypesRouter chi.Router) {
+						eventTypesRouter.Get("/", handler.GetEventTypes)
+						eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEventType)
+						eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/import", handler.ImportOpenApiSpec)
+						eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{eventTypeId}", handler.UpdateEventType)
+						eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/{eventTypeId}/deprecate", handler.DeprecateEventType)
+					})
+
+					projectSubRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+						eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+						eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/forceresend", handler.ForceResendEventDeliveries)
+						eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchretry", handler.BatchRetryEventDelivery)
+
+						eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+							eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+							eventDeliverySubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendEventDelivery)
+
+							eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+								deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+								deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+							})
+						})
+					})
+
+					projectSubRouter.Route("/subscriptions", func(subscriptionRouter chi.Router) {
+						subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateSubscription)
+						subscriptionRouter.Post("/test_filter", handler.TestSubscriptionFilter)
+						subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test_function", handler.TestSubscriptionFunction)
+						subscriptionRouter.With(middleware.Pagination).Get("/", handler.GetSubscriptions)
+						subscriptionRouter.With(handler.RequireEnabledProject()).Delete("/{subscriptionID}", handler.DeleteSubscription)
+						subscriptionRouter.Get("/{subscriptionID}", handler.GetSubscription)
+						subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{subscriptionID}", handler.UpdateSubscription)
+						subscriptionRouter.Put("/{subscriptionID}/toggle_status", handler.ToggleSubscriptionStatus)
+
+						// Filter routes
+						subscriptionRouter.Route("/{subscriptionID}/filters", func(filterRouter chi.Router) {
+							// Portal-link callers reaching filters through the control plane must
+							// still be scoped to subscriptions they own; no-op for JWT/API key.
+							filterRouter.Use(handler.RequirePortalLinkOwnsSubscription())
+							filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateFilter)
+							filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/bulk", handler.BulkCreateFilters)
+							filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/bulk_update", handler.BulkUpdateFilters)
+							filterRouter.Get("/", handler.GetFilters)
+							filterRouter.Get("/{filterID}", handler.GetFilter)
+							filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{filterID}", handler.UpdateFilter)
+							filterRouter.With(handler.RequireEnabledProject()).Delete("/{filterID}", handler.DeleteFilter)
+							filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test/{eventType}", handler.TestFilter)
+						})
+					})
+
+					projectSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/onboard", handler.BulkOnboard)
+
+					projectSubRouter.Route("/sources", func(sourceRouter chi.Router) {
+						sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateSource)
+						sourceRouter.Get("/{sourceID}", handler.GetSource)
+						sourceRouter.With(middleware.Pagination).Get("/", handler.LoadSourcesPaged)
+						sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test_function", handler.TestSourceFunction)
+						sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{sourceID}", handler.UpdateSource)
+						sourceRouter.With(handler.RequireEnabledProject()).Delete("/{sourceID}", handler.DeleteSource)
+					})
+
+					projectSubRouter.Route("/portal-links", func(portalLinkRouter chi.Router) {
+						portalLinkRouter.Use(middleware.RequireValidPortalLinksLicense(handler.A.Licenser, handler.A.Logger))
+						portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreatePortalLink)
+						portalLinkRouter.Get("/{portalLinkID}", handler.GetPortalLink)
+						portalLinkRouter.Get("/{portalLinkID}/refresh_token", handler.RefreshPortalLinkAuthToken)
+						portalLinkRouter.With(middleware.Pagination).Get("/", handler.LoadPortalLinksPaged)
+						portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{portalLinkID}", handler.UpdatePortalLink)
+						portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{portalLinkID}/revoke", handler.RevokePortalLink)
+					})
+
+					projectSubRouter.Route("/meta-events", func(metaEventRouter chi.Router) {
+						metaEventRouter.With(middleware.Pagination).Get("/", handler.GetMetaEventsPaged)
+
+						metaEventRouter.Route("/{metaEventID}", func(metaEventSubRouter chi.Router) {
+							metaEventSubRouter.Get("/", handler.GetMetaEvent)
+							metaEventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendMetaEvent)
+						})
+					})
+				})
+			})
+		})
+	})
+
+	// Dashboard API.
+	router.Route("/ui", func(uiRouter chi.Router) {
+		uiRouter.Use(middleware.JsonResponse)
+		uiRouter.Use(chiMiddleware.Maybe(middleware.RequireAuth(handler.A.Logger), shouldAuthRoute))
+
+		// Guest-listed (login/signup fetch instance features pre-auth), but a signed-in
+		// dashboard call carries a bearer token; resolve it so the handler can count the
+		// caller's orgs and gate org_limit. Without this the org gate always fails open.
+		uiRouter.With(middleware.OptionalAuth(handler.A.Logger)).Get("/license/features", handler.GetLicenseFeatures)
+
+		uiRouter.Post("/users/forgot-password", handler.ForgotPassword)
+		uiRouter.Post("/users/reset-password", handler.ResetPassword)
+		uiRouter.Post("/users/verify_email", handler.VerifyEmail)
+		uiRouter.With(middleware.OptionalAuth(handler.A.Logger)).Post("/users/resend_verification_email", handler.ResendVerificationEmail)
+		uiRouter.With(middleware.OptionalAuth(handler.A.Logger)).Post("/organisations/process_invite", handler.ProcessOrganisationMemberInvite)
+		uiRouter.Get("/users/token", handler.FindUserByInviteToken)
+
+		uiRouter.Route("/auth", func(authRouter chi.Router) {
+			authRouter.With(
+				middleware.WorkspaceSlugProbeRateLimit(a.A.Rate),
+				middleware.RequireValidEnterpriseSSOLicense(handler.A.Licenser, handler.A.Logger),
+			).Get("/sso", handler.InitSSO)
+			authRouter.Post("/login", handler.LoginUser)
+			authRouter.Post("/register", handler.RegisterUser)
+			authRouter.Post("/token/refresh", handler.RefreshToken)
+			authRouter.Post("/logout", handler.LogoutUser)
+
+			authRouter.With(middleware.RequireValidGoogleOAuthLicense(handler.A.Licenser, handler.A.Logger)).Post("/google/token", handler.GoogleOAuthToken)
+			authRouter.With(middleware.RequireValidGoogleOAuthLicense(handler.A.Licenser, handler.A.Logger)).Post("/google/setup", handler.GoogleOAuthSetup)
+		})
+
+		uiRouter.Route("/saml", func(samlRouter chi.Router) {
+			samlRouter.Use(middleware.RequireValidEnterpriseSSOLicense(handler.A.Licenser, handler.A.Logger))
+			samlRouter.Get("/login", handler.RedeemSSOCallback)
+			samlRouter.Post("/admin-portal", handler.GetSSOAdminPortal)
+		})
+
+		uiRouter.Route("/users", func(userRouter chi.Router) {
+			userRouter.Route("/{userID}", func(userSubRouter chi.Router) {
+				userSubRouter.Get("/profile", handler.GetUser)
+				userSubRouter.Put("/profile", handler.UpdateUser)
+				userSubRouter.Put("/password", handler.UpdatePassword)
+
+				userSubRouter.Route("/security", func(securityRouter chi.Router) {
+					securityRouter.Post("/personal_api_keys", handler.CreatePersonalAPIKey)
+					securityRouter.With(middleware.Pagination).Get("/", handler.GetAPIKeys)
+					securityRouter.Put("/{keyID}/revoke", handler.RevokePersonalAPIKey)
+				})
+			})
+		})
+
+		// Admin routes (instance admin only)
+		uiRouter.Route("/admin", func(adminRouter chi.Router) {
+			adminRouter.Get("/feature-flags", handler.GetAllFeatureFlags)
+			adminRouter.Put("/feature-flags/{featureKey}", handler.UpdateFeatureFlag)
+			adminRouter.With(middleware.Pagination).Get("/organisations", handler.GetAllOrganisations)
+			adminRouter.Get("/organisations/{orgID}/overrides", handler.GetOrganisationOverrides)
+			adminRouter.Put("/organisations/{orgID}/overrides", handler.UpdateOrganisationOverride)
+			adminRouter.Delete("/organisations/{orgID}/overrides/{featureKey}", handler.DeleteOrganisationOverride)
+			adminRouter.Get("/organisations/{orgID}/circuit-breaker-config", handler.GetOrganisationCircuitBreakerConfig)
+			adminRouter.Put("/organisations/{orgID}/circuit-breaker-config", handler.UpdateOrganisationCircuitBreakerConfig)
+			adminRouter.With(handler.RequireInstanceAdmin()).Get("/organisations/{orgID}/projects", handler.GetProjects)
+			adminRouter.Get("/projects/{projectID}/circuit-breaker-config", handler.GetProjectCircuitBreakerConfig)
+			adminRouter.Put("/projects/{projectID}/circuit-breaker-config", handler.UpdateProjectCircuitBreakerConfig)
+			adminRouter.Post("/retry-event-deliveries", handler.RetryEventDeliveries)
+			adminRouter.Get("/retry-event-deliveries/count", handler.CountRetryEventDeliveries)
+			adminRouter.Get("/retry-event-deliveries/batch/{batchID}", handler.GetBatchProgress)
+			adminRouter.Get("/retry-event-deliveries/batches", handler.ListBatchProgress)
+			adminRouter.Delete("/retry-event-deliveries/batch/{batchID}", handler.DeleteBatchProgress)
+			adminRouter.Post("/partitions", handler.StartPartitionRun)
+			adminRouter.Get("/partitions", handler.ListPartitionRuns)
+			adminRouter.Get("/partitions/tables", handler.ListPartitionTables)
+			adminRouter.Get("/indexes", handler.ListIndexes)
+			adminRouter.Post("/indexes/rebuild", handler.StartIndexRebuild)
+			adminRouter.Get("/partitions/{runID}", handler.GetPartitionRun)
+			adminRouter.Get("/retention/runs", handler.ListRetentionRuns)
+			adminRouter.Get("/retention/runs/{runID}", handler.GetRetentionRun)
+
+			// Queue monitoring for the dashboard's native page. Both brokers
+			// implement the inspector, so these routes are provider-neutral.
+			// Instance-admin authorization lives in the handlers, like the
+			// sibling admin routes above.
+			adminRouter.Route("/queue", func(queueRouter chi.Router) {
+				queueRouter.Use(middleware.RequireAsynqMonitoring(func() license.Licenser { return a.A.Licenser }, handler.A.Logger))
+				queueRouter.Get("/stats", handler.GetQueueStats)
+				queueRouter.Get("/stores", handler.GetQueueStores)
+				queueRouter.Get("/scheduler", handler.GetQueueSchedulerEntries)
+				queueRouter.Get("/{queueName}/history", handler.GetQueueHistory)
+				queueRouter.Get("/{queueName}/tasks", handler.GetQueueTasks)
+				queueRouter.Post("/{queueName}/tasks/bulk", handler.BulkQueueTaskAction)
+				queueRouter.Post("/{queueName}/tasks/{taskID}/retry", handler.RetryQueueTask)
+				queueRouter.Post("/{queueName}/tasks/{taskID}/run", handler.RunQueueTask)
+				queueRouter.Post("/{queueName}/tasks/{taskID}/archive", handler.ArchiveQueueTask)
+				queueRouter.Post("/{queueName}/tasks/{taskID}/delete", handler.DeleteQueueTask)
+				queueRouter.Post("/{queueName}/pause", handler.PauseQueue)
+				queueRouter.Post("/{queueName}/resume", handler.UnpauseQueue)
+			})
+
+			// Data plane monitoring for the same page. It carries the queue
+			// group's two gates because it answers the same question about the
+			// same instance-wide work, for deployments whose event path does not
+			// run on the queue.
+			adminRouter.Route("/dataplane", func(dataPlaneRouter chi.Router) {
+				dataPlaneRouter.Use(middleware.RequireAsynqMonitoring(func() license.Licenser { return a.A.Licenser }, handler.A.Logger))
+				dataPlaneRouter.Get("/status", handler.GetDataPlaneStatus)
+			})
+		})
+
+		uiRouter.Route("/organisations", func(orgRouter chi.Router) {
+			orgRouter.Post("/", handler.CreateOrganisation)
+			orgRouter.With(middleware.Pagination).Get("/", handler.GetOrganisationsPaged)
+
+			orgRouter.Route("/{orgID}", func(orgSubRouter chi.Router) {
+				orgSubRouter.Get("/", handler.GetOrganisation)
+				orgSubRouter.With(handler.RequireEnabledOrganisation()).Put("/", handler.UpdateOrganisation)
+				orgSubRouter.With(handler.RequireEnabledOrganisation()).Put("/slug", handler.UpdateOrganisationSlug)
+				orgSubRouter.Delete("/", handler.DeleteOrganisation)
+				orgSubRouter.Get("/feature-flags", handler.GetOrganisationFeatureFlags)
+				orgSubRouter.With(handler.RequireEnabledOrganisation()).Put("/feature-flags", handler.UpdateOrganisationFeatureFlags)
+				orgSubRouter.Get("/early-adopter-features", handler.GetEarlyAdopterFeatures)
+
+				orgSubRouter.Route("/invites", func(orgInvitesRouter chi.Router) {
+					orgInvitesRouter.With(handler.RequireEnabledOrganisation()).Post("/", handler.InviteUserToOrganisation)
+					orgInvitesRouter.With(handler.RequireEnabledOrganisation()).Post("/{inviteID}/resend", handler.ResendOrganizationInvite)
+					orgInvitesRouter.With(handler.RequireEnabledOrganisation()).Post("/{inviteID}/cancel", handler.CancelOrganizationInvite)
+					orgInvitesRouter.With(middleware.Pagination, handler.RequireOrganisationMembership()).Get("/pending", handler.GetPendingOrganisationInvites)
+				})
+
+				orgSubRouter.Route("/members", func(orgMemberRouter chi.Router) {
+					orgMemberRouter.With(middleware.Pagination, handler.RequireOrganisationMembership()).Get("/", handler.GetOrganisationMembers)
+					orgMemberRouter.Route("/{memberID}", func(orgMemberSubRouter chi.Router) {
+						orgMemberSubRouter.With(handler.RequireOrganisationMembership()).Get("/", handler.GetOrganisationMember)
+						orgMemberSubRouter.Put("/", handler.UpdateOrganisationMember)
+						orgMemberSubRouter.Delete("/", handler.DeleteOrganisationMember)
+					})
+				})
+
+				orgSubRouter.Route("/projects", func(projectRouter chi.Router) {
+					projectRouter.With(handler.RequireOrganisationMembership()).Get("/", handler.GetProjects)
+					projectRouter.With(handler.RequireEnabledOrganisation()).Post("/", handler.CreateProject)
+
+					projectRouter.Route("/{projectID}", func(projectSubRouter chi.Router) {
+						projectSubRouter.Get("/", handler.GetProject)
+						projectSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/", handler.UpdateProject)
+						projectSubRouter.With(handler.RequireEnabledProject()).Delete("/", handler.DeleteProject)
+						projectSubRouter.Get("/stats", handler.GetProjectStatistics)
+
+						projectSubRouter.Route("/security/keys", func(projectKeySubRouter chi.Router) {
+							projectKeySubRouter.With(handler.RequireEnabledProject()).Put("/regenerate", handler.RegenerateProjectAPIKey)
+						})
+
+						projectSubRouter.Route("/endpoints", func(endpointSubRouter chi.Router) {
+							endpointSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEndpoint)
+							endpointSubRouter.With(middleware.Pagination).Get("/", handler.GetEndpoints)
+							endpointSubRouter.Get("/period-failure-rates", handler.GetEndpointPeriodFailureRates)
+							endpointSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/oauth2/test", handler.TestOAuth2Connection)
+
+							endpointSubRouter.Route("/{endpointID}", func(e chi.Router) {
+								e.Get("/", handler.GetEndpoint)
+
+								e.With(handler.RequireEnabledProject()).Use(handler.RequireEnabledProject())
+
+								e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/", handler.UpdateEndpoint)
+								e.With(handler.RequireEnabledProject()).Delete("/", handler.DeleteEndpoint)
+								e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/expire_secret", handler.ExpireSecret)
+								e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/pause", handler.PauseEndpoint)
+								e.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/activate", handler.ActivateEndpoint)
+							})
+						})
+
+						// TODO(subomi): left this here temporarily till the data plane is stable.
+						projectSubRouter.Route("/events", func(eventRouter chi.Router) {
+							eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+							eventRouter.Get("/countbatchreplayevents", handler.CountAffectedEvents)
+
+							// TODO(all): should the InstrumentPath change?
+							eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEndpointEvent)
+							eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/fanout", handler.CreateEndpointFanoutEvent)
+							eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/broadcast", handler.CreateBroadcastEvent)
+							eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/dynamic", handler.CreateDynamicEvent)
+							eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchreplay", handler.BatchReplayEvents)
+
+							eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+								eventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/replay", handler.ReplayEndpointEvent)
+								eventSubRouter.Get("/", handler.GetEndpointEvent)
+							})
+						})
+
+						projectSubRouter.Route("/event-types", func(eventTypesRouter chi.Router) {
+							eventTypesRouter.Get("/", handler.GetEventTypes)
+							eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEventType)
+							eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/import", handler.ImportOpenApiSpec)
+							eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{eventTypeId}", handler.UpdateEventType)
+							eventTypesRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/{eventTypeId}/deprecate", handler.DeprecateEventType)
+						})
+
+						projectSubRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+							eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+							eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/forceresend", handler.ForceResendEventDeliveries)
+							eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchretry", handler.BatchRetryEventDelivery)
+							eventDeliveryRouter.Get("/countbatchretryevents", handler.CountAffectedEventDeliveries)
+							eventDeliveryRouter.Get("/statustotals", handler.EventDeliveryStatusTotals)
+							eventDeliveryRouter.Get("/eventtypes", handler.EventDeliveryFilterEventTypes)
+
+							eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+								eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+								eventDeliverySubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendEventDelivery)
+
+								eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+									deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+									deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+								})
+							})
+						})
+
+						projectSubRouter.Route("/subscriptions", func(subscriptionRouter chi.Router) {
+							subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateSubscription)
+							subscriptionRouter.Post("/test_filter", handler.TestSubscriptionFilter)
+							subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test_function", handler.TestSubscriptionFunction)
+							subscriptionRouter.With(middleware.Pagination).Get("/", handler.GetSubscriptions)
+							subscriptionRouter.With(handler.RequireEnabledProject()).Delete("/{subscriptionID}", handler.DeleteSubscription)
+							subscriptionRouter.Get("/{subscriptionID}", handler.GetSubscription)
+							subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{subscriptionID}", handler.UpdateSubscription)
+
+							// Filter routes
+							subscriptionRouter.Route("/{subscriptionID}/filters", func(filterRouter chi.Router) {
+								// Portal-link callers reaching filters through the control plane must
+								// still be scoped to subscriptions they own; no-op for JWT/API key.
+								filterRouter.Use(handler.RequirePortalLinkOwnsSubscription())
+								filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateFilter)
+								filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/bulk", handler.BulkCreateFilters)
+								filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/bulk_update", handler.BulkUpdateFilters)
+								filterRouter.Get("/", handler.GetFilters)
+								filterRouter.Get("/{filterID}", handler.GetFilter)
+								filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{filterID}", handler.UpdateFilter)
+								filterRouter.With(handler.RequireEnabledProject()).Delete("/{filterID}", handler.DeleteFilter)
+								filterRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test/{eventType}", handler.TestFilter)
+							})
+						})
+
+						projectSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/onboard", handler.BulkOnboard)
+
+						projectSubRouter.Route("/sources", func(sourceRouter chi.Router) {
+							sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateSource)
+							sourceRouter.Get("/{sourceID}", handler.GetSource)
+							sourceRouter.With(middleware.Pagination).Get("/", handler.LoadSourcesPaged)
+							sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test_function", handler.TestSourceFunction)
+							sourceRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{sourceID}", handler.UpdateSource)
+							sourceRouter.With(handler.RequireEnabledProject()).Delete("/{sourceID}", handler.DeleteSource)
+						})
+
+						projectSubRouter.Route("/meta-events", func(metaEventRouter chi.Router) {
+							metaEventRouter.With(middleware.Pagination).Get("/", handler.GetMetaEventsPaged)
+
+							metaEventRouter.Route("/{metaEventID}", func(metaEventSubRouter chi.Router) {
+								metaEventSubRouter.Get("/", handler.GetMetaEvent)
+								metaEventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendMetaEvent)
+							})
+						})
+
+						projectSubRouter.Route("/portal-links", func(portalLinkRouter chi.Router) {
+							portalLinkRouter.Use(middleware.RequireValidPortalLinksLicense(handler.A.Licenser, handler.A.Logger))
+							portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreatePortalLink)
+							portalLinkRouter.Get("/{portalLinkID}", handler.GetPortalLink)
+							portalLinkRouter.With(middleware.Pagination).Get("/", handler.LoadPortalLinksPaged)
+							portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{portalLinkID}", handler.UpdatePortalLink)
+							portalLinkRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/{portalLinkID}/revoke", handler.RevokePortalLink)
+						})
+
+						projectSubRouter.Route("/dashboard", func(dashboardRouter chi.Router) {
+							dashboardRouter.Get("/summary", handler.GetDashboardSummary)
+						})
+					})
+				})
+			})
+		})
+
+		uiRouter.Route("/configuration", func(configRouter chi.Router) {
+			configRouter.Get("/", handler.GetConfiguration)
+			// Instance-admin only: dashboard Admin → Configurations writes the
+			// instance configurations row (retention / archiving / storage).
+			configRouter.With(handler.RequireInstanceAdmin()).Put("/", handler.UpdateConfiguration)
+			configRouter.With(middleware.WorkspaceSlugProbeRateLimit(a.A.Rate)).Get("/auth", handler.GetAuthConfiguration)
+		})
+
+		uiRouter.Route("/backups", func(backupRouter chi.Router) {
+			backupRouter.Post("/trigger", handler.TriggerBackup)
+		})
+
+		billingHandler := &handlers.BillingHandler{
+			Handler:       handler,
+			BillingClient: a.A.BillingClient,
+		}
+		uiRouter.Route("/billing", func(billingRouter chi.Router) {
+			// Catalog endpoints (config, plans, tax_id_types) are intentionally
+			// readable by any authenticated user: they return only public
+			// catalog data the dashboard needs to render billing UI (plan
+			// names/pricing, tax ID formats, payment provider publishable key,
+			// billing mode). Org-scoped and checkout-state fields stay behind
+			// orgGuard/canManageSelfHostedBilling inside the handlers.
+			billingRouter.Get("/config", billingHandler.GetBillingConfig)
+			billingRouter.Get("/plans", billingHandler.GetPlans)
+			billingRouter.Get("/tax_id_types", billingHandler.GetTaxIDTypes)
+			billingRouter.Post("/sh_checkout/start", billingHandler.StartSelfHostedCheckout)
+			billingRouter.Post("/sh_checkout/complete", billingHandler.CompleteSelfHostedCheckout)
+			billingRouter.Post("/sh_trial/start", billingHandler.StartSelfHostedTrial)
+			billingRouter.Get("/sh_subscription", billingHandler.GetSelfHostedSubscription)
+			billingRouter.Put("/sh_subscription/upgrade", billingHandler.UpgradeSelfHostedSubscription)
+			billingRouter.Delete("/sh_subscription", billingHandler.DeleteSelfHostedSubscription)
+			billingRouter.Get("/sh_organisation", billingHandler.GetSelfHostedOrganisation)
+			billingRouter.Put("/sh_tax_id", billingHandler.UpdateSelfHostedOrganisationTaxID)
+			billingRouter.Put("/sh_address", billingHandler.UpdateSelfHostedOrganisationAddress)
+			billingRouter.Get("/sh_usage", billingHandler.GetSelfHostedUsage)
+			billingRouter.Get("/sh_invoices", billingHandler.GetSelfHostedInvoices)
+			billingRouter.Get("/sh_invoices/{invoiceID}", billingHandler.GetSelfHostedInvoice)
+			billingRouter.Get("/sh_invoices/{invoiceID}/download", billingHandler.DownloadSelfHostedInvoice)
+			billingRouter.Get("/sh_payment_methods", billingHandler.GetSelfHostedPaymentMethods)
+			billingRouter.Get("/sh_payment_methods/setup_intent", billingHandler.GetSelfHostedSetupIntent)
+			billingRouter.Put("/sh_payment_methods/{pmID}/default", billingHandler.SetDefaultSelfHostedPaymentMethod)
+			billingRouter.Delete("/sh_payment_methods/{pmID}", billingHandler.DeleteSelfHostedPaymentMethod)
+
+			if a.cfg.UsesOrgBilling() {
+				billingRouter.Route("/organisations/{orgID}", func(orgBillingRouter chi.Router) {
+					orgBillingRouter.Get("/", billingHandler.GetOrganisation)
+					orgBillingRouter.Put("/", billingHandler.UpdateOrganisation)
+					orgBillingRouter.Get("/usage", billingHandler.GetUsage)
+					orgBillingRouter.Get("/invoices", billingHandler.GetInvoices)
+					orgBillingRouter.Get("/payment_methods", billingHandler.GetPaymentMethods)
+					orgBillingRouter.Get("/subscription", billingHandler.GetSubscription)
+					orgBillingRouter.Get("/internal_id", billingHandler.GetInternalOrganisationID)
+					orgBillingRouter.Put("/tax_id", billingHandler.UpdateOrganisationTaxID)
+					orgBillingRouter.Put("/address", billingHandler.UpdateOrganisationAddress)
+				})
+
+				billingRouter.Route("/organisations/{orgID}/subscriptions", func(billingSubRouter chi.Router) {
+					billingSubRouter.Get("/", billingHandler.GetSubscriptions)
+					billingSubRouter.Post("/onboard", billingHandler.OnboardSubscription)
+					billingSubRouter.Post("/trial", billingHandler.StartTrial)
+					billingSubRouter.Put("/{subscriptionID}/upgrade", billingHandler.UpgradeSubscription)
+					billingSubRouter.Delete("/{subscriptionID}", billingHandler.DeleteSubscription)
+				})
+
+				billingRouter.Route("/organisations/{orgID}/payment_methods", func(billingPmRouter chi.Router) {
+					billingPmRouter.Get("/", billingHandler.GetPaymentMethods)
+					billingPmRouter.Get("/setup_intent", billingHandler.GetSetupIntent)
+					billingPmRouter.Put("/{pmID}/default", billingHandler.SetDefaultPaymentMethod)
+					billingPmRouter.Delete("/{pmID}", billingHandler.DeletePaymentMethod)
+				})
+
+				billingRouter.Route("/organisations/{orgID}/invoices", func(billingInvoiceRouter chi.Router) {
+					billingInvoiceRouter.Get("/", billingHandler.GetInvoices)
+					billingInvoiceRouter.Get("/{invoiceID}", billingHandler.GetInvoice)
+					billingInvoiceRouter.Get("/{invoiceID}/download", billingHandler.DownloadInvoice)
+				})
+			}
+		})
+	})
+
+	// Portal Link API.
+	router.Route("/portal-api", func(portalLinkRouter chi.Router) {
+		portalLinkRouter.Use(middleware.JsonResponse)
+		portalLinkRouter.Use(middleware.SetupCORS(handler.A.Logger))
+		portalLinkRouter.Use(middleware.RequireValidPortalLinksLicense(handler.A.Licenser, handler.A.Logger))
+		portalLinkRouter.Use(middleware.RequireAuth(handler.A.Logger))
+
+		portalLinkRouter.Route("/configuration", func(configRouter chi.Router) {
+			configRouter.Get("/", handler.GetConfiguration)
+			configRouter.With(middleware.WorkspaceSlugProbeRateLimit(a.A.Rate)).Get("/auth", handler.GetAuthConfiguration)
+		})
+
+		portalLinkRouter.Get("/portal_link", handler.GetPortalLink)
+
+		portalLinkRouter.Get("/license/features", handler.GetPortalLicenseFeatures)
+
+		portalLinkRouter.Route("/endpoints", func(endpointRouter chi.Router) {
+			endpointRouter.With(middleware.Pagination).Get("/", handler.GetEndpoints)
+			endpointRouter.Get("/period-failure-rates", handler.GetEndpointPeriodFailureRates)
+			endpointRouter.Get("/{endpointID}", handler.GetEndpoint)
+			endpointRouter.With(handler.CanManageEndpoint()).Post("/", handler.CreateEndpoint)
+			endpointRouter.With(handler.CanManageEndpoint()).Put("/{endpointID}", handler.UpdateEndpoint)
+			endpointRouter.With(handler.CanManageEndpoint()).Delete("/{endpointID}", handler.DeleteEndpoint)
+			endpointRouter.With(handler.CanManageEndpoint()).Put("/{endpointID}/pause", handler.PauseEndpoint)
+			endpointRouter.With(handler.CanManageEndpoint()).Put("/{endpointID}/expire_secret", handler.ExpireSecret)
+		})
+
+		// TODO(subomi): left this here temporarily till the data plane is stable.
+		portalLinkRouter.Route("/events", func(eventRouter chi.Router) {
+			eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/", handler.CreateEndpointEvent)
+			eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+			eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchreplay", handler.BatchReplayEvents)
+			eventRouter.Get("/countbatchreplayevents", handler.CountAffectedEvents)
+
+			eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+				eventSubRouter.Get("/", handler.GetEndpointEvent)
+				eventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/replay", handler.ReplayEndpointEvent)
+			})
+		})
+
+		portalLinkRouter.Route("/event-types", func(eventTypesRouter chi.Router) {
+			eventTypesRouter.Get("/", handler.GetEventTypes)
+			eventTypesRouter.With(handler.RequireEnabledProject()).Post("/", handler.CreateEventType)
+			eventTypesRouter.With(handler.RequireEnabledProject()).Put("/{eventTypeId}", handler.UpdateEventType)
+			eventTypesRouter.With(handler.RequireEnabledProject()).Post("/{eventTypeId}/deprecate", handler.DeprecateEventType)
+		})
+
+		portalLinkRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+			eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+			eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/forceresend", handler.ForceResendEventDeliveries)
+			eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchretry", handler.BatchRetryEventDelivery)
+			eventDeliveryRouter.Get("/countbatchretryevents", handler.CountAffectedEventDeliveries)
+			eventDeliveryRouter.Get("/statustotals", handler.EventDeliveryStatusTotals)
+			eventDeliveryRouter.Get("/eventtypes", handler.EventDeliveryFilterEventTypes)
+
+			eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+				eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+				eventDeliverySubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendEventDelivery)
+
+				eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+					deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+					deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+				})
+			})
+		})
+
+		portalLinkRouter.Route("/dashboard", func(dashboardRouter chi.Router) {
+			dashboardRouter.Get("/summary", handler.GetDashboardSummary)
+		})
+
+		portalLinkRouter.Route("/subscriptions", func(subscriptionRouter chi.Router) {
+			subscriptionRouter.Post("/", handler.CreateSubscription)
+			subscriptionRouter.Post("/test_filter", handler.TestSubscriptionFilter)
+			subscriptionRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/test_function", handler.TestSubscriptionFunction)
+			subscriptionRouter.With(middleware.Pagination).Get("/", handler.GetSubscriptions)
+			subscriptionRouter.Delete("/{subscriptionID}", handler.DeleteSubscription)
+			subscriptionRouter.Get("/{subscriptionID}", handler.GetSubscription)
+			subscriptionRouter.Put("/{subscriptionID}", handler.UpdateSubscription)
+
+			// Filter routes
+			subscriptionRouter.Route("/{subscriptionID}/filters", func(filterRouter chi.Router) {
+				filterRouter.Use(handler.RequirePortalLinkOwnsSubscription())
+				filterRouter.Post("/", handler.CreateFilter)
+				filterRouter.With(handler.RequireEnabledProject()).Post("/bulk", handler.BulkCreateFilters)
+				filterRouter.With(handler.RequireEnabledProject()).Post("/bulk_update", handler.BulkUpdateFilters)
+				filterRouter.Get("/", handler.GetFilters)
+				filterRouter.Get("/{filterID}", handler.GetFilter)
+				filterRouter.With(handler.RequireEnabledProject()).Put("/{filterID}", handler.UpdateFilter)
+				filterRouter.With(handler.RequireEnabledProject()).Delete("/{filterID}", handler.DeleteFilter)
+				filterRouter.With(handler.RequireEnabledProject()).Post("/test/{eventType}", handler.TestFilter)
+			})
+		})
+	})
+
+	// Asynqmon. Redis-only: it reads redis directly, so the postgres broker
+	// leaves QueueMonitor nil and its operators use the dashboard's native
+	// queue page, which is served from /ui/admin/queue for both brokers.
+	router.Route("/queue", func(asynqRouter chi.Router) {
+		monitor := a.A.QueueMonitor
+		if monitor == nil {
+			return
+		}
+		asynqRouter.Use(middleware.RequireAsynqMonitoring(func() license.Licenser { return a.A.Licenser }, handler.A.Logger))
+		asynqRouter.Group(func(sessionRouter chi.Router) {
+			sessionRouter.Use(middleware.RequireAuth(handler.A.Logger))
+			sessionRouter.Post("/monitoring/session", handler.CreateQueueMonitoringSession)
+			sessionRouter.Delete("/monitoring/session", handler.RevokeQueueMonitoringSession)
+		})
+		// The embed route is reached by a browser navigation, which cannot
+		// carry an Authorization header, so it is gated on the cookie minted
+		// above for instance admins alone.
+		asynqRouter.Group(func(embedRouter chi.Router) {
+			embedRouter.Use(middleware.RequireQueueSessionCookie(handlers.ValidateQueueSessionCookie(handler.A.QueueSessionStore)))
+			embedRouter.Handle("/monitoring/embed/*", monitor.MonitorWithRootPath("/queue/monitoring/embed"))
+		})
+		// The direct route carries the same instance-admin policy as minting an
+		// embed session, so both entrances to asynqmon agree on who may read
+		// queue contents.
+		asynqRouter.Group(func(monitorRouter chi.Router) {
+			monitorRouter.Use(middleware.RequireAuth(handler.A.Logger))
+			monitorRouter.Use(handler.RequireQueueMonitoringAdmin())
+			monitorRouter.Handle("/monitoring/*", monitor.Monitor())
+		})
+	})
+
+	router.HandleFunc("/metrics", a.metricsHandler())
+}
+
+func (a *ApplicationHandler) metricsHandler() http.HandlerFunc {
+	if !a.cfg.Metrics.IsEnabled || !a.A.Licenser.CanExportPrometheusMetrics() {
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Prometheus metrics export is not enabled", http.StatusMethodNotAllowed)
+		}
+	}
+
+	h := promhttp.HandlerFor(metrics.Reg(), promhttp.HandlerOpts{
+		Registry: metrics.Reg(),
+	})
+	return h.ServeHTTP
+}
+
+func (a *ApplicationHandler) BuildDataPlaneRoutes() *chi.Mux {
+	router := a.buildRouter()
+
+	handler := &handlers.Handler{A: a.A, Versioning: a.versioning}
+
+	if a.cfg.RootPath != "" {
+		subRouter := chi.NewMux()
+		a.mountDataPlaneRoutes(subRouter, handler)
+		router.Mount(a.cfg.RootPath, subRouter)
+	} else {
+		a.mountDataPlaneRoutes(router, handler)
+	}
+
+	a.Router = router
+
+	return router
+}
+
+func (a *ApplicationHandler) mountDataPlaneRoutes(router chi.Router, handler *handlers.Handler) {
+	router.HandleFunc("/metrics", a.metricsHandler())
+
+	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		_ = render.Render(w, r, util.NewServerResponse(fmt.Sprintf("Convoy %v", convoy.GetVersion()), nil, http.StatusOK))
+	})
+
+	// Ingestion API. Must use the same knob as the control plane's /ingest so
+	// CONVOY_INSTANCE_INGEST_RATE governs every ingest surface.
+	// Failure policy: fail open, same reasoning as the control plane's /ingest.
+	router.Route("/ingest", func(ingestRouter chi.Router) {
+		ingestRouter.Use(middleware.RateLimiterHandler(a.A, middleware.RateLimitBucketIngest, a.cfg.InstanceIngestRate, middleware.FailOpen))
+		ingestRouter.Get("/{maskID}", a.HandleCrcCheck)
+		ingestRouter.Post("/{maskID}", a.IngestEvent)
+	})
+
+	// Public API.
+	router.Route("/api", func(v1Router chi.Router) {
+		v1Router.Route("/v1", func(r chi.Router) {
+			r.Use(allowContentType)
+			r.Use(middleware.JsonResponse)
+			r.Use(middleware.RequireAuth(handler.A.Logger))
+
+			a.mountEventIntakeRoutes(r, handler)
+
+			r.Route("/projects", func(projectRouter chi.Router) {
+				// Failure policy: fail closed, same reasoning as the control
+				// plane's /projects mount. Event intake is deliberately not
+				// under this mount; see mountEventIntakeRoutes.
+				projectRouter.Use(middleware.RateLimiterHandler(a.A, middleware.RateLimitBucketAPI, a.cfg.ApiRateLimit, middleware.FailClosed))
+				projectRouter.Route("/{projectID}", func(projectSubRouter chi.Router) {
+					projectSubRouter.Route("/events", func(eventRouter chi.Router) {
+						// The event creation routes are registered in
+						// mountEventIntakeRoutes, outside this API rate limited
+						// subtree, so they carry the fail open ingest policy.
+
+						eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+						eventRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchreplay", handler.BatchReplayEvents)
+
+						eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+							eventSubRouter.Get("/", handler.GetEndpointEvent)
+							eventSubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/replay", handler.ReplayEndpointEvent)
+						})
+					})
+
+					projectSubRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+						eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+						eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/forceresend", handler.ForceResendEventDeliveries)
+						eventDeliveryRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Post("/batchretry", handler.BatchRetryEventDelivery)
+
+						eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+							eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+							eventDeliverySubRouter.With(handler.RequireEnabledProject(), handler.RequireEnabledOrganisation()).Put("/resend", handler.ResendEventDelivery)
+
+							eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+								deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+								deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+							})
+						})
+					})
+				})
+			})
+		})
+	})
+
+	// Dashboard API.
+	router.Route("/ui", func(uiRouter chi.Router) {
+		uiRouter.Use(middleware.JsonResponse)
+		uiRouter.Use(chiMiddleware.Maybe(middleware.RequireAuth(handler.A.Logger), shouldAuthRoute))
+
+		// TODO(subomi): added these back for the tests to pass.
+		// What should we do in the future?
+		uiRouter.Route("/auth", func(authRouter chi.Router) {
+			authRouter.With(
+				middleware.WorkspaceSlugProbeRateLimit(a.A.Rate),
+				middleware.RequireValidEnterpriseSSOLicense(handler.A.Licenser, handler.A.Logger),
+			).Get("/sso", handler.InitSSO)
+			authRouter.Post("/login", handler.LoginUser)
+			authRouter.Post("/register", handler.RegisterUser)
+			authRouter.Post("/token/refresh", handler.RefreshToken)
+			authRouter.Post("/logout", handler.LogoutUser)
+		})
+
+		// This replica's own live snapshot. It carries the same two gates as the
+		// control plane's /ui/admin/dataplane/status, because it answers the same
+		// question about the same instance-wide work; it exists separately so a
+		// reader does not have to wait out a publish interval.
+		uiRouter.Route("/admin/dataplane", func(dataPlaneRouter chi.Router) {
+			dataPlaneRouter.Use(middleware.RequireAsynqMonitoring(func() license.Licenser { return a.A.Licenser }, handler.A.Logger))
+			dataPlaneRouter.Get("/snapshot", handler.GetDataPlaneSnapshot)
+		})
+
+		uiRouter.Route("/organisations", func(orgRouter chi.Router) {
+			orgRouter.Route("/{orgID}", func(orgSubRouter chi.Router) {
+				orgSubRouter.Route("/projects", func(projectRouter chi.Router) {
+					projectRouter.Route("/{projectID}", func(projectSubRouter chi.Router) {
+						projectSubRouter.Route("/events", func(eventRouter chi.Router) {
+							eventRouter.Post("/", handler.CreateEndpointEvent)
+							eventRouter.Post("/fanout", handler.CreateEndpointFanoutEvent)
+							eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+							eventRouter.Post("/batchreplay", handler.BatchReplayEvents)
+							eventRouter.Get("/countbatchreplayevents", handler.CountAffectedEvents)
+
+							eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+								eventSubRouter.Get("/", handler.GetEndpointEvent)
+								eventSubRouter.Put("/replay", handler.ReplayEndpointEvent)
+							})
+						})
+
+						projectSubRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+							eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+							eventDeliveryRouter.Post("/forceresend", handler.ForceResendEventDeliveries)
+							eventDeliveryRouter.Post("/batchretry", handler.BatchRetryEventDelivery)
+							eventDeliveryRouter.Get("/countbatchretryevents", handler.CountAffectedEventDeliveries)
+							eventDeliveryRouter.Get("/statustotals", handler.EventDeliveryStatusTotals)
+							eventDeliveryRouter.Get("/eventtypes", handler.EventDeliveryFilterEventTypes)
+
+							eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+								eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+								eventDeliverySubRouter.Put("/resend", handler.ResendEventDelivery)
+
+								eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+									deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+									deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+								})
+							})
+						})
+					})
+				})
+			})
+		})
+	})
+
+	// Portal Link API.
+	router.Route("/portal-api", func(portalLinkRouter chi.Router) {
+		portalLinkRouter.Use(middleware.JsonResponse)
+		portalLinkRouter.Use(middleware.SetupCORS(handler.A.Logger))
+		portalLinkRouter.Use(middleware.RequireValidPortalLinksLicense(handler.A.Licenser, handler.A.Logger))
+		portalLinkRouter.Use(middleware.RequireAuth(handler.A.Logger))
+
+		portalLinkRouter.Get("/license/features", handler.GetPortalLicenseFeatures)
+
+		portalLinkRouter.Route("/events", func(eventRouter chi.Router) {
+			eventRouter.Post("/", handler.CreateEndpointEvent)
+			eventRouter.With(middleware.Pagination).Get("/", handler.GetEventsPaged)
+			eventRouter.Post("/batchreplay", handler.BatchReplayEvents)
+			eventRouter.Get("/countbatchreplayevents", handler.CountAffectedEvents)
+
+			eventRouter.Route("/{eventID}", func(eventSubRouter chi.Router) {
+				eventSubRouter.Get("/", handler.GetEndpointEvent)
+				eventSubRouter.Put("/replay", handler.ReplayEndpointEvent)
+			})
+		})
+
+		portalLinkRouter.Route("/eventdeliveries", func(eventDeliveryRouter chi.Router) {
+			eventDeliveryRouter.With(middleware.Pagination).Get("/", handler.GetEventDeliveriesPaged)
+			eventDeliveryRouter.Post("/forceresend", handler.ForceResendEventDeliveries)
+			eventDeliveryRouter.Post("/batchretry", handler.BatchRetryEventDelivery)
+			eventDeliveryRouter.Get("/countbatchretryevents", handler.CountAffectedEventDeliveries)
+			eventDeliveryRouter.Get("/statustotals", handler.EventDeliveryStatusTotals)
+			eventDeliveryRouter.Get("/eventtypes", handler.EventDeliveryFilterEventTypes)
+
+			eventDeliveryRouter.Route("/{eventDeliveryID}", func(eventDeliverySubRouter chi.Router) {
+				eventDeliverySubRouter.Get("/", handler.GetEventDelivery)
+				eventDeliverySubRouter.Put("/resend", handler.ResendEventDelivery)
+
+				eventDeliverySubRouter.Route("/deliveryattempts", func(deliveryRouter chi.Router) {
+					deliveryRouter.Get("/", handler.GetDeliveryAttempts)
+					deliveryRouter.Get("/{deliveryAttemptID}", handler.GetDeliveryAttempt)
+				})
+			})
+		})
+	})
+}
+
+func (a *ApplicationHandler) RegisterPolicy() error {
+	var err error
+
+	err = a.A.Authz.RegisterPolicy(func() authz.Policy {
+		po := &policies.OrganisationPolicy{
+			BasePolicy:             authz.NewBasePolicy(),
+			OrganisationMemberRepo: organisation_members.New(a.A.Logger, a.A.DB),
+		}
+
+		po.SetRule(string(policies.PermissionManageAll), authz.RuleFunc(po.ManageAll))
+		po.SetRule(string(policies.PermissionManage), authz.RuleFunc(po.Manage))
+		po.SetRule(string(policies.PermissionAdd), authz.RuleFunc(po.Add))
+
+		return po
+	}())
+
+	if err != nil {
+		return err
+	}
+
+	err = a.A.Authz.RegisterPolicy(func() authz.Policy {
+		po := &policies.ProjectPolicy{
+			BasePolicy:             authz.NewBasePolicy(),
+			Licenser:               a.A.Licenser,
+			OrganisationRepo:       organisations.New(a.A.Logger, a.A.DB),
+			OrganisationMemberRepo: organisation_members.New(a.A.Logger, a.A.DB),
+		}
+
+		po.SetRule(string(policies.PermissionManage), authz.RuleFunc(po.Manage))
+		po.SetRule(string(policies.PermissionView), authz.RuleFunc(po.View))
+
+		return po
+	}())
+
+	if err != nil {
+		return err
+	}
+
+	err = a.A.Authz.RegisterPolicy(func() authz.Policy {
+		bp := &policies.BillingPolicy{
+			BasePolicy:             authz.NewBasePolicy(),
+			OrganisationMemberRepo: organisation_members.New(a.A.Logger, a.A.DB),
+		}
+
+		bp.SetRule(string(policies.PermissionManage), authz.RuleFunc(bp.Manage))
+
+		return bp
+	}())
+
+	return err
+}
+
+var guestRoutes = []string{
+	"/auth/sso",
+	"/saml/login",
+	"/auth/login",
+	"/auth/register",
+	"/auth/token/refresh",
+	"/users/token",
+	"/users/forgot-password",
+	"/users/reset-password",
+	"/users/verify_email",
+	"/users/resend_verification_email",
+	"/organisations/process_invite",
+	"/ui/configuration/auth",
+	"/ui/license/features",
+	"/ui/auth/google/token",
+	"/ui/auth/google/setup",
+}
+
+func shouldAuthRoute(r *http.Request) bool {
+	for _, route := range guestRoutes {
+		if strings.HasSuffix(r.URL.Path, route) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func shouldApplyCORS(r *http.Request) bool {
+	// /queue/monitoring covers the session create/revoke endpoints and the asynqmon
+	// embed/monitor handlers, which the dashboard calls cross-origin in development.
+	corsRoutes := []string{"/ui", "/portal-api", "/queue/monitoring"}
+
+	for _, route := range corsRoutes {
+		if strings.HasPrefix(r.URL.Path, route) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// allowContentType is a middleware that enforces application/json for all routes
+// except /onboard, which also accepts multipart/form-data for CSV uploads.
+func allowContentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ct := r.Header.Get("Content-Type")
+
+		if strings.HasPrefix(ct, "multipart/form-data") && strings.HasSuffix(r.URL.Path, "/onboard") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !strings.HasPrefix(ct, "application/json") && ct != "" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}

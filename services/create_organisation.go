@@ -1,0 +1,204 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/dchest/uniuri"
+	"github.com/oklog/ulid/v2"
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/frain-dev/convoy/auth"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/billing"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	licensesvc "github.com/frain-dev/convoy/internal/pkg/license/service"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+type CreateOrganisationService struct {
+	OrgRepo       datastore.OrganisationRepository
+	OrgMemberRepo datastore.OrganisationMemberRepository
+	NewOrg        *datastore.OrganisationRequest
+	User          *datastore.User
+	Licenser      license.Licenser
+	RoleType      auth.RoleType
+	// Logger is required for RunBillingOrganisationSync when billing is enabled.
+	Logger log.Logger
+}
+
+func NewCreateOrganisationService(
+	orgRepo datastore.OrganisationRepository,
+	orgMemberRepo datastore.OrganisationMemberRepository,
+	newOrg *datastore.OrganisationRequest,
+	user *datastore.User,
+	licenser license.Licenser,
+	roleType auth.RoleType,
+	logger log.Logger,
+) *CreateOrganisationService {
+	return &CreateOrganisationService{
+		OrgRepo:       orgRepo,
+		OrgMemberRepo: orgMemberRepo,
+		NewOrg:        newOrg,
+		User:          user,
+		Licenser:      licenser,
+		RoleType:      roleType,
+		Logger:        logger,
+	}
+}
+
+var ErrOrgLimit = errors.New("your instance has reached it's organisation limit, upgrade to create new organisations")
+
+func (co *CreateOrganisationService) Run(ctx context.Context) (*datastore.Organisation, error) {
+	// Fail closed with a clear error instead of a nil-pointer panic when a
+	// caller (e.g. a CLI command) forgets to wire the licenser.
+	if co.Licenser == nil {
+		return nil, &ServiceError{ErrMsg: "licenser is required to create an organisation"}
+	}
+
+	ok, err := co.Licenser.CheckOrgLimit(ctx)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	if !ok {
+		return nil, &ServiceError{ErrMsg: ErrOrgLimit.Error(), Err: ErrOrgLimit}
+	}
+
+	err = util.Validate(co.NewOrg)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	if len(co.NewOrg.Name) == 0 {
+		co.Logger.ErrorContext(ctx, "organisation name is required", "error", err)
+		return nil, &ServiceError{ErrMsg: "organisation name is required", Err: err}
+	}
+
+	org := &datastore.Organisation{
+		UID:       ulid.Make().String(),
+		OwnerID:   co.User.UID,
+		Name:      co.NewOrg.Name,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	cfg, err := config.Get()
+	if err != nil {
+		co.Logger.ErrorContext(ctx, "failed to load config", "error", err)
+		return nil, &ServiceError{ErrMsg: "failed to create organisation", Err: err}
+	}
+
+	if len(cfg.CustomDomainSuffix) > 0 {
+		org.AssignedDomain = null.NewString(fmt.Sprintf("%s.%s", uniuri.New(), cfg.CustomDomainSuffix), true)
+	}
+
+	err = co.OrgRepo.CreateOrganisation(ctx, org)
+	if err != nil {
+		co.Logger.ErrorContext(ctx, "failed to create organisation", "error", err)
+		return nil, &ServiceError{ErrMsg: "failed to create organisation", Err: err}
+	}
+
+	_, err = NewOrganisationMemberService(co.OrgMemberRepo, co.Licenser, co.Logger).CreateOrganisationMember(ctx, org, co.User, &auth.Role{Type: auth.RoleOrganisationAdmin})
+	if err != nil {
+		co.Logger.ErrorContext(ctx, "failed to create super_user member for organisation owner", "error", err)
+	}
+
+	hostForBilling := cfg.Host
+	if cfg.Billing.OrganisationHost != "" {
+		hostForBilling = cfg.Billing.OrganisationHost
+	}
+	if cfg.UsesOrgBilling() && hostForBilling != "" {
+		orgCopy := *org
+		cfgCopy := cfg
+		go RunBillingOrganisationSync(
+			context.Background(),
+			billing.NewClient(cfgCopy.Billing),
+			orgCopy,
+			cfgCopy,
+			co.User.Email,
+			hostForBilling,
+			co.OrgRepo,
+			co.Logger,
+		)
+	}
+
+	return org, nil
+}
+
+// RunBillingOrganisationSync creates the organisation in billing, resolves the license key,
+// validates with the license service, encrypts the payload, and updates the org's license data.
+// It is called in a goroutine from CreateOrganisationService.Run; it can also be called
+// synchronously from tests with a mock billing client and org repo.
+// logger must be non-nil.
+func RunBillingOrganisationSync(
+	ctx context.Context,
+	billingClient billing.Client,
+	org datastore.Organisation,
+	cfg config.Configuration,
+	userEmail string,
+	billingHost string,
+	orgRepo datastore.OrganisationRepository,
+	logger log.Logger,
+) {
+	if logger == nil {
+		panic("RunBillingOrganisationSync: logger is required and must not be nil")
+	}
+
+	trimmedEmail := strings.TrimSpace(userEmail)
+	if trimmedEmail == "" {
+		logger.Error("create_organisation: owner email is empty, skipping billing sync", "org_id", org.UID)
+		return
+	}
+
+	orgData := billing.BillingOrganisation{
+		Name:         org.Name,
+		ExternalID:   org.UID,
+		BillingEmail: trimmedEmail,
+		Host:         billingHost,
+	}
+	resp, createErr := billingClient.CreateOrganisation(ctx, orgData)
+	key := ""
+	if createErr == nil && resp != nil {
+		key = resp.Data.LicenseKey
+	}
+	if createErr != nil {
+		logger.Error("create_organisation: CreateOrganisation failed", "error", createErr)
+	}
+	if key == "" && createErr == nil {
+		licResp, licErr := billingClient.GetOrganisationLicense(ctx, org.UID)
+		if licErr == nil && licResp != nil && licResp.Data.Organisation != nil {
+			key = licResp.Data.Organisation.LicenseKey
+		}
+		if licErr != nil {
+			logger.Error("create_organisation: GetOrganisationLicense failed", "error", licErr)
+		}
+	}
+	if key == "" {
+		return
+	}
+	var entitlements map[string]interface{}
+	lc := licensesvc.NewClient(licensesvc.Config{
+		Host:         cfg.LicenseService.Host,
+		ValidatePath: cfg.LicenseService.ValidatePath,
+		Timeout:      cfg.LicenseService.Timeout,
+		RetryCount:   cfg.LicenseService.RetryCount,
+	})
+	if data, valErr := lc.ValidateLicense(ctx, key); valErr == nil {
+		entitlements, _ = data.GetEntitlementsMap()
+	}
+	payload := &license.LicenseDataPayload{Key: key, Entitlements: entitlements}
+	enc, encErr := license.EncryptLicenseData(org.UID, payload)
+	if encErr != nil {
+		logger.Error("create_organisation: EncryptLicenseData failed", "error", encErr)
+		return
+	}
+	if updateErr := orgRepo.UpdateOrganisationLicenseData(ctx, org.UID, enc); updateErr != nil {
+		logger.Error("create_organisation: UpdateOrganisationLicenseData failed", "error", updateErr)
+	}
+}

@@ -1,0 +1,219 @@
+package kafka
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl"
+	"github.com/segmentio/kafka-go/sasl/plain"
+	"github.com/segmentio/kafka-go/sasl/scram"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/internal/pkg/limiter"
+	"github.com/frain-dev/convoy/internal/pkg/metrics"
+	common "github.com/frain-dev/convoy/internal/pkg/pubsub/const"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/util"
+)
+
+type Kafka struct {
+	Cfg         *datastore.KafkaPubSubConfig
+	source      *datastore.Source
+	workers     int
+	ctx         context.Context
+	handler     datastore.PubSubHandler
+	log         log.Logger
+	rateLimiter limiter.RateLimiter
+	licenser    license.Licenser
+	instanceId  string
+}
+
+func New(source *datastore.Source, handler datastore.PubSubHandler, log log.Logger, rateLimiter limiter.RateLimiter, licenser license.Licenser, instanceId string) *Kafka {
+	return &Kafka{
+		Cfg:         source.PubSub.Kafka,
+		source:      source,
+		workers:     source.PubSub.Workers,
+		handler:     handler,
+		log:         log,
+		rateLimiter: rateLimiter,
+		licenser:    licenser,
+		instanceId:  instanceId,
+	}
+}
+
+func (k *Kafka) Start(ctx context.Context) {
+	k.ctx = ctx
+
+	for i := 1; i <= k.workers; i++ {
+		go k.consume()
+	}
+}
+
+func (k *Kafka) dialer() (*kafka.Dialer, error) {
+	var mechanism sasl.Mechanism
+	var err error
+
+	dialer := &kafka.Dialer{
+		Timeout:   15 * time.Second,
+		DualStack: true,
+	}
+
+	auth := k.Cfg.Auth
+	if auth != nil {
+		if auth.Type != "plain" && auth.Type != "scram" {
+			return nil, fmt.Errorf("auth type: %s is not supported", auth.Type)
+		}
+
+		if auth.Type == "plain" {
+			mechanism = plain.Mechanism{
+				Username: auth.Username,
+				Password: auth.Password,
+			}
+		}
+
+		if auth.Type == "scram" {
+			algo := scram.SHA512
+
+			if auth.Hash == "SHA256" {
+				algo = scram.SHA256
+			}
+
+			mechanism, err = scram.Mechanism(algo, auth.Username, auth.Password)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		dialer.SASLMechanism = mechanism
+
+		if auth.TLS {
+			dialer.TLS = &tls.Config{}
+		}
+	}
+
+	return dialer, nil
+}
+
+func (k *Kafka) Verify() error {
+	dialer, err := k.dialer()
+	if err != nil {
+		return err
+	}
+
+	_, err = dialer.DialContext(context.Background(), "tcp", k.Cfg.Brokers[0])
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (k *Kafka) consume() {
+	dialer, err := k.dialer()
+	if err != nil {
+		k.log.Error(fmt.Sprintf("failed to fetch auth for kafka source %s with id %s: %v", k.source.Name, k.source.UID, err))
+		return
+	}
+
+	consumerGroup := k.Cfg.ConsumerGroupID
+	if util.IsStringEmpty(consumerGroup) {
+		// read from all groups.
+		consumerGroup = " "
+	}
+
+	// make a new reader that consumes from topic
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:               k.Cfg.Brokers,
+		GroupID:               consumerGroup,
+		Topic:                 k.Cfg.TopicName,
+		Dialer:                dialer,
+		WatchPartitionChanges: true,
+	})
+
+	defer k.handleError(r)
+
+	cfg, err := config.Get()
+	if err != nil {
+		k.log.Error(fmt.Sprintf("failed to load config.Get() in kafka source %s with id %s: %v", k.source.Name, k.source.UID, err))
+		return
+	}
+
+	for {
+		select {
+		case <-k.ctx.Done():
+			return
+		default:
+			if !util.IsStringEmpty(k.instanceId) {
+				err = k.rateLimiter.Allow(k.ctx, k.instanceId, cfg.InstanceIngestRate)
+				if err != nil {
+					time.Sleep(time.Millisecond * 250)
+					continue
+				}
+			}
+
+			m, err := r.FetchMessage(k.ctx)
+			if err != nil {
+				k.log.Error(fmt.Sprintf("failed to fetch message from kafka source %s with id %s from topic %s - kafka: %v", k.source.Name, k.source.UID, k.Cfg.TopicName, err))
+				continue
+			}
+
+			mm := metrics.GetDPInstance(k.licenser)
+			mm.IncrementIngestTotal(k.source.UID, k.source.ProjectID)
+
+			var d D = m.Headers
+			if d == nil {
+				d = D{}
+			}
+			d = append(d, kafka.Header{Key: common.BrokerMessageHeader, Value: m.Key})
+
+			headers, err := msgpack.EncodeMsgPack(d.Map())
+			if err != nil {
+				k.log.Error("failed to marshall message headers", "error", err)
+			}
+
+			if err := k.handler(k.ctx, k.source, string(m.Value), headers); err != nil {
+				k.log.Error(fmt.Sprintf("failed to write message from kafka source %s with id %s to create event queue - kafka pub sub: %v", k.source.Name, k.source.UID, err))
+				mm.IncrementIngestErrorsTotal(k.source)
+			} else {
+				// acknowledge the message
+				err := r.CommitMessages(k.ctx, m)
+				if err != nil {
+					k.log.Error("failed to commit message - kafka pub sub", "error", err)
+					mm.IncrementIngestErrorsTotal(k.source)
+				} else {
+					mm.IncrementIngestConsumedTotal(k.source)
+				}
+			}
+		}
+	}
+}
+
+func (k *Kafka) handleError(reader *kafka.Reader) {
+	if err := reader.Close(); err != nil {
+		k.log.Error("an error occurred while closing the kafka client", "error", err)
+	}
+
+	if err := recover(); err != nil {
+		k.log.Error("kafka pubsub source crashed", "error", fmt.Errorf("sourceID: %s, Error: %s", k.source.UID, err))
+	}
+}
+
+type M map[string]any
+
+// D is an array representation of Kafka Headers.
+type D []kafka.Header
+
+// Map creates a map from the elements of the D.
+func (d D) Map() M {
+	m := make(M, len(d))
+	for _, e := range d {
+		m[e.Key] = e.Value
+	}
+	return m
+}

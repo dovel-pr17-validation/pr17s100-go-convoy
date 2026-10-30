@@ -1,0 +1,297 @@
+package verifier
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"hash"
+	"net/http"
+	"strings"
+)
+
+var (
+	ErrAlgoNotFound                       = errors.New("algorithm not found")
+	ErrInvalidIP                          = errors.New("source IP not supported")
+	ErrCannotReadRequestBody              = errors.New("failed to read request body")
+	ErrHashDoesNotMatch                   = errors.New("invalid signature - hash does not match")
+	ErrCannotDecodeHexEncodedMACHeader    = errors.New("cannot decode hex encoded MAC header")
+	ErrCannotDecodeBase64EncodedMACHeader = errors.New("cannot decode base64 encoded MAC header")
+	ErrSignatureCannotBeEmpty             = errors.New("signature cannot be empty")
+	ErrAuthHeader                         = errors.New("invalid authorization header")
+	ErrAuthHeaderCannotBeEmpty            = errors.New("auth header cannot be empty")
+	ErrInvalidHeaderStructure             = errors.New("invalid header structure")
+	ErrInvalidAuthLength                  = errors.New("invalid basic auth length")
+	ErrInvalidEncoding                    = errors.New("invalid header encoding")
+	ErrMissingHmacOptions                 = errors.New("missing HMAC options")
+	ErrMissingHeader                      = errors.New("header cannot be empty")
+	ErrMissingHash                        = errors.New("hash algorithm cannot be empty")
+	ErrMissingSecret                      = errors.New("secret cannot be empty")
+	ErrMissingEncoding                    = errors.New("encoding cannot be empty")
+)
+
+type Verifier interface {
+	VerifyRequest(r *http.Request, payload []byte) error
+}
+
+type HmacOptions struct {
+	Header       string
+	GetSignature func(string) string
+	Hash         string
+	Secret       string
+	Encoding     string
+}
+
+type HmacVerifier struct {
+	opts *HmacOptions
+}
+
+func NewHmacVerifier(opts *HmacOptions) (*HmacVerifier, error) {
+	if opts == nil {
+		return nil, ErrMissingHmacOptions
+	}
+	if opts.Header == "" && opts.GetSignature == nil {
+		return nil, ErrMissingHeader
+	}
+	if opts.Hash == "" {
+		return nil, ErrMissingHash
+	}
+	if opts.Secret == "" {
+		return nil, ErrMissingSecret
+	}
+	if opts.Encoding == "" {
+		return nil, ErrMissingEncoding
+	}
+
+	return &HmacVerifier{opts}, nil
+}
+
+func (hV *HmacVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	hash, err := hV.getHashFunction(hV.opts.Hash)
+	if err != nil {
+		return err
+	}
+
+	signature := r.Header.Get(hV.opts.Header)
+
+	if hV.opts.GetSignature != nil {
+		signature = hV.opts.GetSignature(signature)
+	}
+
+	if len(strings.TrimSpace(signature)) == 0 {
+		return ErrSignatureCannotBeEmpty
+	}
+
+	mac := hmac.New(hash, []byte(hV.opts.Secret))
+	mac.Write(payload)
+	computedMAC := mac.Sum(nil)
+
+	var sentMAC []byte
+
+	switch hV.opts.Encoding {
+	case "hex":
+		sentMAC, err = hex.DecodeString(signature)
+		if err != nil {
+			return ErrCannotDecodeHexEncodedMACHeader
+		}
+	case "base64":
+		sentMAC, err = base64.StdEncoding.DecodeString(signature)
+		if err != nil {
+			return ErrCannotDecodeBase64EncodedMACHeader
+		}
+	default:
+		return ErrInvalidEncoding
+	}
+
+	validMAC := hmac.Equal(sentMAC, computedMAC)
+	if !validMAC {
+		return ErrHashDoesNotMatch
+	}
+
+	return nil
+}
+
+func (hV *HmacVerifier) getHashFunction(algo string) (func() hash.Hash, error) {
+	switch algo {
+	case "SHA256":
+		return sha256.New, nil
+	case "SHA512":
+		return sha512.New, nil
+	default:
+		return nil, ErrAlgoNotFound
+	}
+}
+
+type BasicAuthVerifier struct {
+	username string
+	password string
+}
+
+func NewBasicAuthVerifier(username, password string) *BasicAuthVerifier {
+	return &BasicAuthVerifier{
+		username: username,
+		password: password,
+	}
+}
+
+func (baV *BasicAuthVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	val := r.Header.Get("Authorization")
+	authInfo := strings.Split(val, " ")
+
+	if len(authInfo) != 2 {
+		return ErrInvalidHeaderStructure
+	}
+
+	credentials, err := base64.StdEncoding.DecodeString(authInfo[1])
+	if err != nil {
+		return ErrInvalidHeaderStructure
+	}
+
+	creds := strings.Split(string(credentials), ":")
+
+	if len(creds) != 2 {
+		return ErrInvalidAuthLength
+	}
+
+	if creds[0] != baV.username || creds[1] != baV.password {
+		return ErrAuthHeader
+	}
+
+	return nil
+}
+
+type APIKeyVerifier struct {
+	key    string
+	header string
+}
+
+func NewAPIKeyVerifier(key, header string) *APIKeyVerifier {
+	return &APIKeyVerifier{
+		key:    key,
+		header: header,
+	}
+}
+
+func (aV *APIKeyVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	authHeader := "Authorization"
+
+	if len(strings.TrimSpace(aV.header)) != 0 {
+		authHeader = aV.header
+		val := r.Header.Get(authHeader)
+
+		if len(strings.TrimSpace(val)) == 0 {
+			return ErrAuthHeader
+		}
+
+		if val != aV.key {
+			return ErrAuthHeader
+		}
+
+		return nil
+	}
+
+	val := r.Header.Get(authHeader)
+	authInfo := strings.Split(val, " ")
+
+	if len(authInfo) != 2 {
+		return ErrInvalidHeaderStructure
+	}
+
+	if authInfo[1] != aV.key {
+		return ErrAuthHeader
+	}
+
+	return nil
+}
+
+type GithubVerifier struct {
+	HmacOpts *HmacOptions
+}
+
+func NewGithubVerifier(secret string) *GithubVerifier {
+	gv := &GithubVerifier{}
+	gv.HmacOpts = &HmacOptions{
+		Header:       "X-Hub-Signature-256",
+		Hash:         "SHA256",
+		GetSignature: gv.getSignature,
+		Secret:       secret,
+		Encoding:     "hex",
+	}
+
+	return gv
+}
+
+func (gV *GithubVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	v := HmacVerifier{gV.HmacOpts}
+	return v.VerifyRequest(r, payload)
+}
+
+func (gV *GithubVerifier) getSignature(sig string) string {
+	values := strings.Split(sig, "sha256=")
+	if len(values) < 2 {
+		return ""
+	}
+
+	return values[1]
+}
+
+type ShopifyVerifier struct {
+	HmacOpts *HmacOptions
+}
+
+func NewShopifyVerifier(secret string) *ShopifyVerifier {
+	sv := &ShopifyVerifier{}
+	sv.HmacOpts = &HmacOptions{
+		Header:       "X-Shopify-Hmac-SHA256",
+		Hash:         "SHA256",
+		GetSignature: nil,
+		Secret:       secret,
+		Encoding:     "base64",
+	}
+
+	return sv
+}
+
+func (sv *ShopifyVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	v := HmacVerifier{sv.HmacOpts}
+	return v.VerifyRequest(r, payload)
+}
+
+type TwitterVerifier struct {
+	HmacOpts *HmacOptions
+}
+
+func NewTwitterVerifier(secret string) *TwitterVerifier {
+	tv := &TwitterVerifier{}
+	tv.HmacOpts = &HmacOptions{
+		Header:       "X-Twitter-Webhooks-Signature",
+		Hash:         "SHA256",
+		GetSignature: tv.getSignature,
+		Secret:       secret,
+		Encoding:     "base64",
+	}
+
+	return tv
+}
+
+func (tv *TwitterVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	v := HmacVerifier{tv.HmacOpts}
+	return v.VerifyRequest(r, payload)
+}
+
+func (tV *TwitterVerifier) getSignature(sig string) string {
+	values := strings.Split(sig, "sha256=")
+	if len(values) < 2 {
+		return ""
+	}
+
+	return values[1]
+}
+
+type NoopVerifier struct{}
+
+func (nV *NoopVerifier) VerifyRequest(r *http.Request, payload []byte) error {
+	return nil
+}

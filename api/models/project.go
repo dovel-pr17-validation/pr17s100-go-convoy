@@ -1,0 +1,290 @@
+package models
+
+import (
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/lib/pq"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/util"
+)
+
+type CreateProject struct {
+	// Project Name
+	Name string `json:"name" valid:"required~please provide a valid name"`
+
+	// Project Type, supported values are `outgoing`, `incoming`
+	Type    string `json:"type" valid:"required~please provide a valid type,in(incoming|outgoing)"`
+	LogoURL string `json:"logo_url" valid:"url~please provide a valid logo url,optional"`
+
+	// Project Config
+	Config *ProjectConfig `json:"config"`
+}
+
+func (cP *CreateProject) Validate() error {
+	return util.Validate(cP)
+}
+
+type UpdateProject struct {
+	// Project Name
+	Name string `json:"name" valid:"required~please provide a valid name"`
+
+	LogoURL string `json:"logo_url" valid:"url~please provide a valid logo url,optional"`
+
+	// Project Config
+	Config *ProjectConfig `json:"config" valid:"optional"`
+
+	configPresentKeys map[string]struct{} `json:"-"`
+}
+
+func (uP *UpdateProject) UnmarshalJSON(data []byte) error {
+	type plain UpdateProject
+	aux := struct {
+		plain
+		Config json.RawMessage `json:"config"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*uP = UpdateProject(aux.plain)
+	if len(aux.Config) == 0 {
+		return nil
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(aux.Config, &keys); err != nil {
+		return err
+	}
+	uP.configPresentKeys = make(map[string]struct{}, len(keys))
+	for key := range keys {
+		uP.configPresentKeys[key] = struct{}{}
+	}
+	uP.Config = &ProjectConfig{}
+	return json.Unmarshal(aux.Config, uP.Config)
+}
+
+func (uP *UpdateProject) ConfigPresentKeys() map[string]struct{} {
+	return uP.configPresentKeys
+}
+
+func (uP *UpdateProject) Validate() error {
+	return util.Validate(uP)
+}
+
+type ProjectConfig struct {
+	// Specifies how many bytes and incoming project should read from the ingest request, and how many bytes an outgoing project should from the response of your endpoints
+	// Defaults to 50KB.
+	MaxIngestSize uint64 `json:"max_payload_read_size"`
+
+	// Controls if your project will add a timestamp to it's webhook signature header to prevent a replay attack, See this blog post[https://getconvoy.io/blog/generating-stripe-like-webhook-signatures] for more]
+	ReplayAttacks bool `json:"replay_attacks_prevention_enabled"`
+
+	// Controls of the Event ID and Event Delivery ID Headers are added to the request when events are dispatched to endpoints
+	AddEventIDTraceHeaders bool `json:"add_event_id_trace_headers"`
+
+	// Controls if the project will disable and endpoint after the retry threshold for an event is reached
+	DisableEndpoint bool `json:"disable_endpoint"`
+
+	// Specify the interval in hours for which the event tokenizer runs
+	SearchPolicy string `json:"search_policy" db:"search_policy"`
+
+	// RateLimit is used to configure the projects rate limiting config values
+	RateLimit *RateLimitConfiguration `json:"ratelimit"`
+
+	// Strategy is used to configure the project's retry strategies for failing events.
+	Strategy *StrategyConfiguration `json:"strategy"`
+
+	// SSL is used to configure the project's endpoint ssl enforcement rules
+	SSL *SSLConfiguration
+
+	// Signature is used to configure the project's signature header versions
+	Signature *SignatureConfiguration `json:"signature"`
+
+	// RequestIDHeader is the outbound header name for the stable request id sent on webhook deliveries.
+	RequestIDHeader config.RequestIDHeaderProvider `json:"request_id_header,omitempty" valid:"optional"`
+
+	// MetaEvent is used to configure the project's meta events
+	MetaEvent *MetaEventConfiguration `json:"meta_event"`
+
+	// MultipleEndpointSubscriptions is used to configure if multiple subscriptions
+	// can be created for the endpoint in a project
+	MultipleEndpointSubscriptions bool `json:"multiple_endpoint_subscriptions"`
+
+	// VerifyDynamicEvents waits for dynamic endpoint/subscription resolve before
+	// acknowledging POST /events/dynamic. When false, the handler returns 201 after enqueue.
+	VerifyDynamicEvents bool `json:"verify_dynamic_events"`
+
+	// AllowUnmatchedDynamicURLs lets a dynamic event URL that matches none of the project's
+	// endpoint URL templates auto-create an endpoint instead of failing. When false (the
+	// default), a project with templates configured rejects unmatched URLs.
+	AllowUnmatchedDynamicURLs bool `json:"allow_unmatched_dynamic_urls"`
+
+	// CircuitBreaker is used to configure the project's circuit breaker settings
+	CircuitBreaker *datastore.CircuitBreakerConfiguration `json:"circuit_breaker"`
+}
+
+// ErrRenamedSyncDynamicEventAck rejects the name this setting shipped under in
+// v26.7.0. Ignoring the old key would let a caller believe it toggled the
+// setting when nothing changed, so it fails loudly instead. Enforced here rather
+// than per handler so project create and update reject it identically.
+var ErrRenamedSyncDynamicEventAck = errors.New("sync_dynamic_event_ack has been renamed to verify_dynamic_events")
+
+func (pc *ProjectConfig) UnmarshalJSON(data []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	if _, ok := keys["sync_dynamic_event_ack"]; ok {
+		return ErrRenamedSyncDynamicEventAck
+	}
+
+	type plain ProjectConfig
+	aux := plain{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*pc = ProjectConfig(aux)
+	return nil
+}
+
+func (pc *ProjectConfig) Transform() *datastore.ProjectConfig {
+	if pc == nil {
+		return nil
+	}
+
+	return &datastore.ProjectConfig{
+		MaxIngestSize:                 pc.MaxIngestSize,
+		ReplayAttacks:                 pc.ReplayAttacks,
+		DisableEndpoint:               pc.DisableEndpoint,
+		AddEventIDTraceHeaders:        pc.AddEventIDTraceHeaders,
+		MultipleEndpointSubscriptions: pc.MultipleEndpointSubscriptions,
+		VerifyDynamicEvents:           pc.VerifyDynamicEvents,
+		AllowUnmatchedDynamicURLs:     pc.AllowUnmatchedDynamicURLs,
+		SSL:                           pc.SSL.transform(),
+		SearchPolicy:                  pc.SearchPolicy,
+		RateLimit:                     pc.RateLimit.Transform(),
+		Strategy:                      pc.Strategy.transform(),
+		Signature:                     pc.Signature.transform(),
+		RequestIDHeader:               pc.RequestIDHeader,
+		MetaEvent:                     pc.MetaEvent.transform(),
+		CircuitBreaker:                pc.CircuitBreaker,
+	}
+}
+
+type SSLConfiguration struct {
+	EnforceSecureEndpoints bool `json:"enforce_secure_endpoints"`
+}
+
+func (r *SSLConfiguration) transform() *datastore.SSLConfiguration {
+	if r == nil {
+		return nil
+	}
+
+	return &datastore.SSLConfiguration{
+		EnforceSecureEndpoints: r.EnforceSecureEndpoints,
+	}
+}
+
+type RateLimitConfiguration struct {
+	Count    int    `json:"count"`
+	Duration uint64 `json:"duration"`
+}
+
+func (rc *RateLimitConfiguration) Transform() *datastore.RateLimitConfiguration {
+	if rc == nil {
+		return nil
+	}
+
+	return &datastore.RateLimitConfiguration{Count: rc.Count, Duration: rc.Duration}
+}
+
+type StrategyConfiguration struct {
+	Type       string `json:"type" valid:"optional~please provide a valid strategy type, in(linear|exponential)~unsupported strategy type"`
+	Duration   uint64 `json:"duration" valid:"optional~please provide a valid duration in seconds,int"`
+	RetryCount uint64 `json:"retry_count" valid:"optional~please provide a valid retry count,int"`
+}
+
+func (sc *StrategyConfiguration) transform() *datastore.StrategyConfiguration {
+	if sc == nil {
+		return nil
+	}
+
+	return &datastore.StrategyConfiguration{
+		Type:       datastore.StrategyProvider(sc.Type),
+		Duration:   sc.Duration,
+		RetryCount: sc.RetryCount,
+	}
+}
+
+type SignatureConfiguration struct {
+	Header   config.SignatureHeaderProvider `json:"header,omitempty" valid:"required~please provide a valid signature header"`
+	Versions []SignatureVersion             `json:"versions"`
+}
+
+func (sc *SignatureConfiguration) transform() *datastore.SignatureConfiguration {
+	if sc == nil {
+		return nil
+	}
+
+	s := &datastore.SignatureConfiguration{Header: sc.Header}
+	for _, version := range sc.Versions {
+		s.Versions = append(s.Versions, datastore.SignatureVersion{
+			UID:       version.UID,
+			Hash:      version.Hash,
+			Encoding:  datastore.EncodingType(version.Encoding),
+			CreatedAt: version.CreatedAt,
+		})
+	}
+
+	return s
+}
+
+type SignatureVersion struct {
+	UID       string    `json:"uid" db:"id"`
+	Hash      string    `json:"hash,omitempty" valid:"required~please provide a valid hash,supported_hash~unsupported hash type"`
+	Encoding  string    `json:"encoding" valid:"required~please provide a valid signature header"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
+type MetaEventConfiguration struct {
+	IsEnabled bool           `json:"is_enabled"`
+	Type      string         `json:"type" valid:"optional, in(http)~unsupported meta event type"`
+	EventType pq.StringArray `json:"event_type"`
+	URL       string         `json:"url"`
+	Secret    string         `json:"secret"`
+}
+
+func (mc *MetaEventConfiguration) transform() *datastore.MetaEventConfiguration {
+	if mc == nil {
+		return nil
+	}
+
+	return &datastore.MetaEventConfiguration{
+		IsEnabled: mc.IsEnabled,
+		Type:      datastore.MetaEventType(mc.Type),
+		EventType: mc.EventType,
+		URL:       mc.URL,
+		Secret:    mc.Secret,
+	}
+}
+
+type ProjectResponse struct {
+	*datastore.Project
+}
+
+type CreateProjectResponse struct {
+	APIKey  *datastore.APIKeyResponse `json:"api_key" extensions:"x-nullable"`
+	Project *ProjectResponse          `json:"project" extensions:"x-nullable"`
+}
+
+func NewListProjectResponse(projects []*datastore.Project) []*ProjectResponse {
+	results := make([]*ProjectResponse, 0, len(projects))
+
+	for _, project := range projects {
+		results = append(results, &ProjectResponse{Project: project})
+	}
+
+	return results
+}

@@ -1,0 +1,1424 @@
+# Convoy Changes
+
+## 26.7.3
+
+### Breaking Changes
+
+- Boot now drops any index Postgres left invalid and rebuilds it in the background, rather than leaving it until the next `migrate`. An invalid unique index still enforces its key, so dropping one gives up that constraint until the rebuild finishes: plan the upgrade for a window where that is acceptable, and watch `convoy utils indexes` or the admin dashboard until every owed index is valid again. A rebuild that meets duplicate rows is recorded as blocked, with the offending key, and skipped from then on, so it needs the duplicates resolved by hand before a retry can succeed (#2797, #2809, #2812)
+
+### Features
+
+- feat(dataplane): add postgres as a first-class queue provider (#2795)
+- feat(controlplane): rebuild invalid indexes from the admin dashboard (#2799)
+- feat(controlplane): endpoint Teams notifications and transition-gated alerts (#2802)
+- feat(controlplane): add licensed event list search with exact JSON filters (#2803)
+- feat(dataplane): daily delivery counts and queue metrics snapshots (#2808)
+- feat(controlplane): adopt orphan invalid indexes and block duplicate-key rebuilds (#2812)
+
+### Bug Fixes
+
+- fix(dataplane): reject empty endpoint_id on event match (#2788)
+- fix(dashboard): Improve verify-email UX: auth shell layout and clearer modal (#2789)
+- fix(api): invalidate subscription and filter caches on api writes (#2790)
+- fix(controlplane): invalidate endpoint caches on api writes (#2792)
+- fix(dashboard): show delivered URL from attempts on delivery details (#2793)
+- fix(events): use plain inner order by for paged exists scans (#2794)
+- fix(dashboard): show the partition operation the button will run (#2796)
+- fix(controlplane): repair indexes postgres left invalid, rebuild them on demand (#2797)
+- fix(infra): run local installer from published image (#2798)
+- fix(dataplane): sweep orphaned events_endpoints after partition retention (#2800)
+- fix(migrations): reconcile endpoints NOT NULL schema drift (#2801)
+- fix(controlplane): mark event payload jsonb function parallel unsafe (#2804)
+- fix(controlplane): range-scan event deliveries by project and created_at (#2805)
+- fix(dashboard): show event log search progress and load sidebar deliveries (#2806)
+- fix(dataplane): stop prometheus register from scanning event_deliveries (#2807)
+- fix(dataplane): rebuild every owed index at boot (#2809)
+- fix(dataplane): rewrite rollup days that already hold rows (#2810)
+- fix(controlplane): serve delivery status totals from a status-aware rollup (#2811)
+
+### Improvements
+
+- perf(dataplane): cache subscriptions by source id (#2791)
+
+## 26.7.2
+
+### Breaking Changes
+
+- Partition retention now manages the partitions `convoy utils partition` creates, which it previously ignored because their names were folded to lower case. On a licensed instance, history kept only because those partitions were unmanaged is dropped at `CONVOY_RETENTION_POLICY` on the next maintenance run. Confirm that duration before upgrading (#2781)
+
+### Features
+
+- feat(controlplane): partition tables by attaching with an admin UI (#2784)
+
+### Bug Fixes
+
+- fix(dataplane): correct partition naming, retention adoption and event-id enforcement (#2781)
+- fix(controlplane): fit transactional emails to mobile and move the footer inside the card (#2783)
+- fix(controlplane): load endpoint failure rates after the list (#2785)
+- fix(dataplane): drop leftover primary key when attaching after a copy unpartition (#2786)
+- fix(dashboard): keep instance admins on admin after a full reload (#2786)
+- fix(dashboard): start the partition operation the selected table allows (#2786)
+
+## 26.7.1
+
+### Breaking Changes
+
+- The project config field `sync_dynamic_event_ack`, released in 26.7.0, is renamed to `verify_dynamic_events`. `POST /projects` and `PUT /projects/{id}` reject the old key with a 400 naming the new field rather than ignoring it (#2773)
+- `CONVOY_SYNC_DYNAMIC_EVENT_ACK_TIMEOUT` is renamed to `CONVOY_VERIFY_DYNAMIC_EVENTS_TIMEOUT`. The old variable is no longer read and warns at boot; the same key in a config file falls back to the 30s default silently (#2773)
+
+### Features
+
+- feat(dataplane): allow dynamic urls that match no endpoint template (#2773)
+
+### Bug Fixes
+
+- fix(dashboard): correct subscription event type selection and redesign alert toasts (#2775)
+
+## 26.7.0
+
+### Features
+
+- feat(dataplane): optional sync ack for dynamic event resolve (#2766)
+- feat(dashboard): Redesign Convoy dashboard (#2764)
+
+### Bug Fixes
+
+- fix(dataplane): surface dynamic url template failures without leaking event metadata (#2771)
+
+## 26.6.10
+
+### Features
+
+- feat(dataplane): custom user-agent replaces convoy branding header (#2765)
+
+## 26.6.9
+
+### Improvements
+
+- refactor(dataplane): remove delete-query retention and its feature flag (#2753)
+
+### Bug Fixes
+
+- fix(controlplane): swap transactional email header logo (#2761)
+- fix(build): refactor docker install script (#2711)
+- fix(controlplane): harden ingest verifier fallback, retry scoping, bulk onboard and billing update (#2754)
+
+## 26.6.8
+
+### Improvements
+
+- chore(deps): bump golang.org/x/crypto to v0.52.0 and golang.org/x/net to v0.55.0 (#2757)
+
+### Bug Fixes
+
+- fix(controlplane): scope source lookups by project and canonicalize jwt blacklist keys (#2755)
+- fix(dataplane): block cloud metadata and link-local targets on default webhook egress (#2756)
+- fix(controlplane): scope portal-link and org authorization to close cross-tenant access (#2760)
+
+## 26.6.7
+
+### Bug Fixes
+
+- fix: agent ingest honors instance ingest rate limit (#2744)
+- fix: return empty endpoints_metadata for portal links with no endpoints (#2745)
+- fix: close idempotency dedup race on concurrent event creation (#2747)
+- fix(dataplane): reject events without a delivery target and honor app_id fanout (#2746)
+- fix(controlplane): close jul 20-21 vulnerability audit findings (#2749)
+- fix(dashboard): clarify unverified-email copy for dialog and trial modal (#2751)
+- fix: render current year in email template footers (#2750)
+
+## 26.6.6
+
+### Features
+
+- feat(controlplane): Speakeasy public API clients for JS and Python (#2724)
+- feat(controlplane): verify email before cloud trial and enqueue welcome (#2726)
+
+### Bug Fixes
+
+- fix(controlplane): close jul 16 vuln review bundle (#2721)
+- fix(dashboard): default team invite role to organisation_admin (#2722)
+- fix(controlplane): harden endpoint rbac, sh billing gates, and org delete cascade (#2723)
+- fix(controlplane): declare eventTypeId path param on UpdateEventType (#2728)
+- fix: correct OpenAPI types for json.RawMessage and []byte fields (#2736)
+- fix: mark arbitrary-JSON object fields as open maps in OpenAPI spec (#2737)
+- fix(controlplane): send null data in CreateEndpointEvent response (#2741)
+- fix(docs): OpenAPI spec fidelity for generated SDK clients (#2742)
+
+## 26.6.5
+
+### Features
+
+- feat(dataplane,dashboard): configurable outbound request ID header per project (#2665)
+
+### Bug Fixes
+
+- fix(dataplane): delete retention attempts by delivery cutoff (#2718)
+- fix(controlplane): require auth for SSO admin portal (#2719)
+
+## 26.6.4
+
+### Features
+
+- feat(controlplane): attach anonymized usage on license validate (#2715)
+- feat(controlplane): document projects CRUD and harden endpoint activate (#2716)
+
+## 26.6.3
+
+### Features
+
+- feat(billing): render cloud plans dynamically for three-tier pricing (#2710)
+- feat(controlplane): print user/org ids and optionally mint an api key on bootstrap (#2712)
+
+
+### Bug Fixes
+
+- fix(billing): send org owner email on cloud trial start to backfill legacy billing email (#2709)
+
+## 26.6.2
+
+
+### Improvements
+
+- refactor(controlplane): require licenser via service constructors (#2705)
+
+### Bug Fixes
+
+- fix(controlplane): redact secrets and close SSRF gaps across config, delivery, and notifications (#2706)
+- fix(dataplane): capture delivery attempt timestamps around the dispatch call (#2707)
+
+## 26.6.1
+
+### Features
+
+- feat(dataplane): unify circuit breaker enablement and add endpoint failure metrics (#2700)
+- feat(controlplane): cloud and self-hosted billing trials with dashboard UX (#2701)
+- feat(dashboard): reflect circuit breaker state on endpoint status and fix batch retry count (#2703)
+- feat(build): Add local Docker installer script  (#2702)
+
+
+### Bug Fixes
+
+- fix(controlplane): enforce cache-invalidating project repo and wire bootstrap licenser (#2704)
+
+## 26.6.0
+
+### Features
+
+- feat(dashboard): add org switcher search, count, and pagination (#2666)
+- feat(controlplane): self-hosted guest checkout and cloud org billing (#2672)
+- feat(dashboard): add google oauth signup (#2674)
+- feat(controlplane): support endpoint URL templates (#2675)
+- feat(dashboard): show real billing cycle and consolidate event delivery details (#2677)
+- feat(dashboard): mobile responsiveness pass + UI-only CI gating (#2684)
+- feat(controlplane): postgres-backed cloud usage with forward byte columns (#2690)
+- feat(dataplane): record delivery attempt request/response timestamps (#2694)
+- feat(dataplane): retry budget sync, delivery description, and attempt IP (#2696)
+- feat(controlplane): send version and instance id on validate (#2697)
+
+### Improvements
+
+- chore(deps): bump slack-go and testcontainers for OSV HIGH/MEDIUM (#2670)
+- refactor(portal): load license cache via shared bootstrap, add tests (#2683)
+- ci(infra): skip pubsub, e2e, and go codeql on ui-only changes (#2688)
+- ci(infra): speed up integration tests with tmpfs postgres and build cache (#2691)
+
+### Bug Fixes
+
+- fix(dataplane,dashboard): deliver meta events with populated payload and fix meta-events config UI (#2664)
+- fix(controlplane): route oauth2 token exchange through netjail dispatcher (#2668)
+- fix(controlplane): limit public invite token lookup response (#2671)
+- fix(billing): address overwatch with env license for self-hosted billing view (#2673)
+- fix(controlplane): show accurate event delivery metadata (#2676)
+- fix(controlplane): resolve portal license features from portal token (#2678)
+- fix(billing): default self-hosted billing service to prod overwatch (#2679)
+- fix(dashboard): revalidate the html shell so deploys aren't masked by stale cache (#2680)
+- fix(api): scope portal-link access to owned endpoints (#2681)
+- fix(api): require org membership on dashboard org reads (#2682)
+- fix(dashboard): stop portal link crash from undefined portalDetails (#2685)
+- fix(license): resolve community enabled projects from db (#2686)
+- fix(dashboard): correct latest attempt and timeline order on event delivery details (#2687)
+- fix(dashboard): allow instance admins to manage early adopter features (#2689)
+- fix(dashboard): mobile responsiveness across pages, plus service nil-logger panic fix (#2692)
+- fix(dashboard): route templated endpoint test events through dynamic api (#2693)
+- fix(infra): define Configuration type before its methods (#2695)
+- fix(controlplane): share queue monitoring cookie signing key across replicas (#2698)
+
+## 26.3.7
+
+### Features
+
+- feat(controlplane): add logger lint rules (#2628)
+- feat(controlplane): add queue monitoring to admin dashboard (#2623)
+- feat(controlplane): refactor object storage (#2613)
+- feat(controlplane): add inbound event filtering (#2661)
+
+### Improvements
+
+- chore(deps): upgrade to request migration v2 (#2534)
+- refactor(dataplane): move agent runtime into internal package (#2615)
+- chore(release): cut monthly binaries from prior cutoff (#2617)
+- refactor(ci): extract inline workflow scripts into scripts/ci/ (#2618)
+- refactor(docs): update doc generation (#2626)
+- chore(ci): add nighly CVE scans (#2630)
+- chore(deps): fix CVEs from scan (#2631)
+- chore(deps): fix package.lock path (#2633)
+- chore(deps): added workflow to bump staging tag on successful merge to main (#2632)
+- chore(deps): fix workflow file for cloud image bump (#2634)
+- chore(release): prepare v26.3.6 (#2635)
+- refactor(controlplane,dataplane): refactor tracing (#2637)
+- chore(deps): fix user tags mentions in slack payload (#2639)
+- chore(build): bump actions/checkout in docs and load-test workflows (#2640)
+- chore(deps): added path filter to build image workflow (#2641)
+- chore(deps): bump posthog-js in dashboard (#2642)
+- chore(deps): bump karma-jasmine in dashboard (#2643)
+- chore(deps): bump monaco-editor in dashboard (#2644)
+- chore(deps): bump stdlib to v1.26.2 (#2646)
+- ci(build): add dashboard build workflow for PR and main (#2647)
+- chore(dashboard): upgrade to Angular 15 and Node 24 (#2649)
+- chore(dashboard): Angular 21, ESLint flat config, CI lint, control-flow templates (#2651)
+
+### Bug Fixes
+
+- fix(dataplane): assert non-nil configurations for HmacOptions (#2619)
+- fix(controlplane): harden SSO login and retry deactivation paths (#2621)
+- fix(controlplane): prevent password reset token replay (PDE-733) (#2629)
+- fix(dashboard): harden billing address flows and plan upgrade guard (#2638)
+- fix(dashboard): avoid /users/undefined/profile when uid is missing (#2650)
+- fix(controlplane): guard against empty billing owner emails (#2624)
+- fix(dashboard): keep settings shell for team tab (#2652)
+- fix(api-keys): remove invalid group by from paged security query (#2655)
+- fix(controlplane): harden vulnerable auth and outbound paths (#2659)
+- fix(dataplane): allow idempotency header overrides (#2660)
+
+### Others
+
+- Escape special characters in AMQP connection credentials and add unit/integration tests for connection string builder (#2625)
+- add slack notification to image bump (#2636)
+
+## 26.3.6
+
+
+### Improvements
+
+- refactor(dataplane,controlplane): improve logger (#2609)
+- refactor(controlplane,dataplane): endpoints sqlc migration (#2608)
+
+### Bug Fixes
+
+- fix(dataplane): add NO_PROXY support to webhook dispatcher (#2612)
+
+### Others
+
+- update trivy acion image (#2611)
+
+## 26.2.0
+
+### Features
+
+- feat(controlplane): org-level SSO and license data sync (#2560)
+- feat(controlplane): billing-backed license, project limits, and SSO/license sync (#2572)
+- feat(controlplane): workspace slug SSO flow and other fixes (#2583)
+
+### Improvements
+
+- chore(infra): update release process to generate clean changelogs (#2542)
+- refactor(controlplane): add sqlc for batch retry (#2546)
+- refactor(controlplane): add sqlc for subscriptions (#2549)
+- chore: clean up .git-cliff.toml (#2545)
+- chore(build): add worflow for image scans (#2552)
+- chore(build): update dojo workflow to be triggered after image has been pushed (#2553)
+- refactor(controlplane): add sqlc for users (#2554)
+- chore(build): update dojo image scan product and engagement names (#2556)
+- refactor(dataplane): add sqlc for meta events (#2555)
+- docs: update readme with new convoy logo (#2565)
+- ci(build): unblock merge queue by emitting required checks on merge-group commits (#2571)
+- perf(controlplane): events list EXISTS path and CI Redis service in workflows (#2566)
+- refactor(infra): add sql migration linter (#2569)
+- refactor(infra): add caddy as reverse proxy for local installation (#2570)
+- chore(build): update docker-compose files (#2577)
+- chore(build): run all test with race flag (#2578)
+- refactor(dataplane): add sqlc for event types (#2557)
+- refactor(controlplane): streamline test dependencies (#2588)
+
+### Bug Fixes
+
+- fix(dataplane): fix rabbitmq reconnection issue (#2547)
+- fix build step in release.Dockerfile (#2576)
+- fix docker-compose start script (#2584)
+- fix: guard subscription filter_config and source_metadata for null safety (#2585)
+- fix(controlplane): fix events with no subscriptions (#2575)
+- fix(controlplane): change query for fetching endpoint IDs (#2591)
+- fix(controlplane): SSO redirect, billing resilience, login UX, and config simplification (#2589)
+- fix(dataplane): fanout event fix (#2592)
+- fix(controlplane): remove Pro badge and improve Manage plans dialog UX (#2593)
+
+### Others
+
+- License service integration (#2528)
+- Add condition to skip job on pull requests
+- address alpine CVE (#2550)
+- add workflow for defectdojo (#2551)
+- bump stdlib to 1.25 (#2559)
+- bum stdlib to 1.25.7  to fix CVE (#2562)
+- Update badge link for integration tests
+- Fix badge link for integration tests in README
+- Add CodeQL Advanced workflow configuration
+- Delete .github/workflows/codeql.yml
+- Rename codeql-advanced.yml to codeql.yml
+- improve redis sentinel implementation (#2573)
+- add logger to fanout endpoint (#2587)
+
+# 26.1.1
+
+### Enhancements
+
+- refactor: add SQLc for portal links #2511
+- refactor: add SQLc for API keys #2517
+- refactor: add sqlc for organisations #2518
+- refactor: add sqlc for organisation members #2519
+- refactor: add sqlc for organisation invites #2520
+
+### Bug Fixes
+
+- chore: fixed filter bug for boolean values in array #2524
+
+# 25.12.5
+
+### Features
+
+- added new billing module #2325
+
+### Enhancements
+
+- make metrics context timeout configurable #2516
+- Remove unused circuit breaker feature flag check in endpoint handler #2515
+- make billing organization creation asynchronous #2514
+- auto-create billing org on org creation and fix circuit breaker project dropdown #2513
+- use config host instead of org assigned domain for billing #2512
+- Remove pending status from endpoints and related logic #2508
+- Add job id before writing to the queue #2504
+
+### Bug Fixes
+
+- Always assign RoleOrganisationAdmin, clear localStorage on logout, add VAT placeholder examples #2509
+- Correct font paths and exclude Monaco Editor from Open Sauce Sans #2505
+
+# 25.12.4
+
+### Enhancements
+
+- Add action that triggers build when pr gets merged to main #2503
+- Fix missing table alias in event_delivery query filter #2501
+- Portal link endpoints migration #2500
+- Remove PostgreSQL-based rate limiter and update integrations to use test suites #2499
+
+### Bug Fixes
+
+- fix blocking metrics collection when metrics is enabled #2493
+
+# 25.11.3
+
+### Features
+
+- feat: implement OAuth2 client credentials authentication for endpoints #2479
+- feat: add OAuth2 e2e tests #2497
+- feat: implement organization-level feature flags #2495
+
+### Enhancements
+
+- chore: add E2E tests #2496
+- Update dashboard api tests #2492
+- Setup Test Env #2491
+- fix metrics endpoint and prevent loggin event data #2487
+- update prometheus configuration #2490
+- Fix gocritic lint errors #2489
+- Add mise package manager #2488
+- refactor(pubsub): move endpoint validation logic closer to consumption point #2485
+- bump outdated pkgs #2387
+
+# 25.11.2
+
+### Bug Fixes
+
+- Fix `brokerMessageIdFilter` syntax for PostgreSQL headers query #2484
+
+# 25.11.1
+
+### Features
+
+- feat: Add broker message ID tracking across pub/sub infrastructure #2480
+- Add TLS support for Redis connections #2478
+- Add mTLS Client Certificate Support for Endpoints #2468
+- added form-encoded content type support for endpoints #2420
+
+### Enhancements
+
+- refactor: change circuit-breakers update command to use project-id instead of endpoint-id #2482
+- bump pkgs #2475
+- limit dependabot updates to security #2473
+- add lightweight js shim to fix dynamic assets url #2443
+- ch: update release pipeline #2440
+- fix error in dev pipeline commit sha #2439
+- add dev image workflow #2438
+- ft: make root path configurable #2437
+- update sql files #2419
+
+### Bug Fixes
+
+- feat: add license check for mTLS feature #2477
+- fix: circuit breaker email notifications not being sent #2481
+- fix: verify webhook signatures against raw body first, fallback to JSON #2392
+
+# 25.9.1
+
+### Features
+
+- added google sso
+
+### Enhancements
+
+- bump pkgs version
+- update base docker image and add dependabot
+- add organization ID to log
+- update docker compose dev
+- Standardize PortalLink Auth Types
+- Batch retry improvement
+- moved circuit breaker config to project config
+- rbac refactor
+
+### Bug Fixes
+- fix returning of internal errors to client
+
+# 25.7.1
+
+### Features
+
+-   Add owner ID filtering in the event log
+
+# 25.6.8
+
+### Enhancements
+
+-   Increase the default API and ingest rate limits
+
+# 25.6.7
+
+### Bug Fixes
+
+-   Make Sentry tracer sample rate configurable
+
+# 25.6.6
+
+### Enhancements
+
+- Fixed race condition in the compare package
+
+# 25.6.3, 25.6.4, 25.6.5
+
+### Features
+
+-   Add more debug logs
+
+# 25.6.1, 25.6.2
+
+### Feature
+
+-   Improve subscriptions loader #2307
+
+# 25.5.1
+
+### Enhancements
+
+-   Run batch event delivery retry in a background job #2299
+
+# 25.4.2
+
+### Bug Fixes
+
+-   Fixed an issue where read replicas environment variable wasn't being parsed correctly #2298
+
+# 25.4.1
+
+### Enhancements
+
+-   Use webhook dispatcher when creating and updating endpoints #2280
+
+# 25.3.5
+
+### Bug Fixes
+
+-   Fixed an issue where the retention policies job crashes
+
+# 25.3.4
+
+### Bug Fixes
+
+-   Fixed an issue where the filter wasn't properly being saved
+
+# 25.3.3
+
+### Bug Fixes
+
+-   Fixed pagination issue #2273
+
+# 25.3.2
+
+### Bug Fixes
+
+-   Fixed CA certificate issues #2270
+
+# 25.3.1
+
+### Features
+
+-   Added custom Certificate Authority support in dispatcher and server for secure TLS connections #2266
+
+# 25.2.2
+
+### Enhancements
+
+-   Portal links can now be authenticated using the owner id #2256
+
+### Bug Fixes
+
+-   Fixed a bug where the rate-limit setting was not being deleted when updating projects and endpoints #2246
+
+# 25.2.1
+
+### Features
+
+-   Improve Tracing: Add Event ID To Workflow Stages #2245 #2240 #2244
+
+### Enhancements
+
+-   Updated credential encryption #2233 #2231
+-   Updated read-replicas to rely on feature flags #2226
+
+### Bug Fixes
+
+-   Fix panic in backup project data handler #2232
+
+# 25.1.1
+
+### Features
+
+-   Added database read replica support #2195
+-   Create event types whenever a subscription is created or updated #2201
+-   Localhost endpoints can now be configured #2216
+-   Added credential encryption lifecycle management #2202 #2204 #2215 #2213
+-   Added Retention Policies with Partitioning #2194 #2198
+
+### Enhancements
+
+-   Add workflow to build rolling images #2217 #2218
+-   Remove cache implementation #2206
+-   added host to init sso flow #2219
+
+### Bug Fixes
+
+-   Remove multiple subscription for an endpoint setting #2197
+-   Fixed a bug where some gzipped bytes couldn't be inserted into the db column #2214 #2203
+-   Fixed duplicate metrics collection #2220 #2221
+-   Remove acknowledged_at from the event search query #2205
+-   Fixed a bug where the subscription filter form didn't persist deleted configurations #2210 #2209
+-   Fixed portal link UI issues with subscriptions, endpoints, and license check #2208
+-   Fixed portal link creation by owner id #2207
+
+# 24.11.1
+
+### Features
+
+-   Added endpoint circuit breaking. #2120
+-   Added rate limiting to server apis. #2166
+-   Added allow and block IP Lists #2169
+-   Added event types #2180
+-   Added Enterprise SSO #2175
+
+### Enhancements
+
+-   Removed retry configuration from subscriptions. #2161
+-   Redesigned event processing system to use a workflow approach. #2131
+-   Dashboard UI Improvements #2167
+-   Added missing index for fetching delivery attempts #2172
+-   Added version header to responses #2174
+-   Optimized queries for prometheus metrics #2179
+
+### Bug Fixes
+
+-   Fix flatten multiple top level operator bug #2168
+-   Delete an invitation after decline or accept #2171
+
+# 24.9.2
+
+### Enhancements
+
+-   Set CORS allow origin to the configured convoy instance host #2152
+-   Properly format token expiry time forgot/reset password email #2152
+-   Restrict loading of the Convoy dashboard (except portal link dashboards) in an iframe #2153
+
+# 24.9.1
+
+### License Changes
+
+-   Moved ee rbac into community and renamed to multiplayer mode #2146
+-   Setting the worker/agent execution mode can only be done using a license #2155
+
+### Features
+
+-   Added support for inbound webhooks that use urlencoded content type #2119
+
+### Enhancements
+
+-   HTTP ingest now uses the instance ingest rate #2156
+-   Show endpoint authentication config in the UI #2141
+
+### Bug Fixes
+
+-   Make forgot password response obscure #2144
+
+# 24.8.2
+
+### Bug Fixes
+
+-   fixed a retention policy bug where only empty files were uploading to s3
+
+# 24.8.1
+
+### Features
+
+-   Added end to end latency metrics #2079
+-   Add support for inbound webhooks that use form data #1998
+-   Added e2e test suite using test containers #2083
+-   Add license feature gating #2114 #2132 #2134
+-   Change License to Elastic License v2.0 #2124
+
+### Enhancements
+
+-   Move retention policy to instance config #2011
+-   Update event data openapi types #2088
+-   Refactor agent, worker and ingest entry points #2082
+-   Refactored Exponential Backoff Implementation #2073
+-   Remove instance configuration page #2085
+-   Set default signature value to advanced from UI #2090
+-   Add fanout for pubsub ingest #2099
+-   Events ingested in incoming projects would now respond with a 413 for oversized payloads #2095
+-   The agent component can now bootstrap a fresh instance #2111
+-   Don't return an error when an owner id has no registered endpoints #2112
+-   Split delivery attempts from event deliveries #2092
+-   Add auth to metrics and queue monitoring routes #2115
+-   Updated integration test suite #2100
+-   Refactored feature flags implementation #2105
+-   Push docker images to DockerHub #2122
+-   Add owner id to event delivery response #2129
+
+### Bug Fixes
+
+-   Fixed a bug in positional array filter #2086
+-   Fix count & batch retry queries #2089
+-   Fixed a bug where api responses from v2024-04-01 to v2024-01-01 were not properly migrated #2087
+-   Update UI Dependencies #2097
+-   Fixed a migration bug where default column values were not set #2103
+-   Fixed a bug where the wrong delay duration was used when scheduling an event delivery for retry #2110
+-   Fixed a bug where other events were retried from a portal link because the endpoint filter wasn't applied #2116
+
+# 24.6.4
+
+-   fixed a bug where the pubsub ingester won't start when there aren't any projects
+
+# 24.6.3
+
+### Bug Fixes
+
+-   Fixed api migration bug #2087
+
+# 24.6.2
+
+### Bug Fixes
+
+-   Remove default config value for advanced signatures #2090
+
+# 24.6.1
+
+### Features
+
+-   Add rate limiter to event entry points, HTTP APIs, and message brokers #2072 #2035
+-   Add retry queue #2058
+-   Add search bar for subscriptions #2062
+-   Use asynq's exponential backoff for event delivery retries #2052
+-   Add PyroScope profiling #1737
+-   Added Prometheus metrics #2005
+-   Endpoint subscriptions can now be created and viewed on portal links #2015
+-   Subscriptions can now be filtered by name #2014
+
+### Enhancements
+
+-   Optimise flatten and compare packages #2066 #2077
+-   Changed the Postgres driver to pgx #2064
+-   Optimized dashboard query and run time #2070
+-   Fixed order of endpoints and subscriptions #2060
+-   Optimise Subscription loader queries #2056
+-   Make dispatcher proxy less strict, allowing requests to be sent if the proxy URL is invalid #2059
+-   Load subscriptions synchronously on worker startup #2053
+-   Remove cache from userRepo since it's not a hot path #2050
+-   Added cache to retrieving subscriptions for broadcast #2044
+-   Refactored net.Dispatcher
+    -   Create dispatcher once #2043
+    -   Fixed a bug where we were closing the response body late #2029
+-   Refactor ProcessBroadcastEventCreation and ProcessEventCreation handlers
+    -   Deduplicate endpoint IDs #2024
+-   Refactor Repository
+    -   Add FindEventDeliveryByIDSlim #2054
+    -   Refactored event creation to insert in bulk #2038
+    -   Add indexes for FetchSubscriptionsForBroadcast #2033
+
+### Bug Fixes
+
+-   Fix dashboard summary filters #2071
+-   Fix events summary date filter #2069
+-   Fixed panic that occurred when updating project when setting the SSL config #2055
+-   Fixed a bug where we were creating events for the number of matched subscriptions instead of the number of matched endpoints #2025
+-   Fixed a bug where we would try to filter even when none is set on the subscription #2027
+-   Fixed a bug where the default log level was set to debug #2013
+-   Fixed a bug where portal links won't load in iframes because of a missing project reference #2008
+
+# 24.5.1
+
+### Features
+
+-   Create default org when bootstrapping Convoy for the first time. #1991
+-   Display user-settings page when there are no organizations. #1999
+
+### Enhancements
+
+-   Use transactions in ProcessBroadcastEventCreation to prevent a race condition. #1994
+-   Update copy for the kafka source form giving more information and linking to docs. #2000
+-   Update Endpoint table with its ID on the dashboard. #1988
+
+### Bug fixes
+
+-   Fixed a panic that would occur when request body is a string during subscription filtering. #1992
+-   Fixed a bug where the response from the pause endpoint api wasn't versioned correctly. #2001
+
+# 24.4.1
+
+### API Changes
+
+> [!NOTE]
+> All API Changes are backward-compatible, so you shouldn't need to change any code to get them to work, however, you need to specify the version (2024-04-01) in your convoy.json.
+
+-   changed endpoint `title` to `name`
+-   changes endpoint `target_url` to `url`
+
+### Features
+
+-   Implemented an in-memory store for data plane #1932
+-   Re-implement rate limiter using postgres #1937 #1950
+-   Add the ability to mutate payloads from message broker sources using javascript functions #1954 #1956 #1958
+-   Add project config for enforcing https endpoints #1955 #1957
+-   Add documentation to request models #1959
+-
+
+### Enhancements
+
+-   Encode Postgres connection string credentials #1936
+-   Update endpoint `title` to `name` and `target_url` to `url` #1945
+-   Enqueue Stuck Event Deliveries #1977
+
+### Bug Fixes
+
+-   Fixed a bug where telemetry wasn't being sent to PostHog #1944
+-   Fixed a bug where the signature modal in the project settings doesn't dismiss after saving. #1939
+-   Fixed a bug where project settings were not displayed properly on the dashboard #1953
+-   Fixed a bug where a failed subscription filter will stop all subscribers from a broadcast event from receiving the event #1962
+-   Fixed open telemetry tls configuration #1966
+-   Fixed a bug where a created or updated subscription didn't show the nested values #1970
+-   Fixed endpoints count query for portal links #1973
+-   Added data plane capabilities back to the worker which was unintentionally removed #1974
+
+# 24.1.4
+
+-   [Enhancement] Add custom headers to dynamic event #1923
+-   [Feature] Add broadcast event api #1913
+
+# 24.1.3
+
+### Bug Fixes
+
+-   fixed api versioning bug to correctly retrieve the instance api version #1918
+
+# 24.1.2
+
+### Bug Fixes
+
+-   fixed sync bug in the oss telemetry library #1906
+
+# 24.1.1
+
+### API Changes
+
+> [!NOTE]
+> All API Changes are backward-compatible, so you shouldn't need to change any code to get them to work, however, you need to specify which version you're running in your convoy.json.
+
+-   changed `http_timeout` and `rate_limit_duration` in endpoints from duration string to `int`.
+-   changed the default signature format from `simple` to `advanced`.
+-   stripped out unnecessary fields from dynamic api endpoint.
+
+### Features
+
+-   added support for OpenTelemetry #1865
+-   added support for sentry as a tracing backend #1865
+-   added support for api versioning using rolling versioning strategy backwards compatible #1871
+
+### Bug Fixes
+
+-   added `eventType` to `QueryListEventDelivery` #1843
+-   fixed source and subscription forms #1876
+-   fixed source and endpoint dropdown with search box #1850
+-   fixed retrieving portal links by `endpoints` or `owner_id` #1894
+-   update endpoints in cache when all the endpoints are re-enabled #1847
+-   update subscription endpoint metadata when a subscription is updated #1891
+-   fixed event deliveries pagination #1846
+-   delete invite after cancellation #1860
+-   enabled multi-user invite without refresh #1861
+-   set `event_id` in events filter #1866
+
+### Enhancements
+
+-   improved dynamic api support #1884
+-   improved endpoints api #1870
+-   QoL improvements to the api layer #1851
+-   QoL improvements to retention policies export worker #1882
+
+# 23.11.1
+
+-   [Feature] add cache to the organisations and api key repositories, add profiling route #1822
+-   [Feature] Record event delivery latency #1830
+-   [Enhancement] Improve event deliveries filtering #1824 #1840
+-   [Enhancement] UI layout redesign #1815
+-   [Enhancement] Move scheduler functionality into server #1835
+-   [Bugfix] Fixed endpoint enabling and disabling #1837
+
+# 23.10.1
+
+-   [Feature] Added bootstrap cli for user account creation #1773
+-   [Feature] Add prefix configuration to S3 Config #1812
+-   [Enhancement] Added TLS option for SMTP config #1784
+-   [Enhancement] Added support for multi-architecture docker images #1790
+-   [Enhancement] Improved docker compose to use named volumes #1804
+-   [Enhancement] Replaced Flipt for a custom feature flag implementation #1797
+-   [Enhancement] Added several performance improvements with caches and reduced db calls #1765 #1783
+-   [Enhancement] Optimise source loader query #1806
+-   [Bugfix] Added separate port for `ingest` cli #1795
+-   [Bugfix] Add support for Idempotency keys in message broker integration #1800
+-   [Bugfix] Fixed concurrency bug where wrong source name is show in the event log #1800
+-   [Bugfix] Fixed role check for updating organization name #1805
+-   [Bugfix] Fixed a bug with the portal link delete button #1807
+-   [Bugfix] Fixed a bug with the endpoint config button #1810
+-   [Bugfix] Removed onclickout function for dialogs #1808
+-   [Bugfix] Generate exponential back-off rate limits from intervalSeconds and Limt #1813
+
+# 23.9.2
+
+-   [Enhancement] Show invite url on teams invite page
+-   [Bugfix] Handle nullable 'Function' field in worker handler
+
+# 23.09.1
+
+-   [Feature] Add event payload transform functionality #1755 #1761
+-   [Enhancement] Add tail mode for events and event deliveries #1753
+-   [Enhancement] Expose rate limiting for endpoints #1754
+-   [Bugfix] Use the different queue instance when starting stream server #1769
+-   [Bugfix] Return an appropriate error instead of nil the process event delivery #1756
+-   [Bugfix] Add permissions when creating and revoking API keys #1762
+-   [Bugfix] Add QueueUrl nil check in SQS handler #1763
+-   [Bugfix] Update endpoints migration query #1768
+
+# 23.08.2
+
+-   [Feature] Postgres Full Text Search Reimplementation #1734 #1751 #1750
+-   [Feature] Add tail mode for events and event deliveries #1753
+-   [Enhancement] Paused events polling when searching and filtering on the Event Log #1744
+-   [Enhancement] Added an edit endpoint button in event delivery page #1738
+-   [Enhancement] Added a tooltip for Retry and Force Retry buttons #1741
+-   [Bugfix] Fixed a bug where the subscription filter editor UI was unresponsive #1747
+-   [Bugfix] Fixed a bug where the Batch Replay button on the events log would not replay events #1740
+-   [Bugfix] Fixed a bug in the process event delivery handler that caused events to stay in the `Scheduled` state #1756
+
+# 23.08.1
+
+-   [Feature] Check if signup is enabled in the instance config with this new API #1710
+-   [Feature] New support added for Redis clusters #1700
+-   [Feature] Add healthcheck for ingest command #1709
+-   [Feature] New subscription filter based on regex #1725
+-   [Feature] Integration added for Kafka sources #1708
+-   [Enhancement] Add source ID header to ingested events #1715
+-   [Enhancement] Get event deliveries based on subscription ID #1717
+-   [Enhancement] Made improvements to Convoy's UI Modals #1711
+-   [Enhancement] Display event types on event deliveries table #1691
+-   [Enhancement] Use of a separate struct when building meta events to preserve the event delivery attempts #1693
+-   [Enhancement] Update how events and event deliveries are fetched regular intervals #1705
+-   [Enhancement] Prevent other non-server entry points from modifying instance config #1724
+-   [Enhancement] Ensure that endpoint titles are unique #1730
+-   [Bugfix] Resolved a console error when creating a source #1690
+-   [Bugfix] Display of event types on the portal page. #1692
+-   [Bugfix] Fixed Endpoints page loading state and other issues #1697
+-   [Bugfix] Fixed portal link card spacing, scroll and token timeout issues #1707
+-   [Bugfix] Resolved memory consumption issues when the retention policy job runs #1706
+-   [Bugfix] Fixed issues encountered during onboarding related to subscriptions #1713
+-   [Bugfix] The copy button on the project details page has been fixed #1722
+-   [Bugfix] Events with active deliveries are now ignored in retention policies #1723
+-   [Bugfix] Fixed an issue where the organization modal fails to open and the project page keeps loading after creating the first organization #1727
+-   [Bugfix] Update navbar on creating project on new organisation #1250
+-   [Bugfix] Update validation check for create project form #1248
+
+# 23.06.3
+
+-   [Feature] Add support for Webhooks Idempotency #1651 #1688
+-   [Enhancement] Add support for deleting archived tasks #1657
+-   [Enhancement] Improved list projects view #1669 #1678 #1683
+-   [Enhancement] Remove 50Kb limit on MaxResponseSize config #1675
+-   [Enhancement] Create Fanout Event if Owner ID is tied to a portal link #1682
+-   [Bugfix] Delete duplicate task ID when writing to queue #1660
+-   [Bugfix] Fixed view endpoint under portal link's event delivery page #1666
+-   [Bugfix] Fixed issue with closing google pub/sub client #1673
+-   [Bugfix] Fixed issue with overriding config with cli flags #1668
+-   [Bugfix] Fixed issue with HTTP timeout validation #1680
+
+# 23.06.2
+
+-   [Enhancement] Improved logging to include response body #1655
+-   [Enhancement] Improved Datetime filtering UX #1644
+-   [Bugfix] Fixed update project settings while switching tabs bug #1653
+-   [Bugfix] Fixed default retention policy #1652
+-   [Bugfix] Fix multi-tenancy issue on portal links with ownerID. #1654
+
+# 23.06.1
+
+-   [Feature] Add custom response to incoming project sources #1605
+-   [Feature] Enabled endpoint management on portal links #1616
+-   [Feature] Support ingest query parameters to incoming sources #1640
+-   [Enhancement] Improved New Relic Integration #1621
+-   [Enhancement] Enabled auto API docs syncing #1625
+-   [Enhancement] Add endpoint timeout config option to the dashboard #1614
+-   [Enhancement] Improved portal page responsiveness #1648
+-   [Enhancement] Improved request and response annotations #1608 #1619 #1627 #1622 #1630 #1611 #1636 #1632 #1637 #1631 #1641
+-   [Bugfix] Fixed FindSubscriptionByDeviceID query bug #1647
+-   [Bugfix] Coalesce url query parameters #1642
+-   [Bugfix] Fixed event delivery filtering by status #1626
+-   [Bugfix] Fixed index on organisations invite index #1603 #1607
+-   [Bugfix] Link ownerID to portal links without endpoints #1638
+
+# 23.05.5
+
+-   [Enhancement] Optimise Migration Queries #1601
+
+# 23.05.4
+
+-   [Bugfix] Return error when persisting to redis fails on the ingest route #1597
+
+# 23.05.3
+
+-   [Enhancement] Postgres and Redis config options will now be supplied in parts to allow for fine-grained configuration #1579
+-   [Bugfix] Fixed an issue where the email verification flow could not be completed #1586
+-   [Bugfix] Fixed an issue where the frontend client sent the wrong pagination cursor value #1588
+-   [Bugfix] Fixed an issue where a project could not be saved due to meta-event form valiation #1589
+-   [Bugfix] Fixed an issue where the source id query param was not being used to filter when fetching events #1587
+
+# 23.05.2
+
+-   [Feature] Added support for meta events #1541
+-   [Bugfix] Fixed multi-tenancy bug with portal links #1582
+-   [Bugfix] Fixed issue with new user with no organisation #1578
+
+# 23.05.1
+
+-   [Feature] Add support for on the fly events #1558
+-   [Enhancement] Add prompt for disabling endpoints #1556
+-   [Enhancement] Extend subscription filter capabilities #1545 #1566
+-   [Enhancement] Improved logging for all workers #1560
+
+# 0.9.2
+
+-   [Documentation] Fix noun/verb agreement #1504
+-   [Enhancement] Add support for pausing an endpoint #1529 #1527
+-   [Bugfix] Fixed a bug where an endpoint would be stuck in pending #1529
+-   [Bugfix] Fixed max response size log on server startup #1507
+-   [Bugfix] Add endpoint metadata to event search results #1508
+-   [Bugfix] Fixed an issue where the reset password flow could not be completed #1506 #1503
+
+# 0.9.1
+
+-   [Enhancement] Add default db connection options #1496
+-   [Enhancement] Move check for hiding pagination to entire container #1497
+-   [Enhancement] Add support for filtering by "owner_id" when fetching endpoints and by an array of endpoints when fetching subscriptions #1498
+-   [Enhancement] Add signup enabled environment variable #1495
+-   [Bugfix] Change TrimSuffix to TrimSpace when fetching convoy version #1501
+-   [Bugfix] Redirect to the "get started" page when there's no orgnaization for that user #1500
+
+# 0.9.0
+
+-   [Documentation] Update API Annotations #1478
+-   [Enhancement] Change font to inter #1470
+-   [Enhancement] QoL Postgres Updates #1419
+-   [Enhancement] Port Stream Server #1482
+-   [Enhancement] UI updates #1491 #1490 #1486 #1474 #1480
+-   [Bugfix] Check pending migrations #1487
+-   [Bugfix] fix message payload for process event delivery #1483
+
+# 0.9.0-rc.3
+
+-   [Bugfix] Fix search indexer job #1448 #1449
+-   [Bugfix] Fix refresh token issue #1447
+-   [Bugfix] Fix event graph length #1443
+
+# 0.9.0-rc.2
+
+-   [Bugfix] Fix issue with updating PubSub Sources #1440
+-   [Enhancement] Fix toggle and view subscription. #1424
+-   [Enhancement] Create room for empty data on chart. #1422 #1425
+
+# 0.9.0-rc.1
+
+-   [Feature] Add new message broker source. #1285
+-   [Enhancement] Switched backing store to PostgreSQL. #1287
+-   [Enhancement] Add modal to confirm before regenerating API Keys. #1378
+-   [Enhancement] Implement new wait screens #1398
+
+# 0.8.3
+
+-   [Bugfix] Fix search indexer job #1448 #1449
+
+# 0.8.2
+
+-   [Feature] Set Advanced Signatures by default for Incoming projects.
+-   [Enhancement] Refactored Convoy CLI Implementation. #1290
+-   [Enhancement] Improved Project Onboarding #1335
+-   [Enhancement] Improved Delivery Attempt Details page #1341
+-   [Enhancement] Update Subscriptions Card for Incoming Projects. #1349
+-   [Enhancement] Update portal links design #1348
+-   [Enhancement] Improve source, subscription and endpoint forms #1335
+-   [Bugfix] Event Log pagination bug #1346
+-   [Bugfix] Date picker bug fix #1355
+
+# 0.8.1
+
+-   [Enhancement] Improved stats query #1256
+-   [Enhancement] Add analytics and storage policy settings in convoy.josn #1284 #1324
+-   [Feature] Set notifications by default #1251
+-   [Feature] Add raw invite link in invite email #1279
+-   [Feature] Allow user re-generate api key for projects #1277
+
+# 0.8.0
+
+-   [Feature] Filter by HTTP Headers #1240 #1232 #1249
+-   [Feature] Add force retry and batch retry to event logs #1237
+-   [Feature] Add convoy version to private pages #1230
+-   [Feature] Add frontend analytics and welcome email #1209
+-   [Feature] Build source-maps to separate folder #1216
+-   [Feature] Change group to project #1207
+-   [Feature] Filter events using event types and subscriptions #1205 #1217
+-   [Feature] Add custom domain support #1203
+-   [Feature] use central logger everywhere #1176
+-   [Feature] Deprecate Apps in favor of Endpoints #1169 #1159 #1069 #1158
+-   [Feature] Deprecate `document_status` in favor of `delete_at` #1123 #1168
+-   [Feature] Filter events by the subcription filtering #1096 #1116
+-   [Feature] Added support for http connect proxy #1146
+-   [Enhancement] Deprecate subscription status field #1243 #1234
+-   [Enhancement] Update email verification flow #1227
+-   [Enhancement] Improved onboarding forms #1245 #1244 #1246
+-   [Enhancement] MaxIngestSize can be configured per group/project #1160
+-   [Enhancement] Use mongo aggregations when quering multuple collections #1611 #1153
+-   [Enhancement] Redirect user to previous page on login after session timeout #1154
+-   [Enhancement] Add response body to endpoint disabled notification email/slack message #1141 #1152
+-   [Enhancement] Email verification check after signup #1208 #1186
+-   [Enhancement] Add support for building alpine images #1108
+-   [Enhancement] Add api key migrations #1166
+-   [Bugfix] Add raw value to event payload #1236
+-   [Bugfix] Persist advanced signatures config #1233
+-   [Bugfix] Fix migration tool #1226
+-   [Bugfix] Token modal on project creation now show visual feedback #1242
+-   [Bugfix] Show event deliveries in correct order #1202 #1157
+-   [Bugfix] Used correct type for rate limit duation #1201
+-   [Bugfix] Fixed events in discarded state getting stuck #1200
+-   [Bugfix] Fixed events should be created regardless of subscriptions logic
+-   [Bugfix] Enable default retention policy duration #1163
+-   [Bugfix] fixed hobby deployment installation script #1139 #1136 #1135 #1134
+-   [Bugfix] Update navbar on creating project on new organisation #1250
+-   [Bugfix] Update validation check for create project form #1248
+
+# 0.7.6
+
+-   [Bugfix] Preserve whitespaces in event payload #1223
+
+# 0.7.5
+
+-   [Enhancement] Filter event deliveries by subscriptions #1192
+-   [Bugfix] fix prism import error #1194
+-   [Bugfix] correctly use query string in app portal #1195
+
+# 0.7.4
+
+-   [Enhancement] hide cli keys and devices on app portal #1184
+-   [Bugfix] pass query params along in shim #1185
+
+# 0.7.3
+
+-   [Enhancement] Set app portal key expiration to 30 days #1170 #1171
+
+# 0.7.2
+
+-   [Bugfix] Fix Max response size CLI override #1098
+-   [Feature] Advanced Signatures Core Implementation #1053 #1100 #1103 #1104
+-   [Feature] Refactored Logging Implementation #1051
+-   [Bugfix] Update endpoint with custom authentication #1119 #1106 #1107 #1105
+-   [Enhancement] Add support for building alpine image #1108
+
+# 0.7.1
+
+-   [Bugfix] Fix Max response size CLI override #1098
+
+# 0.7.0
+
+-   [Feature] Add support for feature flags #1054
+-   [Enhancement] Enable source filter on Events dashboard #1058 #1043
+-   [Bugfix] Use configured max request size in ingest handler #1086
+-   [Feature] Use mongo aggregation pipeline to fetch subscriptions #1073
+-   [Feature] Run Convoy in Headless mode #1034
+-   [Enhancement] New UI Onboarding #1048
+-   [Bugfix] Fixed retention policies task handler #1049
+-   [Bugfix] Set default body for ingested events to empty JSON #1062
+-   [Feature] Add support for endpoint authentication #1045
+-   [Bugfix] The change stream should not be killed when an error occurs in the handler #1061
+-   [Enhancement] Fix build warnings #1089
+-   [Bugfix] Several UI fixes #1087
+
+# 0.7.0-rc.2
+
+-   [Feature] Create cli api keys and manage devices from the app portal #983
+-   [Bugfix] Fix Subscription Config Inheritance For Event Deliveries #995
+-   [Enhancement] Implement cascading delete for groups, apps and sources #1037
+-   [Enhancement] Add help to project sidebar #1032
+
+# 0.7.0-rc.1
+
+-   [Feature] Add a command to run convoy migrations #989 #996 #993
+-   [Feature] Storybook setup #927
+-   [Feature] Add load test scripts #997
+-   [Feature] Add convoy websocket cli event streaming server and client #931
+-   [Feature] Add support for custom headers for outgoing events #1012
+-   [Bugfix] Use typesense multi search #994
+-   [Bugfix] Fix retention policy export #998
+-   [Bugfix] Allow discarded events to be retried #1016
+-   [Bugfix] Validate source providers separately #1024
+-   [Enhancement] Fixed API spec annotations #1005
+-   [Enhancement] Refactor Store Dependency #1006
+
+# 0.6.8
+
+-   [Bugfix] Fix subscriptions page error #1026
+-   [Bugfix] Add deleted_at to MongoDB indexes #1027
+-   [Bugfix] Dismiss modal when a source is deleted #1026
+
+# 0.6.7
+
+-   [Bugfix] Fix analytics query #1001
+-   [Bugfix] Fix middleware layer for app portal #988
+-   [Bugfix] Fix endpoint notification email bug #981
+
+# 0.6.6
+
+-   [Bugfix] Fix project statistics lookup query #978 #979
+
+# v0.6.5
+
+-   [Feature] Add support for user registration. #959
+-   [Bugfix] Updated event dashboard with application and source metadata. #960
+-   [Bugfix] Allow re-invitation of a previously cancelled invitation. #967
+-   [Enhancement] Projects scoped indexing and search. #945
+-   [Enhancement] Improved notification system. #954
+
+# v0.6.4
+
+-   [Bugfix] Fixed a bug where event deliveries could not be force retried #938
+-   [Bugfix] Changed the group/project rate limit duration type from string to int #938
+-   [Bugfix] Fixed a bug where team invites could not be canceled on the UI #940
+-   [Enhancement] Add an environment variable for the typesense collection name #939
+
+# v0.6.3
+
+-   [Enhancement] change app portal url from `/app-portal` to `/app` #924
+-   [Enhancement] App portal improvements #918
+
+# v0.6.2
+
+-   [Feature] Added Proxy Events without Verification #906
+-   [Enhancement] Reliably forward Incoming events request headers #895
+-   [Bugfix] Fixed force retry bug #891 #890
+
+# v0.6.1
+
+-   [Bugfix] Fixed API response for force retry endpoint #892, #897
+-   [Bugfix] Changed create configuration to use a post request #896
+
+# v0.6.0
+
+-   [Feature] Add Support for Custom Sources (Twitter, Shopify) #869, #833, #826
+-   [Feature] Add Support for Retention Policies #839, #879
+-   [Enhancement] Updated UI Architecture to use Tailwind CSS #816
+-   [Enhancement] Optimised UI to reduce initial bundle size #879
+-   [Enhancement] Allow all workers to run in a single cluster #876
+-   [Enhancement] Add cancelled status on org invite #812
+-   [Bugfix] Fixed wrong FindMany query in subscriptions.go #858
+-   [Bugfix] Enabled JWT configuration with env variables #813
+
+# v0.6.0-rc.4
+
+-   [Bugfix] Fixed bug in correctly using datastore FindMany method #856
+
+# v0.6.0-rc.3
+
+-   [Change] Changed host to instance id in the analytics #821
+-   [Enhancement] Add support for JWT environment variables #813
+-   [Bugfix] Fix analytics query #825
+-   [Bugfix] UI bug fixes #814
+
+# v0.6.0-rc.2
+
+-   [Bugfix] Dereference slice when finding source subscriptions #808
+-   [Bugfix] Use redis client in scheduler #807
+-   [Bugfix] Fixed an issue where the source type would not be updated when updating a Github source
+-   [Bugfix] Fixed an issue where the application details would not be loaded when creating a subscription
+-   [Bugfix] Fixed an issue where an organization created by a user would not show on the top bar to be selected
+
+# v0.6.0-rc.1
+
+-   [Change] Introduce organisations to partition different sets of projects.
+-   [Change] Deprecate file authentication and authorisation. You no longer specify authentication credentials from convoy.json. User and permission details are now persisted to the DB and use jwt for authentication.
+-   [Change] All users are now super users in the OSS core.
+-   [Change] Sentry error tracking has been deprecated. Only New relic is supported for error tracking.
+-   [Change] Revamped UI. The former convoy dashboard was revamped to enable more management of several vital resources - users, projects, applications, endpoints, sources, and subscriptions.
+-   [Change] require_auth has been deprecated. All endpoints will now require authentication.
+-   [Feature] Add Github Custom source #792 #791
+-   [Enhancement] Change base_url config variable to host #754
+-   [Enhancement] Set default event types when filter config is nil #783
+-   [Enhancement] Switched background job system to asynq. #711
+-   [Enhancement] Add toggle subscription status endpoint #784
+-   [Enhancement] Autogenerated webhook secrets use alphanumeric secrets #751
+-   [Enhancement] Use asynq for the scheduler. #745
+-   [Bugfix] Prevent an organisation owner from being deactivated #781
+-   [Bugfix] Fix events ingestion to create event flow #744
+-   [Bugfix] Fixed a race condition that could occur when making an application endpoint #790
+-   [Bugfix] Fixed app portal link. #790
+-   [Bugfix] Use correct arguments for API key verifier #779
+-   [Bugfix] Fixed switching between organisations #775
+-   [Bugfix] Return proper error from SendNotification #764
+-   [Bugfix] Fixed filters in events and event deliveries #718
+-   [Bugfix] Fixed loaders in projects page #724
+
+# v0.6.0-rc
+
+-   [Enhancement] Optimize group statistics query #677
+-   [Enhancement] pause retry count for rate limit errors #676
+-   [Enhancement] Add groupID arg to application datastore methods
+-   [Feature] Add Typesense search backend #652
+-   [Enhancement] Added integration tests #647 #655 #656 #661 #643 #638
+-   [Feature] Add support for storing events for disabled apps #663
+-   [Enhancement] Integrate disq as a replacement for taskq #667
+-   [Enhancement] Fix mongodb index model type #671
+-   [Bugfix] Update endpoints secret #640
+-   [Bugfix] Prevent duplicate app names #635
+-   [Feature] Force retry on App portal #633
+
+# v0.5.3
+
+-   [Feature] Add update scripts for migrating from v0.4 to v0.5 #611
+-   [Enhancement] Changed the way events are created #592
+-   [Documentation] Add GroupId to swagger documentation #617
+-   [Documentation] Fix build command in README.md #600
+-   [Documentation] Fix convoy.json.example #603
+-   [Enhancement] Add unit tests for the service layer #596 #594 #593 #589
+-   [Enhancement] Increase test coverage in server package #584 #581 #565
+-   [Enhancement] Add unit and e2e test for dashboard component #580 #612
+-   [Enhancement] Updated UI on dashboard and app portal #616 #590
+-   [Enhancement] Improve loaders for dashboard and app portal #614 #616
+-   [Feature] Add slack notification system #562
+-   [Feature] Add Force Resend to App Portal API #579
+-   [Enhancement] Configurable Replay attacks on groups #567
+
+# v0.5.0
+
+-   [Feature] Convoy can now be configured with only environment variables and/or cli flags #511 #520
+-   [Feature] Add rate limit to api and ui endpoints using the group id #486
+-   [Feature] Add configuration option to set rate limits on application endpoints
+-   [Feature] Add configuration option to set endpoint timeout duration #550
+-   [Feature] Add support for disabling an application #527
+-   [Enhancement] Removes the need for always passing the groupID as a query string while authenticating with an API Key. #535
+-   [Bugfix] Add the correct event delivery status for matched endpoints #503
+-   [Feature] Convoy now supports replay attack prevention by providing a timestamp in the signature header #528 #537
+-   [Feature] Convoy now uses filters for batch retrying event deliveries.
+-   [Feature] Convoy can now force resend successful event deliveries.
+-   [Enhancement] Introduced a service layer into the code architecure #532 #547 #555 #552
+
+# 0.4.10
+
+-   [Feature] We can now download convoy binaries from package managers #459
+-   [Enhancement] Add support for embedding convoy version file #454
+-   [Feature] Expose taskq queue metrics #476
+-   [Feature] Added support for embedding an App portal in a 3rd pary app #463
+
+# 0.4.0
+
+-   [Enhancement] Replace bbolt implementation with badger #417
+-   [Enhancement] Add compound indexex for events, eventdeliveries and applications #418
+
+# 0.4.0-rc
+
+-   [Feature] Added in memory queue using taskq #342
+-   [Feature] Added in memory database using bolt #390 #388 #347 #348 #343
+-   [Feature] Native Realm Implementation #349
+-   [Feature] Add Group statistics #330
+-   [Feature] Spilt Server Worker CLI #350
+-   [Feature] Add support for New Relic #264
+-   [Feature] Add application search #336
+-   [Bugfix] Configure Max response size to store #345
+-   [Enhancement] Fix slow dashboard summary endpoint #381
+-   [Enhancement] Improve Request Validation #365
+-   [Enhancement] Event deliveries search apps filter #382
+
+# 0.3.0
+
+-   [Bugfix] Fixed hash computation bug #269
+-   [Bugfix] Bundled UI into binary builds. #273
+-   [Bugfix] Don't enqueue discarded events #253
+-   [Enhancement] Build Convoy dashboard UI into npm package in `dashboard-component` #272
+
+# 0.3.0-rc
+
+-   [Feature] URL/Events: User can specify events to each endpoint.
+-   [Feature] Batch Retries: User can batch retry multiple event deliveries at once.
+-   [Feature] Unified auth configuration for both UI and API.
+-   [Feature] Added minimal rbac for super user, admin and ui admin.
+-   [Feature] New tab to view event deliveries for events.
+-   [Feature] Filter event deliveries by delivery status, app and date range
+-   [Feature] View event deliveries status for each event from event's details section.
+-   [Feature] Introduced Groups: To support multi-tenancy for multiple products to pipe events as separete groups.
+-   [Feature] Persist events and event deliveries filters, active group and active logs tab with page reload.
+
+# 0.2.0
+
+-   [Feature] Add disable events and send email notifications.
+-   [Feature] Re-activate endpoints by re-trying a non-successful event.
+-   [Feature] Enable SMTP configuration.
+-   [Enhancement] Improved Delivery Attempt Page.
+-   [Enhancement] Event log filtering by Applications and Date.
+-   [Enhancement] Changed organisations to groups throughout app.
+-   [Enhancement] Changed /apps to /applications
+-   [Enhancement] Create default group on app startup.
+-   [Enhancement] Clicking events button from apps table now automatically filters events by clicked app.
+-   [Enhancement] Convoy config details now shows on dashboard.
+-   [Enhancement] Created at and Next retry on events table now shows time instead of date.
+-   [Enhancement] Improved table pagination.
+-   [Enhancement] Events table now grouped by date.
+-   [Enhancement] Manually retried events now identifiable by a retry icon on events table.
+-   [Enhancement] Event status now differentiated by status color.

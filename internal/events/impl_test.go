@@ -1,0 +1,1762 @@
+package events
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/database/hooks"
+	"github.com/frain-dev/convoy/database/postgres"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/endpoints"
+	"github.com/frain-dev/convoy/internal/event_deliveries"
+	"github.com/frain-dev/convoy/internal/organisations"
+	"github.com/frain-dev/convoy/internal/pkg/attach"
+	"github.com/frain-dev/convoy/internal/pkg/keys"
+	"github.com/frain-dev/convoy/internal/projects"
+	"github.com/frain-dev/convoy/internal/sources"
+	"github.com/frain-dev/convoy/internal/users"
+	"github.com/frain-dev/convoy/pkg/httpheader"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/testenv"
+)
+
+var (
+	testEnv        *testenv.Environment
+	testEnvCleanup func() error
+	testEnvOnce    sync.Once
+	testEnvErr     error
+)
+
+func TestMain(m *testing.M) {
+	_ = os.Setenv("CONVOY_JWT_SECRET", "test-access-secret")
+	_ = os.Setenv("CONVOY_JWT_REFRESH_SECRET", "test-refresh-secret")
+
+	code := m.Run()
+	if testEnvCleanup != nil {
+		if err := testEnvCleanup(); err != nil {
+			fmt.Printf("Failed to cleanup test infrastructure: %v\n", err)
+		}
+	}
+	os.Exit(code)
+}
+
+func launchTestEnv() {
+	testEnvOnce.Do(func() {
+		res, cleanup, err := testenv.Launch(context.Background())
+		if err != nil {
+			testEnvErr = err
+			return
+		}
+		testEnv = res
+		testEnvCleanup = cleanup
+	})
+}
+
+func setupTestDB(t *testing.T) (*Service, database.Database) {
+	t.Helper()
+	launchTestEnv()
+	if testEnvErr != nil {
+		t.Fatalf("Failed to launch test environment: %v", testEnvErr)
+	}
+
+	err := config.LoadConfig("")
+	require.NoError(t, err)
+
+	// Clone test database for isolation
+	conn, err := testEnv.CloneTestDatabase(t, "convoy")
+	require.NoError(t, err)
+
+	dbHooks := hooks.Init()
+	dbHooks.RegisterHook(datastore.EndpointCreated, func(ctx context.Context, data any, changelog any) {})
+
+	db := postgres.NewFromConnection(conn)
+
+	// Initialize KeyManager
+	km, err := keys.NewLocalKeyManager("test")
+	require.NoError(t, err)
+
+	if km.IsSet() {
+		_, err = km.GetCurrentKeyFromCache()
+		require.NoError(t, err)
+	}
+
+	err = keys.Set(km)
+	require.NoError(t, err)
+
+	logger := log.New("convoy", log.LevelInfo)
+	return New(logger, db), db
+}
+
+func TestRequireEventEndpointIDs(t *testing.T) {
+	require.NoError(t, requireEventEndpointIDs(nil))
+	require.NoError(t, requireEventEndpointIDs([]string{"endpoint-id-1"}))
+	require.ErrorIs(t, requireEventEndpointIDs([]string{""}), datastore.ErrEventEndpointIDRequired)
+	require.ErrorIs(t, requireEventEndpointIDs([]string{"endpoint-id-1", "  "}), datastore.ErrEventEndpointIDRequired)
+}
+
+func seedTestProject(t *testing.T, db database.Database) *datastore.Project {
+	t.Helper()
+
+	logger := log.New("convoy", log.LevelInfo)
+	ctx := context.Background()
+
+	// Create user with unique email
+	userRepo := users.New(logger, db)
+	userID := ulid.Make().String()
+	user := &datastore.User{
+		UID:       userID,
+		Email:     fmt.Sprintf("test-%s@example.com", userID),
+		FirstName: "Test",
+		LastName:  "User",
+	}
+	err := userRepo.CreateUser(ctx, user)
+	require.NoError(t, err)
+
+	// Create organisation
+	orgRepo := organisations.New(logger, db)
+	org := &datastore.Organisation{
+		UID:     ulid.Make().String(),
+		Name:    "Test Org",
+		OwnerID: user.UID,
+	}
+	err = orgRepo.CreateOrganisation(ctx, org)
+	require.NoError(t, err)
+
+	// Create project
+	projectRepo := projects.New(log.New("convoy", log.LevelInfo), db)
+	projectConfig := datastore.DefaultProjectConfig
+	project := &datastore.Project{
+		UID:            ulid.Make().String(),
+		Name:           "Test Project",
+		Type:           datastore.OutgoingProject,
+		OrganisationID: org.UID,
+		Config:         &projectConfig,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	err = projectRepo.CreateProject(ctx, project)
+	require.NoError(t, err)
+
+	return project
+}
+
+func seedTestEndpoint(t *testing.T, db database.Database, projectID string) *datastore.Endpoint {
+	t.Helper()
+
+	ctx := context.Background()
+	endpointRepo := endpoints.New(log.New("convoy", log.LevelInfo), db)
+
+	endpointID := ulid.Make().String()
+	endpoint := &datastore.Endpoint{
+		UID:          endpointID,
+		ProjectID:    projectID,
+		Name:         fmt.Sprintf("Test Endpoint %s", endpointID),
+		Url:          fmt.Sprintf("https://example.com/webhook/%s", endpointID),
+		Status:       datastore.ActiveEndpointStatus,
+		SupportEmail: fmt.Sprintf("test-%s@example.com", endpointID),
+		Secrets: datastore.Secrets{
+			{UID: ulid.Make().String(), Value: "test-secret-value"},
+		},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	err := endpointRepo.CreateEndpoint(ctx, endpoint, projectID)
+	require.NoError(t, err)
+
+	return endpoint
+}
+
+func seedTestSource(t *testing.T, db database.Database, projectID string) *datastore.Source {
+	t.Helper()
+
+	logger := log.New("convoy", log.LevelInfo)
+	ctx := context.Background()
+	sourceRepo := sources.New(logger, db)
+
+	sourceID := ulid.Make().String()
+	source := &datastore.Source{
+		UID:       sourceID,
+		ProjectID: projectID,
+		Name:      fmt.Sprintf("Test Source %s", sourceID),
+		MaskID:    fmt.Sprintf("src_%s", sourceID),
+		Type:      datastore.HTTPSource,
+		Verifier:  &datastore.VerifierConfig{Type: datastore.NoopVerifier},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	err := sourceRepo.CreateSource(ctx, source)
+	require.NoError(t, err)
+
+	return source
+}
+
+func createTestEvent(t *testing.T, projectID string, endpointIDs []string, sourceID string) *datastore.Event {
+	t.Helper()
+
+	eventID := ulid.Make().String()
+	now := time.Now()
+
+	return &datastore.Event{
+		UID:              eventID,
+		EventType:        datastore.EventType("test.event"),
+		ProjectID:        projectID,
+		SourceID:         sourceID,
+		Endpoints:        endpointIDs,
+		Headers:          httpheader.HTTPHeader{"X-Test": []string{"value"}},
+		Raw:              `{"test": "data"}`,
+		Data:             json.RawMessage(`{"test": "data"}`),
+		IdempotencyKey:   fmt.Sprintf("idempotency-%s", eventID),
+		URLQueryParams:   "query=test",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		AcknowledgedAt:   null.TimeFrom(now),
+		IsDuplicateEvent: false,
+	}
+}
+
+// defaultSearchParams returns SearchParams covering a wide time range
+// to avoid the epoch-to-epoch filter issue when no dates are specified.
+func defaultSearchParams() datastore.SearchParams {
+	return datastore.SearchParams{
+		CreatedAtStart: time.Now().Add(-24 * time.Hour).Unix(),
+		CreatedAtEnd:   time.Now().Add(1 * time.Hour).Unix(),
+	}
+}
+
+func TestExportRecords(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("Success", func(t *testing.T) {
+		for range 5 {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		var buf bytes.Buffer
+		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		count, err := service.ExportRecords(ctx, epoch, time.Now().Add(1*time.Hour), &buf)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, int64(5))
+
+		// Verify valid JSONL
+		lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+		require.GreaterOrEqual(t, len(lines), 5)
+		for _, line := range lines {
+			var record map[string]any
+			err = json.Unmarshal(line, &record)
+			require.NoError(t, err)
+			// id should be renamed to uid
+			require.NotEmpty(t, record["uid"], "each record should have uid")
+			require.Nil(t, record["id"], "id should be renamed to uid")
+		}
+	})
+
+	t.Run("Empty_with_past_cutoff", func(t *testing.T) {
+		var buf bytes.Buffer
+		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		count, err := service.ExportRecords(ctx, epoch, time.Now().Add(-24*time.Hour), &buf)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), count)
+		require.Empty(t, buf.String())
+	})
+
+	t.Run("TimeWindow", func(t *testing.T) {
+		// Create more events
+		for range 3 {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		// Export with window [1h ago, now+1h) — should include all recently created
+		var buf bytes.Buffer
+		start := time.Now().Add(-1 * time.Hour)
+		end := time.Now().Add(1 * time.Hour)
+		count, err := service.ExportRecords(ctx, start, end, &buf)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, int64(3))
+
+		lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+		require.GreaterOrEqual(t, len(lines), 3)
+
+		// Export with window that excludes all: [2h ago, 1h ago)
+		buf.Reset()
+		count, err = service.ExportRecords(ctx, time.Now().Add(-2*time.Hour), time.Now().Add(-1*time.Hour), &buf)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), count)
+	})
+}
+
+func TestCreateEvent(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("CreateEvent_Success", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+
+		err := service.CreateEvent(ctx, event)
+		require.NoError(t, err)
+		require.NotEmpty(t, event.UID)
+
+		// Verify event was created
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Equal(t, event.UID, found.UID)
+		require.Equal(t, event.ProjectID, found.ProjectID)
+		require.Equal(t, event.EventType, found.EventType)
+	})
+
+	t.Run("CreateEvent_WithMultipleEndpoints", func(t *testing.T) {
+		endpoint2 := seedTestEndpoint(t, db, project.UID)
+		endpoint3 := seedTestEndpoint(t, db, project.UID)
+
+		event := createTestEvent(t, project.UID, []string{endpoint.UID, endpoint2.UID, endpoint3.UID}, source.UID)
+
+		err := service.CreateEvent(ctx, event)
+		require.NoError(t, err)
+
+		// Verify event has all endpoints
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Len(t, found.Endpoints, 3)
+	})
+
+	t.Run("CreateEvent_BatchEndpointProcessing", func(t *testing.T) {
+		// Test with many endpoints to verify 30K batch processing
+		numEndpoints := 100
+		endpointIDs := make([]string, numEndpoints)
+		for i := 0; i < numEndpoints; i++ {
+			endpointIDs[i] = ulid.Make().String()
+		}
+
+		event := createTestEvent(t, project.UID, endpointIDs, source.UID)
+
+		err := service.CreateEvent(ctx, event)
+		require.NoError(t, err)
+
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Len(t, found.Endpoints, numEndpoints)
+	})
+
+	t.Run("CreateEvent_RejectsEmptyEndpointID", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{""}, source.UID)
+
+		err := service.CreateEvent(ctx, event)
+		require.ErrorIs(t, err, datastore.ErrEventEndpointIDRequired)
+	})
+}
+
+func TestFindEventByID(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("FindEventByID_Success", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		err := service.CreateEvent(ctx, event)
+		require.NoError(t, err)
+
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Equal(t, event.UID, found.UID)
+		require.Equal(t, event.ProjectID, found.ProjectID)
+	})
+
+	t.Run("FindEventByID_NotFound", func(t *testing.T) {
+		_, err := service.FindEventByID(ctx, project.UID, ulid.Make().String())
+		require.Error(t, err)
+		require.Equal(t, datastore.ErrEventNotFound, err)
+	})
+}
+
+func TestFindEventsByIDs(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("FindEventsByIDs_Multiple", func(t *testing.T) {
+		event1 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event2 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event3 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+
+		require.NoError(t, service.CreateEvent(ctx, event1))
+		require.NoError(t, service.CreateEvent(ctx, event2))
+		require.NoError(t, service.CreateEvent(ctx, event3))
+
+		events, err := service.FindEventsByIDs(ctx, project.UID, []string{event1.UID, event2.UID, event3.UID})
+		require.NoError(t, err)
+		require.Len(t, events, 3)
+	})
+
+	t.Run("FindEventsByIDs_Empty", func(t *testing.T) {
+		events, err := service.FindEventsByIDs(ctx, project.UID, []string{})
+		require.NoError(t, err)
+		require.Empty(t, events)
+	})
+}
+
+func TestFindEventsByIdempotencyKey(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("FindEventsByIdempotencyKey_Success", func(t *testing.T) {
+		idempotencyKey := fmt.Sprintf("test-key-%s", ulid.Make().String())
+		event1 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event1.IdempotencyKey = idempotencyKey
+
+		event2 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event2.IdempotencyKey = idempotencyKey
+
+		require.NoError(t, service.CreateEvent(ctx, event1))
+		require.NoError(t, service.CreateEvent(ctx, event2))
+
+		exists, err := service.FindEventsByIdempotencyKey(ctx, project.UID, idempotencyKey)
+		require.NoError(t, err)
+		require.True(t, exists)
+	})
+}
+
+func TestFindFirstEventWithIdempotencyKey(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("FindFirstEventWithIdempotencyKey_Success", func(t *testing.T) {
+		idempotencyKey := fmt.Sprintf("test-key-%s", ulid.Make().String())
+
+		// Create first non-duplicate event
+		event1 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event1.IdempotencyKey = idempotencyKey
+		event1.IsDuplicateEvent = false
+		require.NoError(t, service.CreateEvent(ctx, event1))
+
+		// Create duplicate event
+		event2 := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		event2.IdempotencyKey = idempotencyKey
+		event2.IsDuplicateEvent = true
+		require.NoError(t, service.CreateEvent(ctx, event2))
+
+		found, err := service.FindFirstEventWithIdempotencyKey(ctx, project.UID, idempotencyKey)
+		require.NoError(t, err)
+		require.Equal(t, event1.UID, found.UID)
+		require.False(t, found.IsDuplicateEvent)
+	})
+}
+
+func TestFindEventIDsByIdempotencyKeys(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	otherProject := seedTestProject(t, db)
+	otherEndpoint := seedTestEndpoint(t, db, otherProject.UID)
+	otherSource := seedTestSource(t, db, otherProject.UID)
+
+	keyA := fmt.Sprintf("key-a-%s", ulid.Make().String())
+	keyB := fmt.Sprintf("key-b-%s", ulid.Make().String())
+
+	create := func(projectID, endpointID, sourceID, key string, duplicate bool) *datastore.Event {
+		event := createTestEvent(t, projectID, []string{endpointID}, sourceID)
+		event.IdempotencyKey = key
+		event.IsDuplicateEvent = duplicate
+		require.NoError(t, service.CreateEvent(ctx, event))
+		return event
+	}
+
+	first := create(project.UID, endpoint.UID, source.UID, keyA, false)
+	create(project.UID, endpoint.UID, source.UID, keyA, true)
+	second := create(project.UID, endpoint.UID, source.UID, keyB, false)
+	create(project.UID, endpoint.UID, source.UID, "unrelated-"+ulid.Make().String(), false)
+	create(otherProject.UID, otherEndpoint.UID, otherSource.UID, keyA, false)
+
+	ids, err := service.FindEventIDsByIdempotencyKeys(ctx, project.UID, []string{keyA, keyB}, 10)
+	require.NoError(t, err)
+	require.Equal(t, []string{first.UID, second.UID}, ids)
+
+	ids, err = service.FindEventIDsByIdempotencyKeys(ctx, project.UID, []string{keyA, keyB}, 1)
+	require.NoError(t, err)
+	require.Equal(t, []string{first.UID}, ids)
+
+	ids, err = service.FindEventIDsByIdempotencyKeys(ctx, project.UID, nil, 10)
+	require.NoError(t, err)
+	require.Empty(t, ids)
+}
+
+func TestCreateEventIdempotencyClaim(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("SequentialDuplicateIsFlagged", func(t *testing.T) {
+		idempotencyKey := fmt.Sprintf("seq-key-%s", ulid.Make().String())
+
+		first := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		first.IdempotencyKey = idempotencyKey
+		require.NoError(t, service.CreateEvent(ctx, first))
+		require.False(t, first.IsDuplicateEvent)
+
+		// Second create with the same key and a stale not-duplicate flag must be
+		// flagged duplicate by the claim inside CreateEvent.
+		second := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		second.IdempotencyKey = idempotencyKey
+		require.NoError(t, service.CreateEvent(ctx, second))
+		require.True(t, second.IsDuplicateEvent)
+
+		found, err := service.FindEventByID(ctx, project.UID, second.UID)
+		require.NoError(t, err)
+		require.True(t, found.IsDuplicateEvent)
+	})
+
+	t.Run("ConcurrentDuplicatesYieldOneOriginal", func(t *testing.T) {
+		idempotencyKey := fmt.Sprintf("conc-key-%s", ulid.Make().String())
+
+		const workers = 8
+		eventIDs := make([]string, workers)
+		errs := make([]error, workers)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			event.IdempotencyKey = idempotencyKey
+			eventIDs[i] = event.UID
+
+			wg.Add(1)
+			go func(i int, event *datastore.Event) {
+				defer wg.Done()
+				<-start
+				errs[i] = service.CreateEvent(ctx, event)
+			}(i, event)
+		}
+		close(start)
+		wg.Wait()
+
+		nonDuplicates := 0
+		for i := 0; i < workers; i++ {
+			require.NoError(t, errs[i])
+			found, err := service.FindEventByID(ctx, project.UID, eventIDs[i])
+			require.NoError(t, err)
+			if !found.IsDuplicateEvent {
+				nonDuplicates++
+			}
+		}
+		require.Equal(t, 1, nonDuplicates, "exactly one concurrent create should win the idempotency claim")
+	})
+}
+
+func TestUpdateEventEndpoints(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("UpdateEventEndpoints_Success", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint1 := seedTestEndpoint(t, db, project.UID)
+		endpoint2 := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s, Endpoint1: %s, Endpoint2: %s, Source: %s",
+			project.UID, endpoint1.UID, endpoint2.UID, source.UID)
+
+		event := createTestEvent(t, project.UID, []string{endpoint1.UID}, source.UID)
+		t.Logf("Created event - EventID: %s, Initial endpoints: %v", event.UID, event.Endpoints)
+		require.NoError(t, service.CreateEvent(ctx, event))
+
+		// Verify initial state
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		t.Logf("Event after create - EventID: %s, Endpoints: %v", found.UID, found.Endpoints)
+		require.Len(t, found.Endpoints, 1)
+
+		// Update endpoints
+		newEndpoints := []string{endpoint1.UID, endpoint2.UID}
+		t.Logf("Updating endpoints to: %v", newEndpoints)
+		err = service.UpdateEventEndpoints(ctx, event, newEndpoints)
+		require.NoError(t, err)
+
+		// Verify update
+		found, err = service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		t.Logf("Event after update - EventID: %s, Endpoints: %v", found.UID, found.Endpoints)
+		require.Len(t, found.Endpoints, 2, "Expected 2 endpoints after update, got %d: %v", len(found.Endpoints), found.Endpoints)
+	})
+
+	t.Run("UpdateEventEndpoints_RejectsEmptyEndpointID", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		require.NoError(t, service.CreateEvent(ctx, event))
+
+		err := service.UpdateEventEndpoints(ctx, event, []string{""})
+		require.ErrorIs(t, err, datastore.ErrEventEndpointIDRequired)
+	})
+}
+
+func TestUpdateEventStatus(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("UpdateEventStatus_Success", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		require.NoError(t, service.CreateEvent(ctx, event))
+
+		// Update status
+		newStatus := datastore.ProcessingStatus
+		err := service.UpdateEventStatus(ctx, event, newStatus, "")
+		require.NoError(t, err)
+
+		// Verify update
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Equal(t, newStatus, found.Status)
+		require.Empty(t, found.FailureReason)
+	})
+
+	t.Run("UpdateEventStatus_PersistsFailureReason", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		require.NoError(t, service.CreateEvent(ctx, event))
+
+		reason := "dynamic URL does not match any configured endpoint URL template"
+		require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.FailureStatus, reason))
+
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Equal(t, datastore.FailureStatus, found.Status)
+		require.Equal(t, reason, found.FailureReason)
+	})
+
+	// A retry that succeeds must not keep showing why the previous attempt failed.
+	t.Run("UpdateEventStatus_ClearsStaleFailureReason", func(t *testing.T) {
+		event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		require.NoError(t, service.CreateEvent(ctx, event))
+
+		require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.FailureStatus, "no subscription matched this event"))
+		require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.SuccessStatus, ""))
+
+		found, err := service.FindEventByID(ctx, project.UID, event.UID)
+		require.NoError(t, err)
+		require.Equal(t, datastore.SuccessStatus, found.Status)
+		require.Empty(t, found.FailureReason)
+	})
+}
+
+// Round-trip a row with every mutable column set. Attach keeps the heap; copy
+// unpartition still lists columns and will drop any that are missing from it.
+func TestPartitionEventsTableRoundTripsFailureReason(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+	require.NoError(t, service.CreateEvent(ctx, event))
+
+	reason := "dynamic URL does not match any configured endpoint URL template"
+	require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.FailureStatus, reason))
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+
+	found, err := service.FindEventByID(ctx, project.UID, event.UID)
+	require.NoError(t, err)
+	require.Equal(t, datastore.FailureStatus, found.Status)
+	require.Equal(t, reason, found.FailureReason)
+
+	require.NoError(t, service.UnPartitionEventsTable(ctx))
+
+	found, err = service.FindEventByID(ctx, project.UID, event.UID)
+	require.NoError(t, err)
+	require.Equal(t, datastore.FailureStatus, found.Status)
+	require.Equal(t, reason, found.FailureReason)
+
+	// Writes must still work against the rebuilt table.
+	require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.SuccessStatus, ""))
+	found, err = service.FindEventByID(ctx, project.UID, event.UID)
+	require.NoError(t, err)
+	require.Empty(t, found.FailureReason)
+}
+
+// copy_rows writes acknowledged_at, status and metadata on every tokenization
+// run. Assert the whole mirrored column set survives a round trip.
+func TestPartitionEventsSearchTableRoundTripsMirroredColumns(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+	require.NoError(t, service.CreateEvent(ctx, event))
+
+	reason := "dynamic URL does not match any configured endpoint URL template"
+	require.NoError(t, service.UpdateEventStatus(ctx, event, datastore.FailureStatus, reason))
+
+	require.NoError(t, service.CopyRows(ctx, project.UID, config.DefaultSearchTokenizationInterval))
+
+	requireSearchRow := func(stage string) {
+		t.Helper()
+
+		var status, failureReason string
+		err := db.GetDB().QueryRowx(
+			`SELECT COALESCE(status, ''), COALESCE(failure_reason, '') FROM convoy.events_search WHERE id = $1`,
+			event.UID,
+		).Scan(&status, &failureReason)
+		require.NoError(t, err, stage)
+		require.Equal(t, string(datastore.FailureStatus), status, stage)
+		require.Equal(t, reason, failureReason, stage)
+	}
+
+	requireSearchRow("before partitioning")
+
+	require.NoError(t, service.PartitionEventsSearchTable(ctx))
+	requireSearchRow("after partitioning")
+
+	require.NoError(t, service.UnPartitionEventsSearchTable(ctx))
+	requireSearchRow("after un-partitioning")
+
+	// A non-default interval is the search-policy-change path: it purges the
+	// project's tokenized rows and re-runs copy_rows, which writes
+	// status/metadata/failure_reason and so fails outright if the rebuilt table
+	// lost a column.
+	require.NoError(t, service.CopyRows(ctx, project.UID, config.DefaultSearchTokenizationInterval+1))
+	requireSearchRow("after re-tokenizing")
+}
+
+func TestCountProjectMessages(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	t.Run("CountProjectMessages_Success", func(t *testing.T) {
+		// Create multiple events
+		for i := 0; i < 5; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		count, err := service.CountProjectMessages(ctx, project.UID)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, int64(5))
+	})
+}
+
+func TestCountEvents(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("CountEvents_NoFilter", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s, EndpointID: %s, SourceID: %s", project.UID, endpoint.UID, source.UID)
+
+		// Create test events
+		for i := 0; i < 3; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+			t.Logf("Created event %d - EventID: %s", i+1, event.UID)
+		}
+
+		filter := &datastore.Filter{SearchParams: defaultSearchParams()}
+		count, err := service.CountEvents(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("CountEvents result - ProjectID: %s, Filter: empty, Count: %d, Expected: >=3", project.UID, count)
+		require.GreaterOrEqual(t, count, int64(3), "Expected at least 3 events for project %s, got %d", project.UID, count)
+	})
+
+	t.Run("CountEvents_WithEndpointFilter", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint2 := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s, EndpointID: %s, SourceID: %s", project.UID, endpoint2.UID, source.UID)
+
+		// Create events for endpoint2
+		for i := 0; i < 2; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint2.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+			t.Logf("Created event %d - EventID: %s for EndpointID: %s", i+1, event.UID, endpoint2.UID)
+		}
+
+		filter := &datastore.Filter{
+			EndpointIDs:  []string{endpoint2.UID},
+			SearchParams: defaultSearchParams(),
+		}
+		count, err := service.CountEvents(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("CountEvents result - ProjectID: %s, EndpointFilter: %s, Count: %d, Expected: >=2", project.UID, endpoint2.UID, count)
+		require.GreaterOrEqual(t, count, int64(2), "Expected at least 2 events for endpoint %s, got %d", endpoint2.UID, count)
+	})
+}
+
+func TestLoadEventsPaged(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("LoadEventsPaged_FirstPage_DESC", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		// Create test events with deterministic ordering
+		numEvents := 15
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond) // Ensure unique ULID timestamps
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		events, paginationData, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, events, 5)
+		require.Equal(t, 0, paginationData.PrevRowCount.Count)
+		require.True(t, paginationData.HasNextPage)
+
+		// DESC: first page should have the newest events (highest IDs)
+		for i := 1; i < len(events); i++ {
+			require.Greater(t, events[i-1].UID, events[i].UID, "DESC order: events[%d].UID (%s) should be > events[%d].UID (%s)", i-1, events[i-1].UID, i, events[i].UID)
+		}
+	})
+
+	t.Run("LoadEventsPaged_FirstPage_ASC", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		numEvents := 15
+		eventIDs := make([]string, 0, numEvents)
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond)
+			require.NoError(t, service.CreateEvent(ctx, event))
+			eventIDs = append(eventIDs, event.UID)
+		}
+
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "ASC",
+			},
+		}
+		events, paginationData, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, events, 5)
+		require.Equal(t, 0, paginationData.PrevRowCount.Count)
+		require.True(t, paginationData.HasNextPage)
+
+		// ASC: first page should have the oldest events (lowest IDs)
+		for i := 1; i < len(events); i++ {
+			require.Less(t, events[i-1].UID, events[i].UID, "ASC order: events[%d].UID (%s) should be < events[%d].UID (%s)", i-1, events[i-1].UID, i, events[i].UID)
+		}
+
+		// ASC first page should contain the earliest-created events
+		require.Equal(t, eventIDs[0], events[0].UID, "ASC first page should start with the oldest event")
+	})
+
+	t.Run("LoadEventsPaged_ASC_NextPage", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		numEvents := 15
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		// Page 1 ASC
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "ASC",
+			},
+		}
+		page1, pagination1, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page1, 5)
+		require.True(t, pagination1.HasNextPage)
+
+		// Page 2 ASC
+		filter.Pageable.NextCursor = pagination1.NextPageCursor
+		page2, pagination2, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page2, 5)
+		require.True(t, pagination2.HasNextPage)
+
+		// Page 2 should continue in ASC order after page 1
+		require.Greater(t, page2[0].UID, page1[len(page1)-1].UID,
+			"ASC page 2 first event (%s) should be after page 1 last event (%s)",
+			page2[0].UID, page1[len(page1)-1].UID)
+
+		// Page 2 events should also be in ASC order
+		for i := 1; i < len(page2); i++ {
+			require.Less(t, page2[i-1].UID, page2[i].UID, "ASC order on page 2")
+		}
+
+		// No overlap between pages
+		page1IDs := make(map[string]bool)
+		for _, e := range page1 {
+			page1IDs[e.UID] = true
+		}
+		for _, e := range page2 {
+			require.False(t, page1IDs[e.UID], "Page 2 event %s should not appear on page 1", e.UID)
+		}
+	})
+
+	t.Run("LoadEventsPaged_DESC_BackwardPagination", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		numEvents := 15
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		// First get page 1 DESC
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		page1, pagination1, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page1, 5)
+
+		// Get page 2 DESC
+		filter.Pageable.NextCursor = pagination1.NextPageCursor
+		page2, pagination2, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page2, 5)
+
+		// Go back to page 1 (backward pagination)
+		filter.Pageable.Direction = datastore.Prev
+		filter.Pageable.PrevCursor = pagination2.PrevPageCursor
+		pageBack, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, pageBack, 5)
+
+		// Should get the same events as page 1, in the same DESC order
+		require.Equal(t, page1[0].UID, pageBack[0].UID, "Backward pagination should return to page 1")
+		for i := range page1 {
+			require.Equal(t, page1[i].UID, pageBack[i].UID, "Event %d should match", i)
+		}
+	})
+
+	t.Run("LoadEventsPaged_ASC_BackwardPagination", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		numEvents := 15
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		// Page 1 ASC
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "ASC",
+			},
+		}
+		page1, pagination1, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page1, 5)
+
+		// Page 2 ASC
+		filter.Pageable.NextCursor = pagination1.NextPageCursor
+		page2, pagination2, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, page2, 5)
+
+		// Go back to page 1 (backward pagination with ASC sort)
+		filter.Pageable.Direction = datastore.Prev
+		filter.Pageable.PrevCursor = pagination2.PrevPageCursor
+		pageBack, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		require.Len(t, pageBack, 5)
+
+		// Should get the same events as page 1, in the same ASC order
+		require.Equal(t, page1[0].UID, pageBack[0].UID, "ASC backward pagination should return to page 1")
+		for i := range page1 {
+			require.Equal(t, page1[i].UID, pageBack[i].UID, "ASC event %d should match", i)
+		}
+	})
+
+	t.Run("LoadEventsPaged_ASC_vs_DESC_reversed", func(t *testing.T) {
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		numEvents := 5
+		for i := 0; i < numEvents; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			time.Sleep(1 * time.Millisecond)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+
+		// Get all events DESC
+		filterDESC := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		descEvents, _, err := service.LoadEventsPaged(ctx, project.UID, filterDESC)
+		require.NoError(t, err)
+		require.Len(t, descEvents, numEvents)
+
+		// Get all events ASC
+		filterASC := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "ASC",
+			},
+		}
+		ascEvents, _, err := service.LoadEventsPaged(ctx, project.UID, filterASC)
+		require.NoError(t, err)
+		require.Len(t, ascEvents, numEvents)
+
+		// ASC and DESC should return the same events in reversed order
+		for i := 0; i < numEvents; i++ {
+			require.Equal(t, descEvents[i].UID, ascEvents[numEvents-1-i].UID,
+				"DESC[%d] (%s) should equal ASC[%d] (%s)",
+				i, descEvents[i].UID, numEvents-1-i, ascEvents[numEvents-1-i].UID)
+		}
+	})
+
+	t.Run("LoadEventsPaged_WithEndpointFilter", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint2 := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s, EndpointID: %s", project.UID, endpoint2.UID)
+
+		// Create events for endpoint2
+		eventIDs := []string{}
+		for i := 0; i < 3; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint2.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+			eventIDs = append(eventIDs, event.UID)
+		}
+		t.Logf("Created 3 events for endpoint2: %v", eventIDs)
+
+		filter := &datastore.Filter{
+			EndpointIDs:  []string{endpoint2.UID},
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		t.Logf("Calling LoadEventsPaged with EndpointFilter: %s", endpoint2.UID)
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("LoadEventsPaged result - Events count: %d", len(events))
+		require.GreaterOrEqual(t, len(events), 3, "Expected at least 3 events, got %d", len(events))
+
+		// Verify all events belong to endpoint2
+		for _, event := range events {
+			require.Contains(t, event.Endpoints, endpoint2.UID)
+		}
+	})
+
+	t.Run("LoadEventsPaged_WithSourceFilter", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source2 := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s, SourceID: %s", project.UID, source2.UID)
+
+		// Create events for source2
+		eventIDs := []string{}
+		for i := 0; i < 3; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source2.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+			eventIDs = append(eventIDs, event.UID)
+		}
+		t.Logf("Created 3 events for source2: %v", eventIDs)
+
+		filter := &datastore.Filter{
+			SourceID:     source2.UID,
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		t.Logf("Calling LoadEventsPaged with SourceFilter: %s", source2.UID)
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("LoadEventsPaged result - Events count: %d", len(events))
+		require.GreaterOrEqual(t, len(events), 3, "Expected at least 3 events, got %d", len(events))
+
+		// Verify all events belong to source2
+		for _, event := range events {
+			require.Equal(t, source2.UID, event.SourceID)
+		}
+	})
+
+	t.Run("LoadEventsPaged_WithDateRangeFilter", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s", project.UID)
+
+		// Create events
+		for i := 0; i < 5; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+		t.Logf("Created 5 events")
+
+		// Capture timestamps AFTER creating events to ensure events are within range
+		// Add 1 second buffer to account for fractional seconds lost in Unix() conversion
+		now := time.Now().Add(1 * time.Second)
+		yesterday := now.Add(-24 * time.Hour)
+
+		filter := &datastore.Filter{
+			SearchParams: datastore.SearchParams{
+				CreatedAtStart: yesterday.Unix(),
+				CreatedAtEnd:   now.Unix(),
+			},
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		t.Logf("Calling LoadEventsPaged with DateRange: %s (Unix: %d) to %s (Unix: %d)",
+			yesterday, yesterday.Unix(), now, now.Unix())
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("LoadEventsPaged result - Events count: %d", len(events))
+		require.NotEmpty(t, events, "Expected events in date range, got 0")
+
+		// Verify all events are within date range
+		for _, event := range events {
+			require.True(t, event.CreatedAt.After(yesterday) || event.CreatedAt.Equal(yesterday))
+			require.True(t, event.CreatedAt.Before(now) || event.CreatedAt.Equal(now))
+		}
+	})
+
+	t.Run("LoadEventsPaged_EmptyResult", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+
+		t.Logf("Test setup - ProjectID: %s (no events created)", project.UID)
+		nonExistentEndpoint := ulid.Make().String()
+		filter := &datastore.Filter{
+			EndpointIDs:  []string{nonExistentEndpoint},
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   10,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		t.Logf("Calling LoadEventsPaged with non-existent endpoint: %s", nonExistentEndpoint)
+		events, paginationData, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("LoadEventsPaged result - Events count: %d (expected 0)", len(events))
+		require.Empty(t, events)
+		require.False(t, paginationData.HasNextPage)
+		require.Equal(t, 0, paginationData.PrevRowCount.Count)
+	})
+
+	t.Run("LoadEventsPaged_ExistsPath_NoSearchQuery", func(t *testing.T) {
+		// Create isolated project for this test
+		project := seedTestProject(t, db)
+		endpoint := seedTestEndpoint(t, db, project.UID)
+		source := seedTestSource(t, db, project.UID)
+
+		t.Logf("Test setup - ProjectID: %s", project.UID)
+
+		// Create events
+		for i := 0; i < 5; i++ {
+			event := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+			require.NoError(t, service.CreateEvent(ctx, event))
+		}
+		t.Logf("Created 5 events")
+		// This should use EXISTS path (no search query)
+		filter := &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable: datastore.Pageable{
+				PerPage:   5,
+				Direction: datastore.Next,
+				Sort:      "DESC",
+			},
+		}
+		// Empty filter.Query means EXISTS path will be used
+		t.Logf("Calling LoadEventsPaged with empty query (EXISTS path)")
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, filter)
+		require.NoError(t, err)
+		t.Logf("LoadEventsPaged result - Events count: %d (expected at least 1)", len(events))
+		require.NotEmpty(t, events, "Expected events using EXISTS path, got 0")
+	})
+}
+
+func TestCopyRows(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+
+	t.Run("CopyRows_Success", func(t *testing.T) {
+		err := service.CopyRows(ctx, project.UID, 1000)
+		require.NoError(t, err)
+	})
+}
+
+func TestPartitionEventsTableAdoptsTheExistingTable(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	var original int64
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events'`).Scan(&original))
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+
+	var adopted int64
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events_default'`).Scan(&adopted))
+	require.Equal(t, original, adopted, "the adopted partition has a different relfilenode, so the table was rewritten, not attached")
+}
+
+func TestPartitionEventsSearchTableAdoptsTheExistingTable(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	_, err := db.GetDB().ExecContext(ctx, `
+        INSERT INTO convoy.events_search (id, event_type, project_id, raw, data, url_path)
+        VALUES ($1, 'test.event', $2, '{}', '{}'::bytea, '/')`, ulid.Make().String(), project.UID)
+	require.NoError(t, err)
+
+	var original int64
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events_search'`).Scan(&original))
+
+	require.NoError(t, service.PartitionEventsSearchTable(ctx))
+
+	var adopted int64
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events_search_default'`).Scan(&adopted))
+	require.Equal(t, original, adopted, "the adopted partition has a different relfilenode, so the table was rewritten, not attached")
+}
+
+// Copy-unpartition creates events_search_new with PRIMARY KEY, then renames the
+// table. RENAME TABLE keeps the constraint name, so the heap's PK is
+// events_search_new_pkey. Swap used to drop only events_search_pkey and then
+// failed with "multiple primary keys for table events_search_default".
+func TestPartitionEventsSearchTableDropsCopyUnpartitionPrimaryKey(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	var current string
+	require.NoError(t, db.GetDB().QueryRowContext(ctx, `
+        SELECT con.conname
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events_search' AND con.contype = 'p'`).Scan(&current))
+
+	_, err := db.GetDB().ExecContext(ctx, `ALTER TABLE convoy.events_search RENAME CONSTRAINT `+current+` TO events_search_new_pkey`)
+	require.NoError(t, err)
+
+	require.NoError(t, service.PartitionEventsSearchTable(ctx))
+
+	var kind string
+	require.NoError(t, db.GetDB().QueryRowContext(ctx, `
+        SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events_search'`).Scan(&kind))
+	require.Equal(t, "p", kind, "attach after a copy-unpartition PK name should still convert")
+}
+
+func TestPartitionFunctions(t *testing.T) {
+	service, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	t.Run("PartitionEventsTable", func(t *testing.T) {
+		err := service.PartitionEventsTable(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("UnPartitionEventsTable", func(t *testing.T) {
+		err := service.UnPartitionEventsTable(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("PartitionEventsSearchTable", func(t *testing.T) {
+		err := service.PartitionEventsSearchTable(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("UnPartitionEventsSearchTable", func(t *testing.T) {
+		err := service.UnPartitionEventsSearchTable(ctx)
+		require.NoError(t, err)
+	})
+}
+
+// Unpartitioning events restores event_deliveries_event_id_fkey, which is the
+// enforcement event_fk_check stood in for while events was partitioned. The
+// trigger must go, or every delivery insert pays a second existence query and a
+// violation is reported by whichever of the two fires first.
+func TestUnPartitionEventsTableRemovesTheStandInTrigger(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+	require.NoError(t, service.UnPartitionEventsTable(ctx))
+
+	var triggers int
+	require.NoError(t, db.GetDB().QueryRowContext(ctx, `
+        SELECT count(*)
+        FROM pg_catalog.pg_trigger t
+        JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy'
+          AND c.relname = 'event_deliveries'
+          AND t.tgname = 'event_fk_check'`).Scan(&triggers))
+	require.Zero(t, triggers, "event_fk_check outlived the constraint it stood in for")
+
+	var constraints int
+	require.NoError(t, db.GetDB().QueryRowContext(ctx, `
+        SELECT count(*)
+        FROM pg_catalog.pg_constraint
+        WHERE conname = 'event_deliveries_event_id_fkey'`).Scan(&constraints))
+	require.NotZero(t, constraints, "dropping the trigger left no event-id enforcement at all")
+}
+
+func dropAdoptedBounds(t *testing.T, db database.Database, table string) {
+	t.Helper()
+	_, err := db.GetDB().ExecContext(context.Background(),
+		fmt.Sprintf(`ALTER TABLE convoy.%[1]s_default DROP CONSTRAINT %[1]s_default_bounds`, table))
+	require.NoError(t, err)
+}
+
+func relationKind(t *testing.T, db database.Database, table string) string {
+	t.Helper()
+	var kind string
+	require.NoError(t, db.GetDB().QueryRowContext(context.Background(), `
+        SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = $1`, table).Scan(&kind))
+	return kind
+}
+
+func countTrigger(t *testing.T, db database.Database, table, name string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.GetDB().QueryRowContext(context.Background(), `
+        SELECT count(*)
+        FROM pg_catalog.pg_trigger t
+        JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = $1 AND t.tgname = $2`,
+		table, name).Scan(&n))
+	return n
+}
+
+// Retention can drop the adopted _default while the parent stays partitioned.
+// Revert then copies. Copy used to ADD event_deliveries_event_id_fkey on the
+// deliveries parent, which Postgres rejects when that table is partitioned.
+func TestUnPartitionEventsTableCopyWhileDeliveriesArePartitioned(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	require.NoError(t, event_deliveries.New(log.New("convoy", log.LevelError), db).PartitionEventDeliveriesTable(ctx))
+	require.NoError(t, service.PartitionEventsTable(ctx))
+	dropAdoptedBounds(t, db, "events")
+
+	require.NoError(t, service.UnPartitionEventsTable(ctx))
+	require.Equal(t, "r", relationKind(t, db, "events"))
+	require.NotZero(t, countTrigger(t, db, "event_deliveries", "event_fk_check"),
+		"copy-unpartition dropped the stand-in while event_deliveries is still partitioned")
+	require.Zero(t, countNamedConstraint(t, db, "event_deliveries", "event_deliveries_event_id_fkey"),
+		"copy-unpartition installed a real event FK on a partitioned event_deliveries")
+}
+
+// Same copy path, but event_deliveries is still a heap. AfterDetach has to
+// put the real FK back; the copy SQL no longer does.
+func TestUnPartitionEventsTableCopyRestoresEventFK(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+	dropAdoptedBounds(t, db, "events")
+
+	require.NoError(t, service.UnPartitionEventsTable(ctx))
+	require.Equal(t, "r", relationKind(t, db, "events"))
+	require.Zero(t, countTrigger(t, db, "event_deliveries", "event_fk_check"),
+		"copy-unpartition left the stand-in after both tables are heaps")
+	require.NotZero(t, countNamedConstraint(t, db, "event_deliveries", "event_deliveries_event_id_fkey"),
+		"copy-unpartition left no event-id enforcement")
+}
+
+// Operators convert tables one at a time. After event_deliveries is attached,
+// event_deliveries_event_id_fkey lives on the adopted child. Dropping it only
+// from the parent name leaves a stale FK that still points at events_default
+// after events is converted, and blocks retention from dropping that child.
+func TestPartitionEventsTableDropsAdoptedDeliveryFK(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	require.NoError(t, event_deliveries.New(log.New("convoy", log.LevelError), db).PartitionEventDeliveriesTable(ctx))
+
+	require.Equal(t, 1, countNamedConstraint(t, db, "event_deliveries_default", "event_deliveries_event_id_fkey"),
+		"precondition: attach left the event FK on the adopted child")
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+
+	require.Zero(t, countNamedConstraint(t, db, "event_deliveries_default", "event_deliveries_event_id_fkey"),
+		"partitioning events left the event FK on event_deliveries_default")
+}
+
+func countNamedConstraint(t *testing.T, db database.Database, table, name string) int {
+	t.Helper()
+
+	var n int
+	require.NoError(t, db.GetDB().QueryRowContext(context.Background(), `
+        SELECT count(*)
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace ns ON ns.oid = c.relnamespace
+        WHERE ns.nspname = 'convoy' AND c.relname = $1 AND con.conname = $2`,
+		table, name).Scan(&n))
+	return n
+}
+
+func TestPartitionEventsTablesNameForRetention(t *testing.T) {
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+	require.NoError(t, service.CreateEvent(ctx, createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)))
+
+	require.NoError(t, service.PartitionEventsTable(ctx))
+	testenv.RequirePartitionsAddressableByRetention(t, db, "events", project.UID)
+
+	// The partition helpers only create children for days that already hold rows,
+	// and no application write path in this package populates events_search, so
+	// seed it directly rather than leaving the second naming site uncovered.
+	_, err := db.GetDB().ExecContext(ctx, `
+        INSERT INTO convoy.events_search (id, event_type, project_id, raw, data, url_path)
+        VALUES ($1, 'test.event', $2, '{}', '{}'::bytea, '/')`, ulid.Make().String(), project.UID)
+	require.NoError(t, err)
+
+	require.NoError(t, service.PartitionEventsSearchTable(ctx))
+	testenv.RequirePartitionsAddressableByRetention(t, db, "events_search", project.UID)
+}
+
+func TestEventsPagedInnerDesc(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, eventsPagedInnerDesc("DESC", "next"))
+	require.True(t, eventsPagedInnerDesc("ASC", "prev"))
+	require.False(t, eventsPagedInnerDesc("ASC", "next"))
+	require.False(t, eventsPagedInnerDesc("DESC", "prev"))
+}
+
+func eventsTableKind(t *testing.T, ctx context.Context, db database.Database) string {
+	t.Helper()
+
+	var kind string
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'convoy' AND c.relname = 'events'`).Scan(&kind))
+	return kind
+}
+
+func eventRelation(t *testing.T, ctx context.Context, db database.Database, eventID string) string {
+	t.Helper()
+
+	var name string
+	require.NoError(t, db.GetDB().QueryRowxContext(ctx, `
+        SELECT tableoid::regclass::text FROM convoy.events WHERE id = $1`, eventID).Scan(&name))
+	return name
+}
+
+func TestLoadEventsPaged_PayloadContainment(t *testing.T) {
+	t.Run("heap", func(t *testing.T) {
+		runLoadEventsPagedPayloadContainment(t, false)
+	})
+	t.Run("partitioned", func(t *testing.T) {
+		runLoadEventsPagedPayloadContainment(t, true)
+	})
+}
+
+func runLoadEventsPagedPayloadContainment(t *testing.T, partition bool) {
+	t.Helper()
+
+	service, db := setupTestDB(t)
+	ctx := context.Background()
+
+	project := seedTestProject(t, db)
+	endpoint := seedTestEndpoint(t, db, project.UID)
+	source := seedTestSource(t, db, project.UID)
+
+	flat := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+	flat.Raw = `{"status":"paid","amount":10}`
+	flat.Data = json.RawMessage(`{"status":"paid","amount":10}`)
+	require.NoError(t, service.CreateEvent(ctx, flat))
+
+	nested := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+	nested.Raw = `{"data":{"status":"paid"}}`
+	nested.Data = json.RawMessage(`{"data":{"status":"paid"}}`)
+	require.NoError(t, service.CreateEvent(ctx, nested))
+
+	noEndpoints := createTestEvent(t, project.UID, nil, source.UID)
+	noEndpoints.EventType = "test-event-searchable"
+	noEndpoints.Raw = `{"unique_search_term":"test12345"}`
+	noEndpoints.Data = json.RawMessage(`{"unique_search_term":"test12345"}`)
+	require.NoError(t, service.CreateEvent(ctx, noEndpoints))
+	require.NoError(t, service.UpdateEventStatus(ctx, noEndpoints, datastore.FailureStatus, "no subscription matched this event"))
+
+	if partition {
+		require.NoError(t, service.PartitionEventsTable(ctx))
+		require.Equal(t, "p", eventsTableKind(t, ctx, db))
+		require.Contains(t, eventRelation(t, ctx, db, flat.UID), "events_default")
+	} else {
+		require.Equal(t, "r", eventsTableKind(t, ctx, db))
+	}
+
+	pageable := datastore.Pageable{PerPage: 20, Direction: datastore.Next, Sort: "DESC"}
+
+	t.Run("hits flat key", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body:         json.RawMessage(`{"status":"paid"}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, flat.UID, events[0].UID)
+	})
+
+	t.Run("nested path misses a flat body", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body:         json.RawMessage(`{"data":{"status":"paid"}}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, nested.UID, events[0].UID)
+	})
+
+	t.Run("empty body does not filter", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 3)
+	})
+
+	t.Run("two-key json containment hits flat", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body:         json.RawMessage(`{"status":"paid","amount":10}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, flat.UID, events[0].UID)
+	})
+
+	t.Run("two-key json misses wrong amount", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body:         json.RawMessage(`{"status":"paid","amount":99}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Empty(t, events)
+	})
+
+	t.Run("mix and hits matching type and body", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Query:        "test.event",
+			Body:         json.RawMessage(`{"status":"paid"}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, flat.UID, events[0].UID)
+	})
+
+	t.Run("mix and misses wrong type", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Query:        "nope.event",
+			Body:         json.RawMessage(`{"status":"paid"}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Empty(t, events)
+	})
+
+	t.Run("no endpoints payload and failure reason", func(t *testing.T) {
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body:         json.RawMessage(`{"unique_search_term":"test12345"}`),
+			SearchParams: defaultSearchParams(),
+			Pageable:     pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, noEndpoints.UID, events[0].UID)
+		require.Equal(t, "no subscription matched this event", events[0].FailureReason)
+	})
+
+	if !partition {
+		return
+	}
+
+	t.Run("hits row on a forward daily partition", func(t *testing.T) {
+		after := createTestEvent(t, project.UID, []string{endpoint.UID}, source.UID)
+		after.Raw = `{"status":"paid","post_partition":true}`
+		after.Data = json.RawMessage(`{"status":"paid","post_partition":true}`)
+		require.NoError(t, service.CreateEvent(ctx, after))
+
+		// CreateEvent leaves created_at as now(), which still belongs to the
+		// adopted default. Move the row onto a pre-made forward day so search
+		// is proven on both children, not only events_default.
+		forwardAt := attach.Cutoff(time.Now()).Add(time.Hour)
+		_, err := db.GetDB().ExecContext(ctx, `
+            UPDATE convoy.events SET created_at = $1 WHERE id = $2 AND project_id = $3`,
+			forwardAt, after.UID, project.UID)
+		require.NoError(t, err)
+		require.NotContains(t, eventRelation(t, ctx, db, after.UID), "events_default")
+
+		events, _, err := service.LoadEventsPaged(ctx, project.UID, &datastore.Filter{
+			Body: json.RawMessage(`{"post_partition":true}`),
+			SearchParams: datastore.SearchParams{
+				CreatedAtStart: time.Now().Add(-24 * time.Hour).Unix(),
+				CreatedAtEnd:   forwardAt.Add(24 * time.Hour).Unix(),
+			},
+			Pageable: pageable,
+		})
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, after.UID, events[0].UID)
+	})
+}

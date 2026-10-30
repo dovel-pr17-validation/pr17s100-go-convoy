@@ -1,0 +1,103 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy/auth"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/util"
+)
+
+type OrganisationMemberService struct {
+	orgMemberRepo datastore.OrganisationMemberRepository
+	licenser      license.Licenser
+	logger        log.Logger
+}
+
+func NewOrganisationMemberService(orgMemberRepo datastore.OrganisationMemberRepository, licenser license.Licenser, logger log.Logger) *OrganisationMemberService {
+	return &OrganisationMemberService{orgMemberRepo: orgMemberRepo, licenser: licenser, logger: logger}
+}
+
+func (om *OrganisationMemberService) CreateOrganisationMember(ctx context.Context, org *datastore.Organisation, user *datastore.User, role *auth.Role) (*datastore.OrganisationMember, error) {
+	// Only override to RoleInstanceAdmin if not in multi-user mode AND role is not already RoleInstanceAdmin
+	// MultiPlayerMode is redundant - user limits handle this
+	isMultiUser, err := om.licenser.IsMultiUserMode(ctx)
+	if err == nil && !isMultiUser && role.Type != auth.RoleInstanceAdmin {
+		role.Type = auth.RoleInstanceAdmin
+	}
+
+	err = role.Validate("organisation member")
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to validate organisation member role update", "error", err)
+		return nil, util.NewServiceError(http.StatusBadRequest, err)
+	}
+
+	member := &datastore.OrganisationMember{
+		UID:            ulid.Make().String(),
+		OrganisationID: org.UID,
+		UserID:         user.UID,
+		Role:           *role,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	err = om.orgMemberRepo.CreateOrganisationMember(ctx, member)
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to create organisation member", "error", err)
+		return nil, util.NewServiceError(http.StatusBadRequest, errors.New("failed to create organisation member"))
+	}
+
+	return member, nil
+}
+
+func (om *OrganisationMemberService) UpdateOrganisationMember(ctx context.Context, organisationMember *datastore.OrganisationMember, role *auth.Role) (*datastore.OrganisationMember, error) {
+	organisationMember.UpdatedAt = time.Now()
+	organisationMember.Role = *role
+
+	// Only override to RoleInstanceAdmin if not in multi-user mode AND role is not already RoleInstanceAdmin
+	// MultiPlayerMode is redundant - user limits handle this
+	isMultiUser, err := om.licenser.IsMultiUserMode(ctx)
+	if err == nil && !isMultiUser && organisationMember.Role.Type != auth.RoleInstanceAdmin {
+		organisationMember.Role.Type = auth.RoleInstanceAdmin
+	}
+
+	err = organisationMember.Role.Validate("organisation member")
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to validate organisation member role update", "error", err)
+		return nil, util.NewServiceError(http.StatusBadRequest, err)
+	}
+
+	err = om.orgMemberRepo.UpdateOrganisationMember(ctx, organisationMember)
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to to update organisation member", "error", err)
+		return nil, util.NewServiceError(http.StatusBadRequest, errors.New("failed to update organisation member"))
+	}
+
+	return organisationMember, nil
+}
+
+func (om *OrganisationMemberService) DeleteOrganisationMember(ctx context.Context, memberID string, org *datastore.Organisation) error {
+	member, err := om.orgMemberRepo.FetchOrganisationMemberByID(ctx, memberID, org.UID)
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to find organisation member by id", "error", err)
+		return util.NewServiceError(http.StatusBadRequest, errors.New("failed to find organisation member by id"))
+	}
+
+	if member.UserID == org.OwnerID {
+		return util.NewServiceError(http.StatusForbidden, errors.New("cannot deactivate organisation owner"))
+	}
+
+	err = om.orgMemberRepo.DeleteOrganisationMember(ctx, memberID, org.UID)
+	if err != nil {
+		om.logger.ErrorContext(ctx, "failed to delete organisation member", "error", err)
+		return util.NewServiceError(http.StatusBadRequest, errors.New("failed to delete organisation member"))
+	}
+	return err
+}

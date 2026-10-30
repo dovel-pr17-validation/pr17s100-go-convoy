@@ -1,0 +1,83 @@
+<div class="w-full">
+  @if (isLoading) {
+    <div class="flex justify-between h-100px">
+      @for (size of loaderSizes; track $index) {
+        <div class="loader mr-2px last-of-type:mr-0 flex items-end relative w-full h-full">
+          <div class="min-h-[4px] w-full bg-new.surface-muted rounded-4px animate-pulse hover:cursor-pointer transition-all duration-300" [ngStyle]="{ height: size + 'px' }"></div>
+        </div>
+      }
+    </div>
+  }
+
+  @if (!isLoading) {
+    <div class="flex gap-x-1 justify-end">
+      @for (data of paginatedData; track $index; let i = $index) {
+        <div class="mr-2px last-of-type:mr-0 w-full group">
+          <div class="flex items-end h-100px hover:cursor-pointer">
+            <div [class]="data.data > 0 ? 'bg-new.primary-100 bg-opacity-70 rounded-tl-8px rounded-tr-8px' : 'bg-new.surface-muted rounded-4px group-hover:bg-new.text-secondary'" class="min-h-[4px] w-full transition-all duration-300 relative" [ngStyle]="{ height: data.size }">
+              <div
+							class="
+								absolute
+								opacity-0
+								group-hover:opacity-100 group-focus-within:opacity-100 group-focus:opacity-100 group-hover:pointer-events-auto group-focus-within:pointer-events-auto group-focus:pointer-events-auto
+								pointer-events-none
+								transition-all
+								duration-300
+								bg-white-100
+								shadow-[0px_8px_8px_rgba(50,50,71,0.08),0px_8px_16px_rgba(50,50,71,0.06)]
+								rounded-12px
+								w-120px
+								px-14px
+								py-8px
+								bottom-[calc(100%+8px)]
+								left-1/2
+								-translate-x-1/2
+								z-10
+								before:content-['']
+								before:left-1/2
+								before:-translate-x-1/2
+								before:border-[3px] before:border-white-100
+								before:absolute
+								before:-bottom-[20px]
+								before:rounded-12px
+								before:shadow-[0px_2.66667px_2.66667px_rgba(50,50,71,0.06),0px_2.66667px_5.33333px_rgba(50,50,71,0.06)]
+								before:h-12px
+								before:w-12px
+								before:bg-new.primary-100
+								after:content-['']
+								after:absolute
+								after:-bottom-[20px]
+								after:left-1/2
+								after:-translate-x-1/2
+								after:border-[12px] after:border-t-white-100 after:border-b-transparent after:border-x-transparent
+								after:outline-1 after:outline-new.border
+							"
+                [ngClass]="{ 'before:hidden': data.data === 0 }"
+                >
+                <h3 class="font-heading font-medium text-[12px] text-new.text-primary">{{ data.label }}</h3>
+                <p class="font-body text-[12px] text-new.text-secondary">Events: {{ data.data | number }}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      }
+    </div>
+    <div class="line flex items-center justify-between mt-14px border-t border-new.border pt-4px">
+      <div class="font-body text-[10px] text-new.text-secondary">{{ paginatedData[0].label }}</div>
+      <div class="font-body text-[10px] text-new.text-secondary">{{ paginatedData[15].label }}</div>
+      <div class="font-body text-[10px] text-new.text-secondary">{{ paginatedData[paginatedData.length - 1].label }}</div>
+    </div>
+    <div class="flex items-center justify-end gap-12px mt-16px" [class]="pages === 1 ? 'hidden' : 'flex'">
+      <button type="button" class="w-32px h-32px flex items-center justify-center rounded-full border border-new.border bg-white-100 transition-all hover:bg-new.surface-subtle disabled:opacity-40 disabled:pointer-events-none" [disabled]="pageNumber === 1" (click)="prevPage()" aria-label="Previous">
+        <svg width="16" height="16" class="fill-new.text-secondary">
+          <use xlink:href="#arrow-left-icon"></use>
+        </svg>
+      </button>
+      <button type="button" class="w-32px h-32px flex items-center justify-center rounded-full border border-new.border bg-white-100 transition-all hover:bg-new.surface-subtle disabled:opacity-40 disabled:pointer-events-none" [disabled]="pageNumber === pages" (click)="nextPage()" aria-label="Next">
+        <svg width="16" height="16" class="fill-new.text-secondary">
+          <use xlink:href="#arrow-right-icon"></use>
+        </svg>
+      </button>
+    </div>
+  }
+</div>

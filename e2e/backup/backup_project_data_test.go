@@ -1,0 +1,538 @@
+package backup
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/require"
+
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/configuration"
+	"github.com/frain-dev/convoy/internal/endpoints"
+	"github.com/frain-dev/convoy/internal/organisations"
+	"github.com/frain-dev/convoy/internal/projects"
+	log "github.com/frain-dev/convoy/pkg/logger"
+)
+
+func TestE2E_BackupProjectData_MinIO(t *testing.T) {
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Get MinIO client from test infrastructure
+	minioClient, minioEndpoint, err := (*infra.NewMinIOClient)(t)
+	require.NoError(t, err, "failed to create MinIO client")
+
+	// Create unique bucket for test isolation
+	bucket := createTestMinioBucket(t, minioClient)
+
+	db := env.App.DB
+	_ = env.Organisation
+	project := env.Project
+
+	_ = createMinIOConfigWithBucket(t, db, ctx, minioEndpoint, bucket)
+
+	// Seed an endpoint
+	endpoint := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project.UID,
+		OwnerID:   project.UID,
+		Url:       "https://example.com/webhook",
+		Name:      "Test Endpoint",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	endpointRepo := endpoints.New(log.New("convoy", log.LevelInfo), db)
+	err = endpointRepo.CreateEndpoint(ctx, endpoint, project.UID)
+	require.NoError(t, err)
+
+	// Create old data (26 hours old - should be exported)
+	oldEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint, 0)
+
+	// Create recent data (12 hours old - should NOT be exported)
+	recentEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	recentDelivery := seedOldEventDelivery(t, db, ctx, recentEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, recentDelivery, endpoint, 0)
+
+	// Run export
+	runExport(t, env)
+
+	// List objects in MinIO
+	objects := listMinIOObjects(t, minioClient, bucket, "backup/")
+	require.GreaterOrEqual(t, len(objects), 3, "should have at least 3 export files")
+
+	// Find and verify events export
+	eventsObj := findObject(objects, "events")
+	require.NotNil(t, eventsObj, "should have events export in MinIO")
+
+	eventsData := downloadMinIOObject(t, minioClient, bucket, eventsObj.Key)
+	events := parseJSONL(t, eventsData)
+	require.GreaterOrEqual(t, len(events), 1, "should have at least 1 old event exported")
+	require.True(t, containsUID(events, oldEvent.UID), "exported events should contain the old event")
+
+	// Verify time filtering and project isolation for events
+	verifyTimeFiltering(t, eventsData)
+
+	// Find and verify event deliveries export
+	deliveriesObj := findObject(objects, "eventdeliveries")
+	require.NotNil(t, deliveriesObj, "should have event deliveries export in MinIO")
+
+	deliveriesData := downloadMinIOObject(t, minioClient, bucket, deliveriesObj.Key)
+	deliveries := parseJSONL(t, deliveriesData)
+	require.GreaterOrEqual(t, len(deliveries), 1, "should have at least 1 old event delivery exported")
+	require.True(t, containsUID(deliveries, oldDelivery.UID), "exported deliveries should contain the old delivery")
+
+	verifyTimeFiltering(t, deliveriesData)
+
+	// Find and verify delivery attempts export
+	attemptsObj := findObject(objects, "deliveryattempts")
+	require.NotNil(t, attemptsObj, "should have delivery attempts export in MinIO")
+
+	attemptsData := downloadMinIOObject(t, minioClient, bucket, attemptsObj.Key)
+	attempts := parseJSONL(t, attemptsData)
+	require.GreaterOrEqual(t, len(attempts), 1, "should have at least 1 old delivery attempt exported")
+
+	verifyTimeFiltering(t, attemptsData)
+}
+
+func TestE2E_BackupProjectData_OnPrem(t *testing.T) {
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Create temporary directory for OnPrem exports
+	tmpDir := t.TempDir()
+
+	// Get database and repositories
+	db := env.App.DB
+	logger := log.New("convoy", log.LevelInfo)
+	configRepo := configuration.New(logger, db)
+
+	// Create organization and project
+	project := env.Project
+
+	// Create OnPrem storage configuration
+	_ = createOnPremConfig(t, db, ctx, tmpDir)
+
+	// Verify configuration was created correctly
+	loadedConfig, err := configRepo.LoadConfiguration(ctx)
+	require.NoError(t, err, "should load configuration")
+	require.NotNil(t, loadedConfig, "configuration should not be nil")
+	require.NotNil(t, loadedConfig.RetentionPolicy, "retention policy should not be nil")
+	require.True(t, loadedConfig.WebhookArchiving.Enabled, "retention policy should be enabled")
+
+	// Seed an endpoint
+	endpoint := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project.UID,
+		OwnerID:   project.UID,
+		Url:       "https://example.com/webhook",
+		Name:      "Test Endpoint",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	endpointRepo := endpoints.New(log.New("convoy", log.LevelInfo), db)
+	err = endpointRepo.CreateEndpoint(ctx, endpoint, project.UID)
+	require.NoError(t, err)
+
+	// Create old data (26 hours old - should be exported)
+	oldEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint, 0)
+
+	// Create recent data (12 hours old - should NOT be exported)
+	recentEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	recentDelivery := seedOldEventDelivery(t, db, ctx, recentEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, recentDelivery, endpoint, 0)
+
+	// Run export
+	runExport(t, env)
+
+	// Verify export files were created
+	eventsFiles := findExportFiles(t, tmpDir, "events")
+	require.NotEmpty(t, eventsFiles, "should have 1 events export file")
+
+	deliveriesFiles := findExportFiles(t, tmpDir, "eventdeliveries")
+	require.NotEmpty(t, deliveriesFiles, "should have 1 event deliveries export file")
+
+	attemptsFiles := findExportFiles(t, tmpDir, "deliveryattempts")
+	require.NotEmpty(t, attemptsFiles, "should have 1 delivery attempts export file")
+
+	// Verify events export content
+	eventsData := readExportFile(t, eventsFiles[0])
+	events := parseJSONL(t, eventsData)
+	require.GreaterOrEqual(t, len(events), 1, "should have at least 1 old event exported")
+	require.True(t, containsUID(events, oldEvent.UID), "exported events should contain the old event")
+
+	// Verify time filtering - all events should be older than 24 hours
+	verifyTimeFiltering(t, eventsData)
+
+	// Verify event deliveries export content
+	deliveriesData := readExportFile(t, deliveriesFiles[0])
+	deliveries := parseJSONL(t, deliveriesData)
+	require.GreaterOrEqual(t, len(deliveries), 1, "should have at least 1 old event delivery exported")
+	require.True(t, containsUID(deliveries, oldDelivery.UID), "exported deliveries should contain the old delivery")
+
+	verifyTimeFiltering(t, deliveriesData)
+
+	// Verify delivery attempts export content
+	attemptsData := readExportFile(t, attemptsFiles[0])
+	attempts := parseJSONL(t, attemptsData)
+	require.GreaterOrEqual(t, len(attempts), 1, "should have at least 1 old delivery attempt exported")
+
+	verifyTimeFiltering(t, attemptsData)
+}
+
+func TestE2E_BackupProjectData_MultiTenant(t *testing.T) {
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Create temporary directory for OnPrem exports
+	tmpDir := t.TempDir()
+
+	// Get database and repositories
+	db := env.App.DB
+	logger := log.New("convoy", log.LevelInfo)
+	projectRepo := projects.New(logger, db)
+	endpointRepo := endpoints.New(logger, db)
+	orgService := organisations.New(logger, db)
+
+	// Create first organization and project
+	_ = env.Organisation
+	project1 := env.Project
+	user := env.User
+
+	// Create second organization and project
+	org2 := &datastore.Organisation{
+		UID:       ulid.Make().String(),
+		OwnerID:   user.UID,
+		Name:      "Test Org 2",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	err := orgService.CreateOrganisation(ctx, org2)
+	require.NoError(t, err)
+
+	project2 := &datastore.Project{
+		UID:            ulid.Make().String(),
+		Name:           "Test Project 2",
+		OrganisationID: org2.UID,
+		Type:           datastore.IncomingProject,
+		Config:         &datastore.DefaultProjectConfig,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	err = projectRepo.CreateProject(ctx, project2)
+	require.NoError(t, err)
+
+	// Create OnPrem storage configuration (global, not per-org)
+	_ = createOnPremConfig(t, db, ctx, tmpDir)
+
+	// Seed endpoints for both projects
+	endpoint1 := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project1.UID,
+		OwnerID:   project1.UID,
+		Url:       "https://example.com/webhook1",
+		Name:      "Test Endpoint 1",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret-1"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	err = endpointRepo.CreateEndpoint(ctx, endpoint1, project1.UID)
+	require.NoError(t, err)
+
+	endpoint2 := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project2.UID,
+		OwnerID:   project2.UID,
+		Url:       "https://example.com/webhook2",
+		Name:      "Test Endpoint 2",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret-2"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	err = endpointRepo.CreateEndpoint(ctx, endpoint2, project2.UID)
+	require.NoError(t, err)
+
+	// Create old data for project1 (3 records)
+	for i := 0; i < 3; i++ {
+		oldEvent := seedOldEvent(t, db, ctx, project1, endpoint1, 0)
+		oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint1, 0)
+		seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint1, 0)
+	}
+
+	// Create old data for project2 (2 records)
+	for i := 0; i < 2; i++ {
+		oldEvent := seedOldEvent(t, db, ctx, project2, endpoint2, 0)
+		oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint2, 0)
+		seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint2, 0)
+	}
+
+	// Run export
+	runExport(t, env)
+
+	// Export is global — all events from both projects in one file
+	eventsFiles := findExportFiles(t, tmpDir, "events")
+	require.NotEmpty(t, eventsFiles, "should have events export file")
+
+	eventsData := readExportFile(t, eventsFiles[0])
+	allEvents := parseJSONL(t, eventsData)
+	// 3 from project1 + 2 from project2 = at least 5
+	require.GreaterOrEqual(t, len(allEvents), 5, "should have at least 5 total events from both projects")
+}
+
+func TestE2E_BackupProjectData_TimeFiltering(t *testing.T) {
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Create temporary directory for OnPrem exports
+	tmpDir := t.TempDir()
+
+	// Get database and repositories
+	db := env.App.DB
+
+	// Create organization and project
+	project := env.Project
+
+	// Create OnPrem storage configuration
+	_ = createOnPremConfig(t, db, ctx, tmpDir)
+
+	// Seed an endpoint
+	endpoint := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project.UID,
+		OwnerID:   project.UID,
+		Url:       "https://example.com/webhook",
+		Name:      "Test Endpoint",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	endpointRepo := endpoints.New(log.New("convoy", log.LevelInfo), db)
+	err := endpointRepo.CreateEndpoint(ctx, endpoint, project.UID)
+	require.NoError(t, err)
+
+	// Create events at current time (within backup interval window)
+	for range 3 {
+		evt := seedOldEvent(t, db, ctx, project, endpoint, 0)
+		dlv := seedOldEventDelivery(t, db, ctx, evt, endpoint, 0)
+		seedOldDeliveryAttempt(t, db, ctx, dlv, endpoint, 0)
+	}
+
+	// Run export
+	runExport(t, env)
+
+	// Verify events were exported
+	eventsFiles := findExportFiles(t, tmpDir, "events")
+	require.NotEmpty(t, eventsFiles, "should have events export file")
+
+	eventsData := readExportFile(t, eventsFiles[0])
+	events := parseJSONL(t, eventsData)
+	require.GreaterOrEqual(t, len(events), 3, "should have at least 3 events")
+
+	// Verify all exported events have valid timestamps
+	verifyTimeFiltering(t, eventsData)
+
+	// Verify delivery attempts
+	attemptsFiles := findExportFiles(t, tmpDir, "deliveryattempts")
+	require.NotEmpty(t, attemptsFiles, "should have delivery attempts export file")
+
+	attemptsData := readExportFile(t, attemptsFiles[0])
+	attempts := parseJSONL(t, attemptsData)
+	require.GreaterOrEqual(t, len(attempts), 3, "should have at least 3 delivery attempts")
+
+	verifyTimeFiltering(t, attemptsData)
+}
+
+func TestE2E_BackupProjectData_AllTables(t *testing.T) {
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Create temporary directory for OnPrem exports
+	tmpDir := t.TempDir()
+
+	// Get database and repositories
+	db := env.App.DB
+
+	// Create organization and project
+	_ = env.Organisation
+	project := env.Project
+
+	// Create OnPrem storage configuration
+	_ = createOnPremConfig(t, db, ctx, tmpDir)
+
+	// Seed an endpoint
+	endpoint := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project.UID,
+		OwnerID:   project.UID,
+		Url:       "https://example.com/webhook",
+		Name:      "Test Endpoint",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	endpointRepo := endpoints.New(log.New("convoy", log.LevelInfo), db)
+	err := endpointRepo.CreateEndpoint(ctx, endpoint, project.UID)
+	require.NoError(t, err)
+
+	// Create old data (26 hours old)
+	oldEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint, 0)
+
+	// Run export
+	runExport(t, env)
+
+	// Verify all 3 tables have export files
+	eventsFiles := findExportFiles(t, tmpDir, "events")
+	require.NotEmpty(t, eventsFiles, "should have events export file")
+
+	deliveriesFiles := findExportFiles(t, tmpDir, "eventdeliveries")
+	require.NotEmpty(t, deliveriesFiles, "should have event deliveries export file")
+
+	attemptsFiles := findExportFiles(t, tmpDir, "deliveryattempts")
+	require.NotEmpty(t, attemptsFiles, "should have delivery attempts export file")
+
+	// Verify all files contain valid JSON with at least 1 record
+	eventsData := readExportFile(t, eventsFiles[0])
+	verifyJSONLStructure(t, eventsData, 1)
+
+	deliveriesData := readExportFile(t, deliveriesFiles[0])
+	verifyJSONLStructure(t, deliveriesData, 1)
+
+	attemptsData := readExportFile(t, attemptsFiles[0])
+	verifyJSONLStructure(t, attemptsData, 1)
+
+	// Verify directory structure uses backup/{date}/{table}/ format
+	require.Contains(t, eventsFiles[0], "/backup/", "events file should use backup/ path")
+	require.Contains(t, eventsFiles[0], "/events/", "events file should be in events directory")
+	require.Contains(t, deliveriesFiles[0], "/eventdeliveries/", "deliveries file should be in eventdeliveries directory")
+	require.Contains(t, attemptsFiles[0], "/deliveryattempts/", "attempts file should be in deliveryattempts directory")
+}
+
+func TestE2E_BackupProjectData_AzureBlob(t *testing.T) {
+	if infra.NewAzuriteClient == nil {
+		t.Skip("Azurite not available")
+	}
+
+	env := SetupE2EWithoutWorker(t)
+	ctx := context.Background()
+
+	// Get Azurite client
+	azClient, azEndpoint, err := (*infra.NewAzuriteClient)(t)
+	require.NoError(t, err)
+
+	// Create unique container for test isolation
+	bucket := createTestAzuriteContainer(t, azClient)
+
+	// Get database and repositories
+	db := env.App.DB
+	logger := log.New("convoy", log.LevelInfo)
+
+	_ = env.Organisation
+	project := env.Project
+
+	// Configure Azure Blob storage with unique container
+	createAzuriteConfigWithContainer(t, db, ctx, azEndpoint, bucket)
+
+	// Seed an endpoint
+	endpoint := &datastore.Endpoint{
+		UID:       ulid.Make().String(),
+		ProjectID: project.UID,
+		OwnerID:   project.UID,
+		Url:       "https://example.com/webhook",
+		Name:      "Test Endpoint Azure",
+		Secrets: []datastore.Secret{
+			{UID: ulid.Make().String(), Value: "test-secret"},
+		},
+		Status:         datastore.ActiveEndpointStatus,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Authentication: &datastore.EndpointAuthentication{},
+	}
+	endpointRepo := endpoints.New(logger, db)
+	err = endpointRepo.CreateEndpoint(ctx, endpoint, project.UID)
+	require.NoError(t, err)
+
+	// Seed old data (26 hours old - should be exported)
+	oldEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	oldDelivery := seedOldEventDelivery(t, db, ctx, oldEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, oldDelivery, endpoint, 0)
+
+	// Seed recent data (12 hours old - should NOT be exported)
+	recentEvent := seedOldEvent(t, db, ctx, project, endpoint, 0)
+	recentDelivery := seedOldEventDelivery(t, db, ctx, recentEvent, endpoint, 0)
+	seedOldDeliveryAttempt(t, db, ctx, recentDelivery, endpoint, 0)
+
+	// Run export
+	runExport(t, env)
+
+	// List exported blobs
+	blobs := listAzuriteBlobs(t, azClient, bucket, "backup/")
+	require.GreaterOrEqual(t, len(blobs), 3, "should have at least 3 export files")
+
+	// Find blobs by path
+	var eventsBlob, deliveriesBlob, attemptsBlob string
+	for _, b := range blobs {
+		switch {
+		case strings.Contains(b, "/events/"):
+			eventsBlob = b
+		case strings.Contains(b, "/eventdeliveries/"):
+			deliveriesBlob = b
+		case strings.Contains(b, "/deliveryattempts/"):
+			attemptsBlob = b
+		}
+	}
+	require.NotEmpty(t, eventsBlob, "should have events export")
+	require.NotEmpty(t, deliveriesBlob, "should have deliveries export")
+	require.NotEmpty(t, attemptsBlob, "should have attempts export")
+
+	// Download and verify events
+	eventsData := downloadAzuriteBlob(t, azClient, bucket, eventsBlob)
+	evts := parseJSONL(t, eventsData)
+	require.GreaterOrEqual(t, len(evts), 1, "should have at least 1 old event exported")
+	require.Equal(t, oldEvent.UID, evts[0]["uid"], "exported event should be the old one")
+
+	verifyTimeFiltering(t, eventsData)
+
+	// Download and verify deliveries
+	deliveriesData := downloadAzuriteBlob(t, azClient, bucket, deliveriesBlob)
+	dlvrs := parseJSONL(t, deliveriesData)
+	require.GreaterOrEqual(t, len(dlvrs), 1, "should have at least 1 old delivery exported")
+
+	// Download and verify attempts
+	attemptsData := downloadAzuriteBlob(t, azClient, bucket, attemptsBlob)
+	atmpts := parseJSONL(t, attemptsData)
+	require.GreaterOrEqual(t, len(atmpts), 1, "should have at least 1 old delivery attempt exported")
+}

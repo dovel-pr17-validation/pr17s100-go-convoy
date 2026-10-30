@@ -1,0 +1,173 @@
+package services
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/dchest/uniuri"
+	"github.com/oklog/ulid/v2"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/auth"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/email"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	"github.com/frain-dev/convoy/pkg/msgpack"
+	"github.com/frain-dev/convoy/queue"
+)
+
+type InviteUserService struct {
+	Queue         queue.Queuer
+	InviteRepo    datastore.OrganisationInviteRepository
+	OrgMemberRepo datastore.OrganisationMemberRepository
+
+	InviteeEmail string
+	Role         auth.Role
+	User         *datastore.User
+	Organisation *datastore.Organisation
+	Licenser     license.Licenser
+	Logger       log.Logger
+}
+
+func NewInviteUserService(
+	queue queue.Queuer,
+	inviteRepo datastore.OrganisationInviteRepository,
+	orgMemberRepo datastore.OrganisationMemberRepository,
+	inviteeEmail string,
+	role auth.Role,
+	user *datastore.User,
+	organisation *datastore.Organisation,
+	licenser license.Licenser,
+	logger log.Logger,
+) *InviteUserService {
+	return &InviteUserService{
+		Queue:         queue,
+		InviteRepo:    inviteRepo,
+		OrgMemberRepo: orgMemberRepo,
+		InviteeEmail:  inviteeEmail,
+		Role:          role,
+		User:          user,
+		Organisation:  organisation,
+		Licenser:      licenser,
+		Logger:        logger,
+	}
+}
+
+func (iu *InviteUserService) Run(ctx context.Context) (*datastore.OrganisationInvite, error) {
+	ok, err := iu.Licenser.CheckUserLimit(ctx)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	if !ok {
+		return nil, &ServiceError{ErrMsg: ErrUserLimit.Error()}
+	}
+
+	// Check if multi-user mode is enabled (user_limit > 1)
+	// MultiPlayerMode is redundant - user limits handle this
+	// If user_limit is 1, it's single-user mode; otherwise multi-user
+	isMultiUser, err := iu.Licenser.IsMultiUserMode(ctx)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	if !isMultiUser {
+		return nil, &ServiceError{ErrMsg: "invites are only available in multi-user mode"}
+	}
+
+	// Enforce the cloud per-org user_limit against the org's own plan. Pending invites
+	// count here so a trial org already at its member cap cannot accumulate dangling
+	// over-cap invites. No-op for self-hosted orgs (no per-org license_data).
+	ok, err = CheckOrganisationUserLimit(ctx, iu.Organisation, true, OrgUserLimitDeps{
+		OrgMemberRepo: iu.OrgMemberRepo,
+		InviteRepo:    iu.InviteRepo,
+		Logger:        iu.Logger,
+	})
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+	if !ok {
+		return nil, &ServiceError{ErrMsg: ErrOrgUserLimit.Error(), Err: ErrOrgUserLimit}
+	}
+
+	iv := &datastore.OrganisationInvite{
+		UID:            ulid.Make().String(),
+		OrganisationID: iu.Organisation.UID,
+		InviteeEmail:   iu.InviteeEmail,
+		Token:          uniuri.NewLen(64),
+		Role:           iu.Role,
+		Status:         datastore.InviteStatusPending,
+		ExpiresAt:      time.Now().Add(time.Hour * 24 * 14), // expires in 2 weeks.
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	err = iu.InviteRepo.CreateOrganisationInvite(ctx, iv)
+	if err != nil {
+		errMsg := "failed to invite member"
+		iu.Logger.ErrorContext(ctx, errMsg, "error", err)
+
+		if strings.Contains(err.Error(), "duplicate") && strings.Contains(err.Error(), "organisation_invites_invitee_email") {
+			return nil, &ServiceError{ErrMsg: "an invite for this email already exists", Err: err}
+		}
+
+		return nil, &ServiceError{ErrMsg: errMsg, Err: err}
+	}
+
+	err = sendInviteEmail(ctx, iv, iu.User, iu.Organisation, iu.Queue)
+	if err != nil {
+		iu.Logger.ErrorContext(ctx, "failed to send email invite", "error", err)
+	}
+
+	return iv, nil
+}
+
+func sendInviteEmail(ctx context.Context, iv *datastore.OrganisationInvite, user *datastore.User, org *datastore.Organisation, queuer queue.Queuer) error {
+	cfg, err := config.Get()
+	if err != nil {
+		return err
+	}
+
+	baseURL := cfg.Host
+	rootPath := cfg.RootPath
+
+	var inviteURL string
+	if rootPath != "" {
+		inviteURL = fmt.Sprintf("%s%s/accept-invite?invite-token=%s", baseURL, rootPath, iv.Token)
+	} else {
+		inviteURL = fmt.Sprintf("%s/accept-invite?invite-token=%s", baseURL, iv.Token)
+	}
+
+	em := email.Message{
+		Email:        iv.InviteeEmail,
+		Subject:      "Convoy Organization Invite",
+		TemplateName: email.TemplateOrganisationInvite,
+		Params: map[string]string{
+			"invite_url":        inviteURL,
+			"organisation_name": org.Name,
+			"inviter_name":      fmt.Sprintf("%s %s", user.FirstName, user.LastName),
+			"expires_at":        iv.ExpiresAt.Format(time.RFC1123),
+		},
+	}
+
+	bytes, err := msgpack.EncodeMsgPack(em)
+	if err != nil {
+		return nil
+	}
+
+	job := &queue.Job{
+		ID:      iv.UID,
+		Payload: bytes,
+	}
+
+	err = queuer.Write(ctx, convoy.EmailProcessor, convoy.DefaultQueue, job)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}

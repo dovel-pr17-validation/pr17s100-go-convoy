@@ -1,0 +1,239 @@
+version: "2"
+
+servers:
+  - engine: postgresql
+    uri: postgres://${CONVOY_DB_USERNAME}:${CONVOY_DB_PASSWORD}@${CONVOY_DB_HOST}:${CONVOY_DB_PORT}/${CONVOY_DB_DATABASE}?sslmode=disable
+
+sql:
+  - queries: ./internal/endpoints/queries.sql
+    engine: postgresql
+    database: &db_config
+      uri: "postgres://${CONVOY_DB_USERNAME}:${CONVOY_DB_PASSWORD}@${CONVOY_DB_HOST}:${CONVOY_DB_PORT}/${CONVOY_DB_DATABASE}?sslmode=disable"
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/endpoints/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+        overrides:
+          - column: "convoy.endpoints.status"
+            go_type: "string"
+          - column: "convoy.endpoints.authentication_type"
+            go_type: "string"
+          - column: "convoy.endpoints.content_type"
+            go_type: "string"
+  - queries: ./internal/portal_links/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/portal_links/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+        overrides:
+          - column: "convoy.portal_links.auth_type"
+            go_type: "string"
+  - queries: ./internal/api_keys/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/api_keys/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/organisations/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/organisations/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/organisation_members/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/organisation_members/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/organisation_invites/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/organisation_invites/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/delivery_attempts/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/delivery_attempts/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/configuration/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/configuration/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+        overrides:
+          - column: "convoy.configurations.retention_enabled"
+            go_type: "github.com/jackc/pgx/v5/pgtype.Bool"
+          - column: "convoy.configurations.admin_managed"
+            go_type: "github.com/jackc/pgx/v5/pgtype.Bool"
+  - queries: ./internal/projects/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/projects/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/sources/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/sources/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/filters/repo/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/filters/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/batch_retries/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/batch_retries/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/subscriptions/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/subscriptions/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+        overrides:
+          - column: "convoy.subscriptions.delivery_mode"
+            go_type: "string"
+  - queries: ./internal/users/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/users/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/meta_events/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/meta_events/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/event_types/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/event_types/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/events/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/events/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/event_deliveries/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/event_deliveries/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+        overrides:
+          - column: "convoy.event_deliveries.delivery_mode"
+            go_type: "string"
+  - queries: ./internal/backup_jobs/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/backup_jobs/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/jobs/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/jobs/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true
+  - queries: ./internal/feature_flags/queries.sql
+    engine: postgresql
+    database: *db_config
+    gen:
+      go:
+        package: "repo"
+        out: "./internal/feature_flags/repo"
+        sql_package: "pgx/v5"
+        omit_unused_structs: true
+        emit_interface: true

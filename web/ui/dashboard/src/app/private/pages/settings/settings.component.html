@@ -1,0 +1,72 @@
+<div class="max-w-[1000px] mt-24px mx-auto pb-60px desktop:px-24px">
+  <!-- Page header -->
+  <div class="flex items-center gap-12px">
+    <a routerLink="/projects" class="w-28px h-28px flex items-center justify-center rounded-[6px] border border-new.border bg-white-100 transition-colors hover:bg-new.surface-muted">
+      <svg width="20" height="20" class="fill-new.text-secondary scale-75">
+        <use xlink:href="#arrow-left-icon"></use>
+      </svg>
+    </a>
+    <div class="flex flex-col gap-2px">
+      <h2 class="font-heading font-medium text-[20px] leading-[28px] text-new.text-primary">Organisation settings</h2>
+      <p class="font-body font-normal text-[14px] leading-normal text-new.text-secondary">Manage your organisation, team and billing</p>
+    </div>
+  </div>
+
+  <div class="h-[1px] w-full bg-new.border mt-16px mb-24px"></div>
+
+  <div class="flex flex-col md:flex-row gap-24px md:gap-40px">
+    <!-- Sidebar nav -->
+    <div class="min-w-[200px] shrink-0 settings-sidebar overflow-visible">
+      <ul class="flex flex-col gap-4px overflow-visible">
+        @for (menu of settingsMenu; track $index) {
+          <li class="!list-none overflow-visible">
+            @if (menu.name === 'team' && isTeamMenuBlocked()) {
+              <convoy-tooltip [withIcon]="false" position="right" className="!min-w-[220px] max-w-[280px] whitespace-normal text-left !z-[60]">
+                {{ getTeamUpgradeMessage() }}
+                <span tooltipToggle class="block w-full">
+                  <div class="w-full flex items-center gap-10px px-12px py-8px rounded-8px font-body text-[14px] leading-[20px] text-left text-new.text-secondary opacity-60 cursor-not-allowed">
+                    <svg width="16" height="16" class="transition-all shrink-0 stroke-neutral-11">
+                      <use [attr.xlink:href]="'#' + menu.icon + '-icon'"></use>
+                    </svg>
+                    <span class="capitalize">{{ menu.name }}</span>
+                  </div>
+                </span>
+              </convoy-tooltip>
+            } @else {
+              <button
+                type="button"
+                class="w-full flex items-center gap-10px px-12px py-8px rounded-8px font-body text-[14px] leading-[20px] text-left transition-colors"
+                [class]="activePage === menu.name ? 'bg-new.surface-muted text-new.text-primary font-medium' : 'text-new.text-secondary hover:bg-new.surface-subtle'"
+                (click)="toggleActivePage(menu.name)"
+                >
+                <svg width="16" height="16" class="transition-all shrink-0" [class]="activePage === menu.name ? menu.svg + '-new.primary-400' : menu.svg + '-neutral-11'">
+                  <use [attr.xlink:href]="'#' + menu.icon + '-icon'"></use>
+                </svg>
+                <span class="capitalize">{{ menu.name }}</span>
+              </button>
+            }
+          </li>
+        }
+      </ul>
+    </div>
+
+    <!-- Content -->
+    <div class="min-h-[60vh] w-full min-w-0 relative">
+      @if (activePage === 'organisation settings') {
+        <organisation-settings></organisation-settings>
+      }
+
+      @if (activePage === 'early adopter features') {
+        <early-adopter-features></early-adopter-features>
+      }
+
+      @if (activePage === 'team') {
+        <app-teams></app-teams>
+      }
+
+      @if (activePage === 'usage and billing') {
+        <app-billing-page></app-billing-page>
+      }
+    </div>
+  </div>
+</div>

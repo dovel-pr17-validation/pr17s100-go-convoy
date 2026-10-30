@@ -1,0 +1,48 @@
+
+import { Component, EventEmitter, forwardRef, Input, OnInit, Optional, Output } from '@angular/core';
+import { ControlContainer, ControlValueAccessor, NG_VALUE_ACCESSOR, ReactiveFormsModule } from '@angular/forms';
+
+@Component({
+    selector: 'convoy-toggle',
+    imports: [ReactiveFormsModule],
+    templateUrl: './toggle.component.html',
+    styleUrls: ['./toggle.component.scss'],
+    providers: [
+        {
+            provide: NG_VALUE_ACCESSOR,
+            useExisting: forwardRef(() => ToggleComponent),
+            multi: true
+        }
+    ]
+})
+export class ToggleComponent implements OnInit, ControlValueAccessor {
+	private static nextId = 0;
+
+	@Input('isChecked') isChecked = false;
+	@Input('label') label!: string;
+	@Input('name') id!: string;
+	@Input('className') class!: string;
+	@Input('formControlName') formControlName?: string;
+	@Output('onChange') onChange = new EventEmitter<any>();
+	control!: any;
+
+	constructor(@Optional() private controlContainer: ControlContainer) {}
+
+	ngOnInit(): void {
+		if (!this.id) {
+			const base = this.formControlName || 'toggle';
+			this.id = `convoy-toggle-${base}-${ToggleComponent.nextId++}`;
+		}
+		if (this.formControlName) {
+			if (this.controlContainer.control?.get(this.formControlName)) this.control = this.controlContainer.control.get(this.formControlName);
+		}
+	}
+
+	registerOnChange() {}
+
+	registerOnTouched() {}
+
+	writeValue() {}
+
+	setDisabledState() {}
+}

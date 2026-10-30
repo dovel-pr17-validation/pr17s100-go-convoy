@@ -1,0 +1,115 @@
+name: Release Go Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Manual workflow name"
+        required: true
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  set-release-kind:
+    name: Set release kind
+    runs-on: ubuntu-latest
+    outputs:
+      release_kind: ${{ steps.set-kind-tag.outputs.release_kind || steps.set-kind-main.outputs.release_kind }}
+    steps:
+      - name: Set release kind for tags
+        if: ${{ github.ref_type == 'tag' }}
+        id: set-kind-tag
+        run: echo "release_kind=tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set release kind for main
+        if: ${{ github.ref_type != 'tag' }}
+        id: set-kind-main
+        run: echo "release_kind=main" >> "$GITHUB_OUTPUT"
+
+  build_ui:
+    name: Build UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Build Artifact
+        run: "make ui_install type=ce"
+
+      - name: Archive Build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-without-markdown
+          path: |
+            web/ui/dashboard/dist
+            !web/ui/dashboard/dist/**/*.md
+
+  release-matrix:
+    name: Release & Publish Go Binary
+    needs: [build_ui, set-release-kind]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: dist-without-markdown
+          path: api/ui/build
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        name: Set up QEMU
+
+      - name: Clean git state
+        run: |
+          git checkout -- api/ui/build/
+          git clean -fd
+
+      - name: Install git-cliff
+        if: ${{ needs.set-release-kind.outputs.release_kind == 'tag' }}
+        uses: taiki-e/install-action@650c5ca14212efbbf3e580844b04bdccf68dac31 # v2
+        with:
+          tool: git-cliff
+
+      - name: Generate release notes
+        if: ${{ needs.set-release-kind.outputs.release_kind == 'tag' }}
+        run: git-cliff --config .git-cliff.toml --latest --output /tmp/release-notes.md
+
+      - name: Release (Tag)
+        if: ${{ needs.set-release-kind.outputs.release_kind == 'tag' }}
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          version: latest
+          args: -f .publisher.yml release --clean --skip=homebrew --release-notes /tmp/release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ github.repository }}
+
+      - name: Release (Main Snapshot)
+        if: ${{ needs.set-release-kind.outputs.release_kind == 'main' }}
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          version: latest
+          args: -f .publisher.yml release --clean --snapshot --skip=homebrew --skip=nfpm
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ github.repository }}
+
+  homebrew:
+    needs: release-matrix
+    if: github.ref_type == 'tag'
+    uses: ./.github/workflows/publish-homebrew.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

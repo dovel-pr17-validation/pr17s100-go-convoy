@@ -1,0 +1,354 @@
+package services
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"time"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/cache"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/fflag"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/net"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	endpointurl "github.com/frain-dev/convoy/pkg/url"
+	"github.com/frain-dev/convoy/util"
+)
+
+type UpdateEndpointService struct {
+	Cache                      cache.Cache
+	EndpointRepo               datastore.EndpointRepository
+	ProjectRepo                datastore.ProjectRepository
+	Licenser                   license.Licenser
+	FeatureFlag                *fflag.FFlag
+	FeatureFlagFetcher         fflag.FeatureFlagFetcher
+	EarlyAdopterFeatureFetcher fflag.EarlyAdopterFeatureFetcher
+	DB                         database.Database
+	Logger                     log.Logger
+	E                          models.UpdateEndpoint
+	Endpoint                   *datastore.Endpoint
+	Project                    *datastore.Project
+}
+
+func NewUpdateEndpointService(
+	cache cache.Cache,
+	endpointRepo datastore.EndpointRepository,
+	projectRepo datastore.ProjectRepository,
+	licenser license.Licenser,
+	featureFlag *fflag.FFlag,
+	featureFlagFetcher fflag.FeatureFlagFetcher,
+	earlyAdopterFeatureFetcher fflag.EarlyAdopterFeatureFetcher,
+	db database.Database,
+	logger log.Logger,
+	e models.UpdateEndpoint,
+	endpoint *datastore.Endpoint,
+	project *datastore.Project,
+) *UpdateEndpointService {
+	return &UpdateEndpointService{
+		Cache:                      cache,
+		EndpointRepo:               endpointRepo,
+		ProjectRepo:                projectRepo,
+		Licenser:                   licenser,
+		FeatureFlag:                featureFlag,
+		FeatureFlagFetcher:         featureFlagFetcher,
+		EarlyAdopterFeatureFetcher: earlyAdopterFeatureFetcher,
+		DB:                         db,
+		Logger:                     logger,
+		E:                          e,
+		Endpoint:                   endpoint,
+		Project:                    project,
+	}
+}
+
+func (a *UpdateEndpointService) Run(ctx context.Context) (*datastore.Endpoint, error) {
+	// Fetch the current endpoint from database first to get decrypted mTLS cert
+	endpoint, err := a.EndpointRepo.FindEndpointByID(ctx, a.Endpoint.UID, a.Project.UID)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	// Validate the endpoint URL with the existing endpoint data
+	endpointUrl, err := a.ValidateEndpoint(ctx, a.Project, a.E.MtlsClientCert, endpoint)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	a.E.URL = endpointUrl
+
+	endpoint, err = a.updateEndpoint(ctx, endpoint, a.E, a.Project)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	err = a.EndpointRepo.UpdateEndpoint(ctx, endpoint, endpoint.ProjectID)
+	if err != nil {
+		a.Logger.ErrorContext(ctx, "failed to update endpoint", "error", err)
+		return endpoint, &ServiceError{ErrMsg: "an error occurred while updating endpoints", Err: err}
+	}
+
+	return endpoint, nil
+}
+
+func (a *UpdateEndpointService) ValidateEndpoint(ctx context.Context, project *datastore.Project, mtlsClientCert *models.MtlsClientCert, existingEndpoint *datastore.Endpoint) (string, error) {
+	if util.IsStringEmpty(a.E.URL) {
+		return "", ErrEndpointURLRequired
+	}
+
+	endpointURLTemplatesEnabled := a.Licenser.EndpointURLTemplates() &&
+		a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.EndpointURLTemplates, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, a.Project.OrganisationID)
+
+	u, hasTemplate, pingErr := endpointurl.ValidateEndpointTemplate(a.E.URL, endpointURLTemplatesEnabled)
+	if pingErr != nil {
+		return "", pingErr
+	}
+
+	switch u.Scheme {
+	case "http":
+		if project.Config.SSL.EnforceSecureEndpoints {
+			return "", ErrHTTPSOnly
+		}
+	case "https":
+		if hasTemplate {
+			return a.E.URL, nil
+		}
+
+		cfg, innerErr := config.Get()
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		if cfg.Dispatcher.SkipPingValidation {
+			break
+		}
+
+		caCertTLSCfg, innerErr := config.GetCaCert()
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		dispatcher, innerErr := net.NewDispatcher(
+			a.Licenser,
+			a.FeatureFlag,
+			net.LoggerOption(a.Logger),
+			net.ProxyOption(cfg.Server.HTTP.HttpProxy, cfg.Server.HTTP.NoProxy),
+			net.AllowListOption(cfg.Dispatcher.AllowList),
+			net.BlockListOption(cfg.Dispatcher.BlockList),
+			net.TLSConfigOption(cfg.Dispatcher.InsecureSkipVerify, a.Licenser, caCertTLSCfg),
+		)
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		var mtlsCert *tls.Certificate
+
+		if mtlsClientCert != nil && !util.IsStringEmpty(mtlsClientCert.ClientCert) && !util.IsStringEmpty(mtlsClientCert.ClientKey) {
+			cert, certErr := config.LoadClientCertificate(mtlsClientCert.ClientCert, mtlsClientCert.ClientKey)
+			if certErr != nil {
+				a.Logger.WarnContext(ctx, "failed to load new mTLS cert for ping, will validate later", "error", certErr)
+			} else {
+				mtlsCert = cert
+			}
+		} else if mtlsClientCert == nil && existingEndpoint != nil && existingEndpoint.MtlsClientCert != nil {
+			cert, certErr := config.LoadClientCertificate(existingEndpoint.MtlsClientCert.ClientCert, existingEndpoint.MtlsClientCert.ClientKey)
+			if certErr != nil {
+				a.Logger.WarnContext(ctx, "failed to load existing mTLS cert for ping", "error", certErr)
+			} else {
+				mtlsCert = cert
+			}
+		}
+
+		contentType := ""
+		if a.E.ContentType != nil {
+			contentType = *a.E.ContentType
+		}
+
+		// OAuth2 token exchange uses a dedicated dispatcher that keeps the SSRF
+		// allow/block rules but always validates TLS (it must not inherit the
+		// webhook insecure_skip_verify setting, since it carries credentials).
+		var oauth2TokenGetter net.OAuth2TokenGetter
+		if (a.E.Authentication != nil && a.E.Authentication.Type == datastore.OAuth2Authentication) ||
+			(existingEndpoint != nil && existingEndpoint.Authentication != nil && existingEndpoint.Authentication.Type == datastore.OAuth2Authentication) {
+			oauth2Dispatcher, innerErr := net.NewOAuth2Dispatcher(a.Licenser, a.FeatureFlag, a.Logger, cfg, caCertTLSCfg)
+			if innerErr != nil {
+				return "", innerErr
+			}
+
+			if a.E.Authentication != nil && a.E.Authentication.Type == datastore.OAuth2Authentication {
+				// OAuth2 is being set or updated
+				oauth2TokenGetter = createOAuth2TokenGetter(a.E.Authentication, a.E.URL, existingEndpoint.UID, a.Logger, oauth2Dispatcher)
+			} else {
+				// OAuth2 is not being updated, but endpoint already has OAuth2 - use existing config
+				oauth2TokenGetter = createOAuth2TokenGetterFromDatastore(existingEndpoint.Authentication.OAuth2, a.E.URL, existingEndpoint.UID, a.Logger, oauth2Dispatcher)
+			}
+		}
+
+		pingErr = dispatcher.Ping(ctx, net.PingOptions{
+			Endpoint:          a.E.URL,
+			Timeout:           10 * time.Second,
+			ContentType:       contentType,
+			MtlsCert:          mtlsCert,
+			OAuth2TokenGetter: oauth2TokenGetter,
+		})
+		if pingErr != nil {
+			a.Logger.ErrorContext(ctx, "failed to ping tls endpoint", "error", pingErr)
+			return "", fmt.Errorf("endpoint validation failed: %w", pingErr)
+		}
+	default:
+		return "", ErrInvalidEndpointScheme
+	}
+
+	if hasTemplate {
+		return a.E.URL, nil
+	}
+
+	return u.String(), nil
+}
+
+//nolint:cyclop // Large function with many conditional branches for endpoint updates
+func (a *UpdateEndpointService) updateEndpoint(ctx context.Context, endpoint *datastore.Endpoint, e models.UpdateEndpoint, project *datastore.Project) (*datastore.Endpoint, error) {
+	endpoint.Url = e.URL
+	endpoint.Description = e.Description
+
+	endpoint.Name = *e.Name
+
+	if e.SupportEmail != nil && a.Licenser.AdvancedEndpointMgmt() {
+		endpoint.SupportEmail = *e.SupportEmail
+	}
+
+	if e.SlackWebhookURL != nil && a.Licenser.AdvancedEndpointMgmt() {
+		// Reject a slack_webhook_url that targets loopback/private/reserved
+		// addresses (SSRF); the worker POSTs to it outside request scope.
+		//
+		// The underlying error is dropped rather than wrapped: both webhook URLs
+		// are bearer secrets (a Slack URL's path token, a Teams Workflows URL's
+		// `sig` query parameter), and url.Parse errors quote the URL they failed
+		// on, which would echo the secret back to the caller.
+		if !util.IsStringEmpty(*e.SlackWebhookURL) {
+			if _, err := util.ValidateOutboundURL(*e.SlackWebhookURL, false); err != nil {
+				return nil, &ServiceError{ErrMsg: "invalid slack webhook url"}
+			}
+		}
+		endpoint.SlackWebhookURL = *e.SlackWebhookURL
+	}
+
+	if e.TeamsWebhookURL != nil && a.Licenser.AdvancedEndpointMgmt() {
+		// Same SSRF guard and same redaction policy as slack_webhook_url.
+		if !util.IsStringEmpty(*e.TeamsWebhookURL) {
+			if _, err := util.ValidateOutboundURL(*e.TeamsWebhookURL, false); err != nil {
+				return nil, &ServiceError{ErrMsg: "invalid teams webhook url"}
+			}
+		}
+		endpoint.TeamsWebhookURL = *e.TeamsWebhookURL
+	}
+
+	if e.RateLimit >= 0 {
+		endpoint.RateLimit = e.RateLimit
+	}
+
+	endpoint.RateLimitDuration = e.RateLimitDuration
+
+	if e.ContentType != nil {
+		endpoint.ContentType = *e.ContentType
+	}
+
+	if e.AdvancedSignatures != nil && project.Type == datastore.OutgoingProject {
+		endpoint.AdvancedSignatures = *e.AdvancedSignatures
+	}
+
+	if e.HttpTimeout != 0 {
+		endpoint.HttpTimeout = e.HttpTimeout
+
+		if !a.Licenser.AdvancedEndpointMgmt() {
+			// switch to default timeout
+			endpoint.HttpTimeout = convoy.HTTP_TIMEOUT
+		}
+	}
+
+	if !util.IsStringEmpty(e.OwnerID) {
+		endpoint.OwnerID = e.OwnerID
+	}
+
+	auth, err := ValidateEndpointAuthentication(e.Authentication.Transform())
+	if err != nil {
+		return nil, err
+	}
+
+	// Check license + feature flag before allowing Basic Auth configuration
+	if auth != nil && auth.Type == datastore.BasicAuthentication {
+		if !a.Licenser.BasicAuthEndpointAuth() {
+			return nil, &ServiceError{ErrMsg: ErrBasicAuthFeatureUnavailable}
+		}
+
+		basicAuthEnabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.BasicAuthEndpoint, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, a.Project.OrganisationID)
+		if !basicAuthEnabled {
+			a.Logger.WarnContext(ctx, "Basic Auth configuration provided but feature flag not enabled, ignoring Basic Auth config")
+			auth = nil
+		}
+	}
+
+	// Check license before allowing OAuth2 configuration
+	if auth != nil && auth.Type == datastore.OAuth2Authentication {
+		if !a.Licenser.OAuth2EndpointAuth() {
+			return nil, &ServiceError{ErrMsg: ErrOAuth2FeatureUnavailable}
+		}
+
+		// Check feature flag for OAuth2 using project's organisation ID
+		oauth2Enabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.OAuthTokenExchange, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, a.Project.OrganisationID)
+		if !oauth2Enabled {
+			a.Logger.WarnContext(ctx, "OAuth2 configuration provided but feature flag not enabled, ignoring OAuth2 config")
+			// Remove OAuth2 authentication if feature flag is disabled
+			auth = nil
+		}
+	}
+
+	endpoint.Authentication = auth
+
+	// Update mTLS client certificate if provided
+	if e.MtlsClientCert != nil {
+		cc := e.MtlsClientCert
+
+		if util.IsStringEmpty(cc.ClientCert) && util.IsStringEmpty(cc.ClientKey) {
+			// Both empty means remove mTLS configuration
+			endpoint.MtlsClientCert = nil
+			// Clear cached certificate since it's being removed
+			config.GetCertCache().Delete(endpoint.UID)
+		} else {
+			// Check license before allowing mTLS configuration
+			if !a.Licenser.MutualTLS() {
+				return nil, &ServiceError{ErrMsg: ErrMutualTLSFeatureUnavailable}
+			}
+
+			// Updating or setting new mTLS cert - both fields required
+			mtlsEnabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.MTLS, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, a.Project.OrganisationID)
+			if !mtlsEnabled {
+				a.Logger.WarnContext(ctx, "mTLS configuration provided but feature flag not enabled, ignoring mTLS config")
+				endpoint.MtlsClientCert = nil
+				config.GetCertCache().Delete(endpoint.UID)
+			} else {
+				if util.IsStringEmpty(cc.ClientCert) || util.IsStringEmpty(cc.ClientKey) {
+					return nil, &ServiceError{ErrMsg: "mtls_client_cert requires both client_cert and client_key"}
+				}
+
+				// Validate the certificate and key pair (checks expiration and matching)
+				_, err := config.LoadClientCertificate(cc.ClientCert, cc.ClientKey)
+				if err != nil {
+					return nil, &ServiceError{ErrMsg: fmt.Sprintf("invalid mTLS client certificate: %v", err)}
+				}
+
+				endpoint.MtlsClientCert = e.MtlsClientCert.Transform()
+
+				// Clear cached certificate since it's being updated
+				config.GetCertCache().Delete(endpoint.UID)
+			}
+		}
+	}
+
+	endpoint.UpdatedAt = time.Now()
+
+	return endpoint, nil
+}

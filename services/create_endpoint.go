@@ -1,0 +1,486 @@
+package services
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+
+	neturl "net/url"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/api/models"
+	ncache "github.com/frain-dev/convoy/cache/noop"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/database"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/fflag"
+	"github.com/frain-dev/convoy/internal/pkg/keys"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/net"
+	log "github.com/frain-dev/convoy/pkg/logger"
+	endpointurl "github.com/frain-dev/convoy/pkg/url"
+	"github.com/frain-dev/convoy/util"
+)
+
+// createOAuth2TokenGetter creates an OAuth2TokenGetter for ping validation.
+// It uses a noop cache since this is a one-time validation. The dispatcher is
+// threaded through so the token exchange request honours the IP allow/block
+// rules, matching the webhook ping.
+func createOAuth2TokenGetter(auth *models.EndpointAuthentication, endpointURL, existingEndpointID string, logger log.Logger, dispatcher *net.Dispatcher) net.OAuth2TokenGetter {
+	if auth == nil || auth.Type != datastore.OAuth2Authentication || auth.OAuth2 == nil {
+		return nil
+	}
+
+	return createOAuth2TokenGetterFromDatastore(auth.OAuth2.Transform(), endpointURL, existingEndpointID, logger, dispatcher)
+}
+
+// createOAuth2TokenGetterFromDatastore creates an OAuth2TokenGetter from a datastore OAuth2 config.
+func createOAuth2TokenGetterFromDatastore(oauth2 *datastore.OAuth2, endpointURL, existingEndpointID string, logger log.Logger, dispatcher *net.Dispatcher) net.OAuth2TokenGetter {
+	if oauth2 == nil {
+		return nil
+	}
+
+	tempEndpointID := existingEndpointID
+	if tempEndpointID == "" {
+		tempEndpointID = ulid.Make().String()
+	}
+
+	tempEndpoint := &datastore.Endpoint{
+		UID: tempEndpointID,
+		Url: endpointURL,
+		Authentication: &datastore.EndpointAuthentication{
+			Type:   datastore.OAuth2Authentication,
+			OAuth2: oauth2,
+		},
+	}
+
+	noopCache := ncache.NewNoopCache()
+	oauth2TokenService := NewOAuth2TokenService(
+		noopCache,
+		logger,
+		WithOAuth2HTTPClient(dispatcher.HTTPClient()),
+		WithOAuth2Context(dispatcher.ContextWithRules),
+	)
+
+	return func(ctx context.Context) (string, error) {
+		return oauth2TokenService.GetAuthorizationHeader(ctx, tempEndpoint)
+	}
+}
+
+type CreateEndpointService struct {
+	EndpointRepo               datastore.EndpointRepository
+	ProjectRepo                datastore.ProjectRepository
+	Licenser                   license.Licenser
+	FeatureFlag                *fflag.FFlag
+	FeatureFlagFetcher         fflag.FeatureFlagFetcher
+	EarlyAdopterFeatureFetcher fflag.EarlyAdopterFeatureFetcher
+	DB                         database.Database
+	Logger                     log.Logger
+	E                          models.CreateEndpoint
+	ProjectID                  string
+}
+
+func NewCreateEndpointService(
+	endpointRepo datastore.EndpointRepository,
+	projectRepo datastore.ProjectRepository,
+	licenser license.Licenser,
+	featureFlag *fflag.FFlag,
+	featureFlagFetcher fflag.FeatureFlagFetcher,
+	earlyAdopterFeatureFetcher fflag.EarlyAdopterFeatureFetcher,
+	db database.Database,
+	logger log.Logger,
+	e models.CreateEndpoint,
+	projectID string,
+) *CreateEndpointService {
+	return &CreateEndpointService{
+		EndpointRepo:               endpointRepo,
+		ProjectRepo:                projectRepo,
+		Licenser:                   licenser,
+		FeatureFlag:                featureFlag,
+		FeatureFlagFetcher:         featureFlagFetcher,
+		EarlyAdopterFeatureFetcher: earlyAdopterFeatureFetcher,
+		DB:                         db,
+		Logger:                     logger,
+		E:                          e,
+		ProjectID:                  projectID,
+	}
+}
+
+func (a *CreateEndpointService) Run(ctx context.Context) (*datastore.Endpoint, error) {
+	project, err := a.ProjectRepo.FetchProjectByID(ctx, a.ProjectID)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: "failed to load endpoint project", Err: err}
+	}
+
+	endpointUrl, err := a.ValidateEndpoint(ctx, project, a.E.MtlsClientCert)
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	a.E.URL = endpointUrl
+
+	truthValue := true
+	switch project.Type {
+	case datastore.IncomingProject:
+		a.E.AdvancedSignatures = &truthValue
+	case datastore.OutgoingProject:
+		if a.E.AdvancedSignatures != nil {
+			break
+		}
+
+		a.E.AdvancedSignatures = &truthValue
+	}
+
+	endpoint := &datastore.Endpoint{
+		UID:                ulid.Make().String(),
+		ProjectID:          a.ProjectID,
+		OwnerID:            a.E.OwnerID,
+		Name:               a.E.Name,
+		SupportEmail:       a.E.SupportEmail,
+		SlackWebhookURL:    a.E.SlackWebhookURL,
+		TeamsWebhookURL:    a.E.TeamsWebhookURL,
+		Url:                a.E.URL,
+		Description:        a.E.Description,
+		RateLimit:          a.E.RateLimit,
+		HttpTimeout:        a.E.HttpTimeout,
+		AdvancedSignatures: *a.E.AdvancedSignatures,
+		AppID:              a.E.AppID,
+		RateLimitDuration:  a.E.RateLimitDuration,
+		ContentType:        a.E.ContentType,
+		Status:             datastore.ActiveEndpointStatus,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+	}
+
+	if !a.Licenser.AdvancedEndpointMgmt() {
+		// switch to the default timeout
+		endpoint.HttpTimeout = convoy.HTTP_TIMEOUT
+
+		endpoint.SupportEmail = ""
+		endpoint.SlackWebhookURL = ""
+		endpoint.TeamsWebhookURL = ""
+	}
+
+	// Reject a slack_webhook_url that targets loopback/private/reserved
+	// addresses (SSRF). The worker POSTs failure notifications to this URL, so it
+	// must pass the same outbound-URL guard as delivery endpoints.
+	//
+	// The underlying error is dropped rather than wrapped: both webhook URLs are
+	// bearer secrets (a Slack URL's path token, a Teams Workflows URL's `sig`
+	// query parameter), and url.Parse errors quote the URL they failed on, which
+	// would echo the secret back to the caller and into any log that records the
+	// response.
+	if !util.IsStringEmpty(endpoint.SlackWebhookURL) {
+		if _, err := util.ValidateOutboundURL(endpoint.SlackWebhookURL, false); err != nil {
+			return nil, &ServiceError{ErrMsg: "invalid slack webhook url"}
+		}
+	}
+
+	// Same SSRF guard and same redaction policy for teams_webhook_url.
+	if !util.IsStringEmpty(endpoint.TeamsWebhookURL) {
+		if _, err := util.ValidateOutboundURL(endpoint.TeamsWebhookURL, false); err != nil {
+			return nil, &ServiceError{ErrMsg: "invalid teams webhook url"}
+		}
+	}
+
+	if util.IsStringEmpty(endpoint.AppID) {
+		endpoint.AppID = endpoint.UID
+	}
+
+	if util.IsStringEmpty(a.E.Secret) {
+		sc, err := util.GenerateSecret()
+		if err != nil {
+			return nil, &ServiceError{ErrMsg: "could not generate secret", Err: err}
+		}
+
+		endpoint.Secrets = []datastore.Secret{
+			{
+				UID:       ulid.Make().String(),
+				Value:     sc,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			},
+		}
+	} else {
+		endpoint.Secrets = append(endpoint.Secrets, datastore.Secret{
+			UID:       ulid.Make().String(),
+			Value:     a.E.Secret,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		})
+	}
+
+	auth, err := ValidateEndpointAuthentication(a.E.Authentication.Transform())
+	if err != nil {
+		return nil, &ServiceError{ErrMsg: err.Error()}
+	}
+
+	// Check license + feature flag before allowing Basic Auth configuration
+	if auth != nil && auth.Type == datastore.BasicAuthentication {
+		if !a.Licenser.BasicAuthEndpointAuth() {
+			return nil, &ServiceError{ErrMsg: ErrBasicAuthFeatureUnavailable}
+		}
+
+		basicAuthEnabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.BasicAuthEndpoint, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, project.OrganisationID)
+		if !basicAuthEnabled {
+			a.Logger.WarnContext(ctx, "Basic Auth configuration provided but feature flag not enabled, ignoring Basic Auth config")
+			auth = nil
+		}
+	}
+
+	// Check license before allowing OAuth2 configuration
+	if auth != nil && auth.Type == datastore.OAuth2Authentication {
+		if !a.Licenser.OAuth2EndpointAuth() {
+			return nil, &ServiceError{ErrMsg: ErrOAuth2FeatureUnavailable}
+		}
+
+		// Check feature flag for OAuth2 using project's organisation ID
+		oauth2Enabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.OAuthTokenExchange, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, project.OrganisationID)
+		if !oauth2Enabled {
+			a.Logger.WarnContext(ctx, "OAuth2 configuration provided but feature flag not enabled, ignoring OAuth2 config")
+			// Remove OAuth2 authentication if feature flag is disabled
+			auth = nil
+		}
+	}
+
+	endpoint.Authentication = auth
+
+	// Set mTLS client certificate if provided
+	if a.E.MtlsClientCert != nil {
+		// Check license before allowing mTLS configuration
+		if !a.Licenser.MutualTLS() {
+			return nil, &ServiceError{ErrMsg: ErrMutualTLSFeatureUnavailable}
+		}
+
+		// Validate both fields provided together
+		mtlsEnabled := a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.MTLS, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, project.OrganisationID)
+		if !mtlsEnabled {
+			a.Logger.WarnContext(ctx, "mTLS configuration provided but feature flag not enabled, ignoring mTLS config")
+		} else {
+			cc := a.E.MtlsClientCert
+			if util.IsStringEmpty(cc.ClientCert) || util.IsStringEmpty(cc.ClientKey) {
+				return nil, &ServiceError{ErrMsg: "mtls_client_cert requires both client_cert and client_key"}
+			}
+
+			// Validate the certificate and key pair (checks expiration and matching)
+			_, err := config.LoadClientCertificate(cc.ClientCert, cc.ClientKey)
+			if err != nil {
+				return nil, &ServiceError{ErrMsg: fmt.Sprintf("invalid mTLS client certificate: %v", err)}
+			}
+
+			endpoint.MtlsClientCert = a.E.MtlsClientCert.Transform()
+		}
+	}
+
+	err = a.EndpointRepo.CreateEndpoint(ctx, endpoint, a.ProjectID)
+	if err != nil {
+		a.Logger.ErrorContext(ctx, "failed to create endpoint", "error", err)
+		if errors.Is(err, keys.ErrCredentialEncryptionFeatureUnavailableUpgradeOrRevert) {
+			return nil, &ServiceError{ErrMsg: err.Error(), Err: err}
+		}
+		return nil, &ServiceError{ErrMsg: "an error occurred while adding endpoint", Err: err}
+	}
+
+	return endpoint, nil
+}
+
+func (a *CreateEndpointService) ValidateEndpoint(ctx context.Context, project *datastore.Project, mtlsClientCert *models.MtlsClientCert) (string, error) {
+	if util.IsStringEmpty(a.E.URL) {
+		return "", ErrEndpointURLRequired
+	}
+
+	endpointURLTemplatesEnabled := a.Licenser.EndpointURLTemplates() &&
+		a.FeatureFlag.CanAccessOrgFeature(ctx, fflag.EndpointURLTemplates, a.FeatureFlagFetcher, a.EarlyAdopterFeatureFetcher, project.OrganisationID)
+
+	u, hasTemplate, pingErr := endpointurl.ValidateEndpointTemplate(a.E.URL, endpointURLTemplatesEnabled)
+	if pingErr != nil {
+		return "", pingErr
+	}
+
+	switch u.Scheme {
+	case "http":
+		if project.Config.SSL.EnforceSecureEndpoints {
+			return "", ErrHTTPSOnly
+		}
+	case "https":
+		if hasTemplate {
+			return a.E.URL, nil
+		}
+
+		cfg, innerErr := config.Get()
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		if cfg.Dispatcher.SkipPingValidation {
+			break
+		}
+
+		caCertTLSCfg, innerErr := config.GetCaCert()
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		dispatcher, innerErr := net.NewDispatcher(
+			a.Licenser,
+			a.FeatureFlag,
+			net.LoggerOption(a.Logger),
+			net.ProxyOption(cfg.Server.HTTP.HttpProxy, cfg.Server.HTTP.NoProxy),
+			net.AllowListOption(cfg.Dispatcher.AllowList),
+			net.BlockListOption(cfg.Dispatcher.BlockList),
+			net.TLSConfigOption(cfg.Dispatcher.InsecureSkipVerify, a.Licenser, caCertTLSCfg),
+		)
+		if innerErr != nil {
+			return "", innerErr
+		}
+
+		// Load mTLS client certificate if provided for ping validation
+		// Note: This is best-effort. If cert loading fails here, it will be properly
+		// validated later in the Run() method before persisting to database.
+		var mtlsCert *tls.Certificate
+		if mtlsClientCert != nil && !util.IsStringEmpty(mtlsClientCert.ClientCert) && !util.IsStringEmpty(mtlsClientCert.ClientKey) {
+			cert, certErr := config.LoadClientCertificate(mtlsClientCert.ClientCert, mtlsClientCert.ClientKey)
+			if certErr != nil {
+				// Log warning but don't fail - validation will happen later
+				a.Logger.WarnContext(ctx, "failed to load mTLS cert for ping, will validate later", "error", certErr)
+			} else {
+				mtlsCert = cert
+			}
+		}
+
+		// OAuth2 token exchange uses a dedicated dispatcher that keeps the SSRF
+		// allow/block rules but always validates TLS (it must not inherit the
+		// webhook insecure_skip_verify setting, since it carries credentials).
+		// Only build it when OAuth2 is configured so non-OAuth2 endpoints do not
+		// pay for an unused dispatcher.
+		var oauth2TokenGetter net.OAuth2TokenGetter
+		if a.E.Authentication != nil && a.E.Authentication.Type == datastore.OAuth2Authentication && a.E.Authentication.OAuth2 != nil {
+			oauth2Dispatcher, innerErr := net.NewOAuth2Dispatcher(a.Licenser, a.FeatureFlag, a.Logger, cfg, caCertTLSCfg)
+			if innerErr != nil {
+				return "", innerErr
+			}
+
+			oauth2TokenGetter = createOAuth2TokenGetter(a.E.Authentication, a.E.URL, "", a.Logger, oauth2Dispatcher)
+		}
+
+		pingErr = dispatcher.Ping(ctx, net.PingOptions{
+			Endpoint:          a.E.URL,
+			Timeout:           10 * time.Second,
+			ContentType:       a.E.ContentType,
+			MtlsCert:          mtlsCert,
+			OAuth2TokenGetter: oauth2TokenGetter,
+		})
+		if pingErr != nil {
+			a.Logger.ErrorContext(ctx, "failed to ping tls endpoint", "error", pingErr)
+			return "", fmt.Errorf("endpoint validation failed: %w", pingErr)
+		}
+	default:
+		return "", ErrInvalidEndpointScheme
+	}
+
+	if hasTemplate {
+		return a.E.URL, nil
+	}
+
+	return u.String(), nil
+}
+
+// ValidateEndpointURL validates the URL format without performing an HTTPS ping.
+// This is used by bulk operations where pinging each endpoint would be too slow.
+func ValidateEndpointURL(rawURL string, enforceSecure bool) (string, error) {
+	u, err := endpointurl.ValidateEndpointURL(rawURL, enforceSecure)
+	if err != nil {
+		return "", err
+	}
+
+	return u.String(), nil
+}
+
+func ValidateEndpointAuthentication(auth *datastore.EndpointAuthentication) (*datastore.EndpointAuthentication, error) {
+	if auth != nil && !util.IsStringEmpty(string(auth.Type)) {
+		if err := util.Validate(auth); err != nil {
+			return nil, err
+		}
+
+		switch auth.Type {
+		case datastore.APIKeyAuthentication:
+			if auth.ApiKey == nil || util.IsStringEmpty(auth.ApiKey.HeaderValue) {
+				return nil, util.NewServiceError(http.StatusBadRequest, ErrAPIKeyFieldRequired)
+			}
+			if util.IsStringEmpty(auth.ApiKey.HeaderName) {
+				return nil, util.NewServiceError(http.StatusBadRequest, errors.New("api key header_name is required"))
+			}
+
+		case datastore.OAuth2Authentication:
+			if auth.OAuth2 == nil {
+				return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 configuration is required"))
+			}
+			if util.IsStringEmpty(auth.OAuth2.URL) {
+				return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 url is required"))
+			}
+			if util.IsStringEmpty(auth.OAuth2.ClientID) {
+				return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 client_id is required"))
+			}
+			if util.IsStringEmpty(string(auth.OAuth2.AuthenticationType)) {
+				return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 authentication_type is required"))
+			}
+
+			// Validate authentication type specific fields
+			switch auth.OAuth2.AuthenticationType {
+			case datastore.SharedSecretAuth:
+				if util.IsStringEmpty(auth.OAuth2.ClientSecret) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 client_secret is required for shared_secret authentication"))
+				}
+			case datastore.ClientAssertionAuth:
+				if auth.OAuth2.SigningKey == nil {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key is required for client_assertion authentication"))
+				}
+				// Validate JWK fields
+				if util.IsStringEmpty(auth.OAuth2.SigningKey.Kty) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.kty is required"))
+				}
+				if util.IsStringEmpty(auth.OAuth2.SigningKey.Kid) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.kid is required"))
+				}
+				if util.IsStringEmpty(auth.OAuth2.SigningKey.D) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.d (private key) is required"))
+				}
+				// Validate ES256 algorithm requirements
+				if auth.OAuth2.SigningAlgorithm == "ES256" || auth.OAuth2.SigningAlgorithm == "" {
+					if auth.OAuth2.SigningKey.Kty != "EC" {
+						return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.kty must be 'EC' for ES256 algorithm"))
+					}
+					if auth.OAuth2.SigningKey.Crv != "P-256" {
+						return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.crv must be 'P-256' for ES256 algorithm"))
+					}
+					if util.IsStringEmpty(auth.OAuth2.SigningKey.X) || util.IsStringEmpty(auth.OAuth2.SigningKey.Y) {
+						return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 signing_key.x and signing_key.y are required for EC keys"))
+					}
+				}
+				if util.IsStringEmpty(auth.OAuth2.Issuer) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 issuer is required for client_assertion authentication"))
+				}
+				if util.IsStringEmpty(auth.OAuth2.Subject) {
+					return nil, util.NewServiceError(http.StatusBadRequest, errors.New("oauth2 subject is required for client_assertion authentication"))
+				}
+			default:
+				return nil, util.NewServiceError(http.StatusBadRequest, fmt.Errorf("unsupported oauth2 authentication_type: %s", auth.OAuth2.AuthenticationType))
+			}
+
+			// Validate token URL format
+			_, err := neturl.Parse(auth.OAuth2.URL)
+			if err != nil {
+				return nil, util.NewServiceError(http.StatusBadRequest, fmt.Errorf("invalid oauth2 url: %w", err))
+			}
+		}
+
+		return auth, nil
+	}
+
+	return nil, nil
+}

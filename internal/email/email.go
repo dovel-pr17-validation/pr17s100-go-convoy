@@ -1,0 +1,120 @@
+package email
+
+import (
+	"bytes"
+	"embed"
+	"fmt"
+	"html/template"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/frain-dev/convoy/internal/pkg/smtp"
+)
+
+//go:embed templates/*
+var templateDir embed.FS
+
+const (
+	templatePath = "templates/"
+	layoutPath   = "templates/_layout.html"
+	fileSuffix   = ".html"
+)
+
+type TemplateName string
+
+const (
+	TemplateEndpointUpdate     TemplateName = "endpoint.update"
+	TemplateEmailVerification  TemplateName = "user.verify.email"
+	TemplateOrganisationInvite TemplateName = "organisation.invite"
+	TemplateResetPassword      TemplateName = "reset.password"
+	TemplateTwitterSource      TemplateName = "twitter.source"
+)
+
+func (t TemplateName) String() string {
+	return string(t)
+}
+
+// Message represents a generic email message. It can be anything from
+// an organisation invite to a disabled endpoint email
+type Message struct {
+	// Email represents email recipient.
+	Email string `json:"email,omitempty"`
+
+	// Subject of the email
+	Subject string `json:"subject,omitempty"`
+
+	// Params to replace the template variables.
+	Params interface{} `json:"params,omitempty"`
+
+	// Glob represents which template to use in building the email
+	TemplateName TemplateName `json:"template_name,omitempty"`
+}
+
+type Email struct {
+	client smtp.SmtpClient
+	templ  *template.Template
+	body   bytes.Buffer
+}
+
+func NewEmail(c smtp.SmtpClient) *Email {
+	return &Email{client: c}
+}
+
+// templateFuncs are available to every email template.
+var templateFuncs = template.FuncMap{
+	"currentYear": func() int {
+		return time.Now().Year()
+	},
+
+	// Outlook ignores max-width, so the fluid shell needs a fixed-width ghost
+	// table to keep its 656px column. html/template strips comments out of
+	// template source, so the conditionals have to be emitted at render time.
+	"outlookShellOpen": func() template.HTML {
+		return `<!--[if mso]><table role="presentation" width="656" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td width="656"><![endif]-->`
+	},
+	"outlookShellClose": func() template.HTML {
+		return `<!--[if mso]></td></tr></table><![endif]-->`
+	},
+}
+
+// TODO(subomi): glob pattern must not match more than one template
+func (e *Email) Build(glob string, params interface{}) error {
+	pattern := e.buildGlob(glob)
+	base := path.Base(pattern)
+
+	templ, err := template.New(base).Funcs(templateFuncs).ParseFS(templateDir, layoutPath, pattern)
+	if err != nil {
+		return fmt.Errorf("failed to parse template fs: %v", err)
+	}
+	e.templ = templ
+
+	err = e.templ.ExecuteTemplate(&e.body, base, params)
+	if err != nil {
+		return fmt.Errorf("failed to execute template: %v", err)
+	}
+
+	return nil
+}
+
+func (e *Email) Send(emailAddr, subject string) error {
+	err := e.client.SendEmail(emailAddr, subject, e.body)
+	if err != nil {
+		return fmt.Errorf("failed to send email: %v", err)
+	}
+
+	return nil
+}
+
+func (e *Email) buildGlob(glob string) string {
+	var s strings.Builder
+
+	s.WriteString(templatePath)
+	s.WriteString(glob)
+
+	if !strings.HasSuffix(glob, fileSuffix) {
+		s.WriteString(fileSuffix)
+	}
+
+	return s.String()
+}

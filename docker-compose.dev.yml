@@ -1,0 +1,98 @@
+version: "3"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+    web:
+        build:
+          context: ./
+          dockerfile: Dockerfile.dev
+        command: ["./cmd", "server", "--config", "convoy.json"]
+        volumes:
+            - ./convoy.json:/convoy.json
+        restart: on-failure
+        ports:
+          - "5005:5005"
+        depends_on:
+            - postgres
+            - redis_server
+            - migrate
+        environment:
+            - CONVOY_ENV=development
+            - CONVOY_VERSION=v1.0.0
+            - CONVOY_COMPONENT=web
+            # - CONVOY_ENABLE_FEATURE_FLAG=ip-rules,credential-encryption,circuit-breaker,prometheus
+            # - CONVOY_METRICS_ENABLED=false
+            # - CONVOY_METRICS_BACKEND=prometheus
+            # - CONVOY_METRICS_SAMPLE_TIME=5
+
+    migrate:
+        build:
+            context: ./
+            dockerfile: Dockerfile.dev
+        entrypoint: ["./cmd", "migrate", "up"]
+        volumes:
+            - ./convoy.json:/convoy.json
+        restart: on-failure
+        depends_on:
+            postgres:
+                condition: service_healthy
+
+    agent:
+        build:
+            context: ./
+            dockerfile: Dockerfile.dev
+        entrypoint: ["./cmd", "agent"]
+        volumes:
+            - ./convoy.json:/convoy.json
+        restart: on-failure
+        ports:
+            - "5008:5008"
+        depends_on:
+            - postgres
+            - redis_server
+            - migrate
+        environment:
+            - CONVOY_ENV=development
+            - CONVOY_VERSION=v1.0.0
+            - CONVOY_COMPONENT=agent
+            # - CONVOY_ENABLE_FEATURE_FLAG=ip-rules,credential-encryption,circuit-breaker,prometheus
+            # - CONVOY_METRICS_ENABLED=false
+            # - CONVOY_METRICS_BACKEND=prometheus
+            # - CONVOY_METRICS_SAMPLE_TIME=5
+
+    postgres:
+        image: postgres:15.2-alpine
+        restart: unless-stopped
+        ports:
+            - "5432:5432"
+        environment:
+            POSTGRES_DB: convoy
+            POSTGRES_USER: convoy
+            POSTGRES_PASSWORD: convoy
+            PGDATA: /data/postgres
+        volumes:
+            - postgres_data:/data/postgres
+        healthcheck:
+            test: [ "CMD-SHELL", "pg_isready -U convoy" ]
+            interval: 5s
+            timeout: 5s
+            retries: 5
+
+    redis_server:
+        image: redis:7-alpine
+        restart: always
+        ports:
+            - "6379:6379"
+        volumes:
+          - redis_data:/data
+
+    prometheus:
+        image: prom/prometheus:v2.24.0
+        volumes:
+            - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+        ports:
+            - 9090:9090
+        restart: always

@@ -1,0 +1,419 @@
+package handlers
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
+
+	"github.com/frain-dev/convoy/api/models"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/datastore/cached"
+	"github.com/frain-dev/convoy/internal/organisations"
+	"github.com/frain-dev/convoy/internal/sources"
+	"github.com/frain-dev/convoy/pkg/cachedrepo"
+	"github.com/frain-dev/convoy/pkg/transform"
+	"github.com/frain-dev/convoy/services"
+	"github.com/frain-dev/convoy/util"
+)
+
+// CreateSource
+//
+//	@Summary		Create a source
+//	@Description	This endpoint creates a source
+//	@Id				CreateSource
+//	@Tags			Sources
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string				true	"Project ID"
+//	@Param			source		body		models.CreateSource	true	"Source Details"
+//	@Success		201			{object}	util.ServerResponse{data=models.SourceResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources [post]
+func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	var newSource models.CreateSource
+	if err := util.ReadJSON(r, &newSource); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if err := newSource.Validate(); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	cs := services.CreateSourceService{
+		SourceRepo: sources.New(h.A.Logger, h.A.DB),
+		NewSource:  &newSource,
+		Project:    project,
+		Logger:     h.A.Logger,
+	}
+
+	source, err := cs.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	org, err := organisations.New(h.A.Logger, h.A.DB).FetchOrganisationByID(r.Context(), project.OrganisationID)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "failed to find organisation by id", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	fillSourceURL(source, baseUrl, org.CustomDomain.ValueOrZero())
+	resp := &models.SourceResponse{Source: source}
+
+	_ = render.Render(w, r, util.NewServerResponse("Source created successfully", resp, http.StatusCreated))
+}
+
+// GetSource
+//
+//	@Summary		Retrieve a source
+//	@Description	This endpoint retrieves a source by its id
+//	@Id				GetSource
+//	@Tags			Sources
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string	true	"Project ID"
+//	@Param			sourceID	path		string	true	"Source ID"
+//	@Success		200			{object}	util.ServerResponse{data=models.SourceResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources/{sourceID} [get]
+func (h *Handler) GetSource(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	source, err := sources.New(h.A.Logger, h.A.DB).FindSourceByID(r.Context(), project.UID, chi.URLParam(r, "sourceID"))
+	if err != nil {
+		if errors.Is(err, datastore.ErrSourceNotFound) {
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusNotFound))
+			return
+		}
+
+		_ = render.Render(w, r, util.NewErrorResponse("error retrieving source", http.StatusBadRequest))
+		return
+	}
+
+	org, err := organisations.New(h.A.Logger, h.A.DB).FetchOrganisationByID(r.Context(), project.OrganisationID)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "failed to find organisation by id", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	fillSourceURL(source, baseUrl, org.CustomDomain.ValueOrZero())
+	resp := &models.SourceResponse{Source: source}
+
+	_ = render.Render(w, r, util.NewServerResponse("Source fetched successfully", resp, http.StatusOK))
+}
+
+// UpdateSource
+//
+//	@Summary		Update a source
+//	@Description	This endpoint updates a source
+//	@Id				UpdateSource
+//	@Tags			Sources
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string				true	"Project ID"
+//	@Param			sourceID	path		string				true	"source id"
+//	@Param			source		body		models.UpdateSource	true	"Source Details"
+//	@Success		202			{object}	util.ServerResponse{data=models.SourceResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources/{sourceID} [put]
+func (h *Handler) UpdateSource(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	var sourceUpdate models.UpdateSource
+	err = util.ReadJSON(r, &sourceUpdate)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if err := sourceUpdate.Validate(); err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	source, err := sources.New(h.A.Logger, h.A.DB).FindSourceByID(r.Context(), project.UID, chi.URLParam(r, "sourceID"))
+	if err != nil {
+		if errors.Is(err, datastore.ErrSourceNotFound) {
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusNotFound))
+			return
+		}
+
+		_ = render.Render(w, r, util.NewErrorResponse("error retrieving source", http.StatusBadRequest))
+		return
+	}
+
+	us := services.UpdateSourceService{
+		SourceRepo:   sources.New(h.A.Logger, h.A.DB),
+		Project:      project,
+		SourceUpdate: &sourceUpdate,
+		Source:       source,
+		Logger:       h.A.Logger,
+	}
+
+	source, err = us.Run(r.Context())
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	org, err := organisations.New(h.A.Logger, h.A.DB).FetchOrganisationByID(r.Context(), project.OrganisationID)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "failed to find organisation by id", "error", err)
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	fillSourceURL(source, baseUrl, org.CustomDomain.ValueOrZero())
+	resp := &models.SourceResponse{Source: source}
+
+	_ = render.Render(w, r, util.NewServerResponse("Source updated successfully", resp, http.StatusAccepted))
+}
+
+// DeleteSource
+//
+//	@Summary		Delete a source
+//	@Description	This endpoint deletes a source
+//	@Id				DeleteSource
+//	@Tags			Sources
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string	true	"Project ID"
+//	@Param			sourceID	path		string	true	"source id"
+//	@Success		200			{object}	util.ServerResponse{data=Stub}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources/{sourceID} [delete]
+func (h *Handler) DeleteSource(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	sourceRepo := sources.New(h.A.Logger, h.A.DB)
+
+	source, err := sourceRepo.FindSourceByID(r.Context(), project.UID, chi.URLParam(r, "sourceID"))
+	if err != nil {
+		if errors.Is(err, datastore.ErrSourceNotFound) {
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusNotFound))
+			return
+		}
+
+		_ = render.Render(w, r, util.NewErrorResponse("error retrieving source", http.StatusBadRequest))
+		return
+	}
+
+	err = sourceRepo.DeleteSourceByID(r.Context(), project.UID, source.UID, source.VerifierID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse("failed to delete source", http.StatusBadRequest))
+		return
+	}
+
+	// Deleting a source cascade deletes its subscriptions in SQL, below the cached
+	// repository, so nothing else evicts the list the match path reads by source id.
+	if h.A.Cache != nil {
+		cachedrepo.Invalidate(r.Context(), h.A.Cache, h.A.Logger, cached.SubscriptionsBySourceCacheKey(project.UID, source.UID))
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Source deleted successfully", nil, http.StatusOK))
+}
+
+// LoadSourcesPaged
+//
+//	@Summary		List all sources
+//	@Description	This endpoint fetches multiple sources
+//	@Id				LoadSourcesPaged
+//	@Tags			Sources
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string					true	"Project ID"
+//	@Param			request		query		models.QueryListSource	false	"Query Params"
+//	@Success		200			{object}	util.ServerResponse{data=models.PagedResponse{content=[]models.SourceResponse}}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources [get]
+func (h *Handler) LoadSourcesPaged(w http.ResponseWriter, r *http.Request) {
+	project, err := h.retrieveProject(r)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	var q *models.QueryListSource
+
+	data := q.Transform(r)
+	sourcesData, paginationData, err := sources.New(h.A.Logger, h.A.DB).LoadSourcesPaged(r.Context(), project.UID, data.SourceFilter, data.Pageable)
+	if err != nil {
+		h.A.Logger.Error("an error occurred while fetching sources", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse("an error occurred while fetching sources", http.StatusBadRequest))
+		return
+	}
+
+	baseUrl, err := h.retrieveHost()
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	var org *datastore.Organisation
+	orgRepo := organisations.New(h.A.Logger, h.A.DB)
+	org, err = orgRepo.FetchOrganisationByID(r.Context(), project.OrganisationID)
+	if err != nil {
+		_ = render.Render(w, r, util.NewServiceErrResponse(err))
+		return
+	}
+
+	var customDomain string
+	if org == nil {
+		customDomain = ""
+	} else {
+		customDomain = org.CustomDomain.ValueOrZero()
+	}
+
+	for i := range sourcesData {
+		fillSourceURL(&sourcesData[i], baseUrl, customDomain)
+	}
+
+	resp := models.NewListResponse(sourcesData, func(source datastore.Source) models.SourceResponse {
+		return models.SourceResponse{Source: &source}
+	})
+	_ = render.Render(w, r, util.NewServerResponse("Sources fetched successfully", models.PagedResponse{Content: resp, Pagination: &paginationData}, http.StatusOK))
+}
+
+func fillSourceURL(s *datastore.Source, baseUrl, customDomain string) {
+	if s == nil {
+		return
+	}
+	url := baseUrl
+	if len(customDomain) > 0 {
+		url = customDomain
+	}
+
+	s.URL = fmt.Sprintf("%s/ingest/%s", url, s.MaskID)
+}
+
+// TestSourceFunction
+//
+//	@Summary		Validate source function
+//	@Description	This endpoint validates that a filter will match a certain payload structure.
+//	@Tags			Subscriptions
+//	@Accept			json
+//	@Produce		json
+//	@Param			projectID	path		string					true	"Project ID"
+//	@Param			filter		body		models.FunctionRequest	true	"Function Details"
+//	@Success		200			{object}	util.ServerResponse{data=models.FunctionResponse}
+//	@Failure		400,401,404	{object}	util.ServerResponse{data=Stub}
+//	@Security		ApiKeyAuth
+//	@Router			/v1/projects/{projectID}/sources/test_function [post]
+func (h *Handler) TestSourceFunction(w http.ResponseWriter, r *http.Request) {
+	if !h.A.Licenser.Transformations() {
+		_ = render.Render(w, r, util.NewErrorResponse("your instance does not have access to transformations, upgrade to access this feature", http.StatusBadRequest))
+		return
+	}
+
+	var test models.FunctionRequest
+	err := util.ReadJSON(r, &test)
+	if err != nil {
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	transformer := transform.NewTransformer()
+	mutatedPayload, consoleLog, err := transformer.Transform(test.Function, test.Payload)
+	if err != nil {
+		h.A.Logger.ErrorContext(r.Context(), "failed to transform function", "error", err)
+		_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+		return
+	}
+
+	if test.Type == "body" {
+		// transform to required payload
+		pBytes, err := json.Marshal(mutatedPayload)
+		if err != nil {
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+			return
+		}
+
+		convoyEvent := struct {
+			EndpointID     string            `json:"endpoint_id"`
+			OwnerID        string            `json:"owner_id"`
+			EventType      string            `json:"event_type"`
+			Data           json.RawMessage   `json:"data"`
+			CustomHeaders  map[string]string `json:"custom_headers"`
+			IdempotencyKey string            `json:"idempotency_key"`
+		}{}
+
+		decoder := json.NewDecoder(bytes.NewReader(pBytes))
+		decoder.DisallowUnknownFields()
+
+		// check the payload structure to be sure it satisfies what convoy can ingest else discard and nack it.
+		if err = decoder.Decode(&convoyEvent); err != nil {
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+			return
+		}
+
+		if util.IsStringEmpty(convoyEvent.EventType) {
+			err := fmt.Errorf("the output payload doesn't include an event type")
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+			return
+		}
+
+		if len(convoyEvent.Data) == 0 {
+			err := fmt.Errorf("the output payload doesn't include any data")
+			_ = render.Render(w, r, util.NewErrorResponse(err.Error(), http.StatusBadRequest))
+			return
+		}
+	}
+
+	functionResponse := models.FunctionResponse{
+		Payload: mutatedPayload,
+		Log:     consoleLog,
+	}
+
+	_ = render.Render(w, r, util.NewServerResponse("Transformer function run successfully", functionResponse, http.StatusOK))
+}
